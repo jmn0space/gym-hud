@@ -1,6 +1,8 @@
 """Core API views."""
 
 from django.db import DatabaseError, connection
+from django.utils.decorators import method_decorator
+from django.views.decorators.cache import cache_control
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
@@ -8,16 +10,22 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 
+@method_decorator(
+    cache_control(no_cache=True, no_store=True, must_revalidate=True),
+    name="dispatch",
+)
 class HealthView(APIView):
-    """Report application and database health."""
+    """Report application and database health without caching probe results."""
 
     permission_classes = [AllowAny]
 
     def get(self, _request: Request) -> Response:
-        """Return health status, including database connectivity."""
+        """Return health status, including a live database connectivity check."""
         database_connected = True
 
         try:
+            connection.close_if_unusable_or_obsolete()
+            connection.ensure_connection()
             with connection.cursor() as cursor:
                 cursor.execute("SELECT 1")
                 cursor.fetchone()
