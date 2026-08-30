@@ -5,6 +5,7 @@ extend-exclude = ["backend/**/migrations/*.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "DJ"]
+# Django convention prefers empty strings over NULL for string-based model fields.
 ignore = ["DJ001"]
 
 [tool.ruff.format]
