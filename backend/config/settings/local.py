@@ -3,6 +3,7 @@
 from .base import *  # noqa: F403
 from .base import (
     CORS_ALLOWED_ORIGINS,
+    CSRF_TRUSTED_ORIGINS,
     audit_security,
 )
 
@@ -11,6 +12,7 @@ DEBUG = True
 
 ALLOWED_HOSTS = ["localhost", "127.0.0.1", "[::1]"]
 CORS_ALLOWED_ORIGINS = [*CORS_ALLOWED_ORIGINS, "http://localhost:5173"]
+CSRF_TRUSTED_ORIGINS = [*CSRF_TRUSTED_ORIGINS, "http://localhost:5173"]
 
 SESSION_COOKIE_SECURE = False
 CSRF_COOKIE_SECURE = False
@@ -25,5 +27,6 @@ audit_security(
     debug=DEBUG,
     secret_key=SECRET_KEY,  # noqa: F405
     allowed_hosts=ALLOWED_HOSTS,
+    csrf_trusted_origins=CSRF_TRUSTED_ORIGINS,
     database_url=DATABASE_URL,  # noqa: F405
 )
