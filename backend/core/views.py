@@ -24,7 +24,6 @@ class HealthView(APIView):
         database_connected = True
 
         try:
-            connection.close_if_unusable_or_obsolete()
             connection.ensure_connection()
             with connection.cursor() as cursor:
                 cursor.execute("SELECT 1")
