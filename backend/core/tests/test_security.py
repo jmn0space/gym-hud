@@ -1,6 +1,6 @@
 """Tests for the startup security auditor."""
 
-import logging
+from unittest.mock import patch
 
 import pytest
 from config.settings.base import audit_security
@@ -19,9 +19,9 @@ def test_production_security_audit_rejects_insecure_settings() -> None:
         )
 
 
-def test_local_security_audit_emits_warning(caplog: pytest.LogCaptureFixture) -> None:
+def test_local_security_audit_emits_warning() -> None:
     """Local development explicitly warns about insecure settings."""
-    with caplog.at_level(logging.WARNING, logger="security_audit"):
+    with patch("config.settings.base.logger.warning") as warning:
         audit_security(
             environment="local",
             debug=True,
@@ -30,5 +30,6 @@ def test_local_security_audit_emits_warning(caplog: pytest.LogCaptureFixture) ->
             database_url="sqlite:///db.sqlite3",
         )
 
-    assert "SECURITY" in caplog.text
-    assert "DEBUG=True" in caplog.text
+    messages = " ".join(str(call) for call in warning.call_args_list)
+    assert "SECURITY" in messages
+    assert "DEBUG=True" in messages

@@ -35,7 +35,7 @@ DATABASE_URL = os.getenv(
     "DATABASE_URL",
     f"sqlite:///{BASE_DIR / 'db.sqlite3'}",
 )
-DATABASES: dict[str, dict[str, object]] = {
+DATABASES = {
     "default": dj_database_url.parse(
         DATABASE_URL,
         conn_max_age=60,
