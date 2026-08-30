@@ -61,10 +61,7 @@ def main() -> int:
 
     if blocking:
         for vulnerability_id, severities in blocking:
-            print(
-                "blocking vulnerability: "
-                f"{vulnerability_id} ({', '.join(sorted(severities))})"
-            )
+            print(f"blocking vulnerability: {vulnerability_id} ({', '.join(sorted(severities))})")
         return 1
 
     print("No High/Critical dependency vulnerabilities found.")

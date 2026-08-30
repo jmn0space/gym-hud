@@ -31,8 +31,6 @@ class HealthView(APIView):
             },
         }
         response_status = (
-            status.HTTP_200_OK
-            if database_connected
-            else status.HTTP_503_SERVICE_UNAVAILABLE
+            status.HTTP_200_OK if database_connected else status.HTTP_503_SERVICE_UNAVAILABLE
         )
         return Response(payload, status=response_status)

@@ -22,9 +22,7 @@ _DEFAULT_LOCAL_SECRET = "insecure-local-development-key-do-not-use-in-production
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", _DEFAULT_LOCAL_SECRET)
 
 ALLOWED_HOSTS: list[str] = [
-    host.strip()
-    for host in os.getenv("DJANGO_ALLOWED_HOSTS", "").split(",")
-    if host.strip()
+    host.strip() for host in os.getenv("DJANGO_ALLOWED_HOSTS", "").split(",") if host.strip()
 ]
 
 CSRF_TRUSTED_ORIGINS: list[str] = [
@@ -131,9 +129,7 @@ REST_FRAMEWORK = {
 }
 
 CORS_ALLOWED_ORIGINS: list[str] = [
-    origin.strip()
-    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
-    if origin.strip()
+    origin.strip() for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",") if origin.strip()
 ]
 CORS_ALLOW_CREDENTIALS = True
 
@@ -188,11 +184,7 @@ def audit_security(
         if debug:
             errors.append("DEBUG must be False in production.")
 
-        if (
-            not secret_key
-            or secret_key == _DEFAULT_LOCAL_SECRET
-            or len(secret_key) < 50
-        ):
+        if not secret_key or secret_key == _DEFAULT_LOCAL_SECRET or len(secret_key) < 50:
             errors.append(
                 "DJANGO_SECRET_KEY must be set to a strong value of at least 50 characters."
             )
@@ -206,9 +198,7 @@ def audit_security(
             host.lower() in insecure_hosts or host.lower().endswith(".localhost")
             for host in allowed_hosts
         ):
-            errors.append(
-                "DJANGO_ALLOWED_HOSTS must not contain wildcard or localhost values."
-            )
+            errors.append("DJANGO_ALLOWED_HOSTS must not contain wildcard or localhost values.")
 
         if errors:
             details = " ".join(errors)
