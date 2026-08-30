@@ -1,5 +1,7 @@
 """Fast, isolated settings for automated tests."""
 
+import os
+
 import dj_database_url
 
 from .base import *  # noqa: F403
@@ -7,7 +9,8 @@ from .base import *  # noqa: F403
 ENVIRONMENT = "test"
 DEBUG = False
 
-DATABASES["default"] = dj_database_url.parse("sqlite:///:memory:")  # noqa: F405
+TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", "sqlite:///:memory:")
+DATABASES["default"] = dj_database_url.parse(TEST_DATABASE_URL, conn_max_age=0)  # noqa: F405
 
 PASSWORD_HASHERS = [
     "django.contrib.auth.hashers.MD5PasswordHasher",
