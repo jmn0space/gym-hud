@@ -177,7 +177,7 @@ def audit_security(
     database_url: str,
 ) -> None:
     """Validate settings after environment-specific overrides are applied."""
-    insecure_hosts = {"*", "localhost", "127.0.0.1", "0.0.0.0", "[::1]"}
+    insecure_hosts = {"*", "localhost", "127.0.0.1", "0.0.0.0", "[::1]"}  # noqa: S104
 
     if environment == "production":
         errors: list[str] = []
