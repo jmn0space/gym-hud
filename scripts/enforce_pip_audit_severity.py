@@ -28,15 +28,27 @@ def _severity_names(vulnerability: dict[str, Any]) -> set[str]:
 def main() -> int:
     """Inspect a CycloneDX pip-audit report and enforce the severity threshold."""
     if len(sys.argv) != 2:
-        print("usage: enforce_pip_audit_severity.py <cyclonedx-json-report>")
+        print("usage: enforce_pip_audit_severity.py <cyclonedx-json-report>", file=sys.stderr)
         return 2
 
     report_path = Path(sys.argv[1])
-    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if not report_path.is_file():
+        print(f"pip-audit report was not produced: {report_path}", file=sys.stderr)
+        return 2
+
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"unable to read pip-audit report: {exc}", file=sys.stderr)
+        return 2
+
+    if not isinstance(report, dict):
+        print("pip-audit report must be a JSON object", file=sys.stderr)
+        return 2
 
     vulnerabilities = report.get("vulnerabilities", [])
     if not isinstance(vulnerabilities, list):
-        print("pip-audit report has an unexpected vulnerabilities field")
+        print("pip-audit report has an unexpected vulnerabilities field", file=sys.stderr)
         return 2
 
     blocking: list[tuple[str, set[str]]] = []
