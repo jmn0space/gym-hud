@@ -212,9 +212,7 @@ def audit_security(
             or "127.0.0.1" in origin
             for origin in csrf_trusted_origins
         ):
-            errors.append(
-                "DJANGO_CSRF_TRUSTED_ORIGINS must contain only HTTPS production origins."
-            )
+            errors.append("DJANGO_CSRF_TRUSTED_ORIGINS must contain only HTTPS production origins.")
 
         if errors:
             details = " ".join(errors)
