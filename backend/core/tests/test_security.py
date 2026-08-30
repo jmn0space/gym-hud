@@ -3,9 +3,8 @@
 import logging
 
 import pytest
-from django.core.exceptions import ImproperlyConfigured
-
 from config.settings.base import audit_security
+from django.core.exceptions import ImproperlyConfigured
 
 
 def test_production_security_audit_rejects_insecure_settings() -> None:

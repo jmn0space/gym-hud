@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 import dj_database_url
 from django.core.exceptions import ImproperlyConfigured
