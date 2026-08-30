@@ -18,7 +18,7 @@ logger = logging.getLogger("security_audit")
 ENVIRONMENT = os.getenv("DJANGO_ENV", "local").strip().lower()
 DEBUG = False
 
-_DEFAULT_LOCAL_SECRET = "insecure-local-development-key-do-not-use-in-production"
+_DEFAULT_LOCAL_SECRET = "insecure-local-development-key-do-not-use-in-production"  # noqa: S105
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", _DEFAULT_LOCAL_SECRET)
 
 ALLOWED_HOSTS: list[str] = [
@@ -173,6 +173,7 @@ def audit_security(
     debug: bool,
     secret_key: str,
     allowed_hosts: Sequence[str],
+    csrf_trusted_origins: Sequence[str],
     database_url: str,
 ) -> None:
     """Validate settings after environment-specific overrides are applied."""
@@ -189,7 +190,8 @@ def audit_security(
                 "DJANGO_SECRET_KEY must be set to a strong value of at least 50 characters."
             )
 
-        if not database_url.startswith(("postgres://", "postgresql://")):
+        database_scheme = database_url.partition(":")[0].lower()
+        if database_scheme not in {"postgres", "postgresql"}:
             errors.append("DATABASE_URL must point to PostgreSQL in production.")
 
         if not allowed_hosts:
@@ -199,6 +201,20 @@ def audit_security(
             for host in allowed_hosts
         ):
             errors.append("DJANGO_ALLOWED_HOSTS must not contain wildcard or localhost values.")
+
+        if not csrf_trusted_origins:
+            errors.append(
+                "DJANGO_CSRF_TRUSTED_ORIGINS must contain at least one production origin."
+            )
+        elif any(
+            not origin.lower().startswith("https://")
+            or "localhost" in origin.lower()
+            or "127.0.0.1" in origin
+            for origin in csrf_trusted_origins
+        ):
+            errors.append(
+                "DJANGO_CSRF_TRUSTED_ORIGINS must contain only HTTPS production origins."
+            )
 
         if errors:
             details = " ".join(errors)
