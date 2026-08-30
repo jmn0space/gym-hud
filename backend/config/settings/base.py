@@ -189,7 +189,7 @@ def audit_security(
                 "DJANGO_SECRET_KEY must be set to a strong value of at least 50 characters."
             )
 
-        if not database_url or database_url.startswith("sqlite:"):
+        if not database_url.startswith(("postgres://", "postgresql://")):
             errors.append("DATABASE_URL must point to PostgreSQL in production.")
 
         if not allowed_hosts:
