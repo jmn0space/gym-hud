@@ -1,0 +1,11 @@
+-r requirements.txt
+
+django-stubs>=5.2
+djangorestframework-stubs>=3.16
+mypy>=1.15
+ruff>=0.9
+pytest>=8.3
+pytest-django>=4.10
+pre-commit>=4.0
+detect-secrets>=1.5
+pip-audit>=2.8
