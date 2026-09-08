@@ -9,3 +9,4 @@ pytest-django>=4.10
 pre-commit>=4.0
 detect-secrets>=1.5
 pip-audit>=2.8
+cvss>=3.6,<4

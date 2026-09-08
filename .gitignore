@@ -1,4 +1,7 @@
 .env
+.env.*
+!.env.example
+pip-audit.json
 .venv/
 venv/
 __pycache__/

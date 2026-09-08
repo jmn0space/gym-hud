@@ -18,6 +18,7 @@ class HealthView(APIView):
     """Report application and database health without caching probe results."""
 
     permission_classes = [AllowAny]
+    authentication_classes = []
 
     def get(self, _request: Request) -> Response:
         """Return health status, including a live database connectivity check."""

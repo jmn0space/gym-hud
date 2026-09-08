@@ -36,7 +36,7 @@ A healthy response is:
 }
 ```
 
-### Docker Compose
+### Local Docker Compose
 
 ```bash
 docker compose up --build
@@ -51,23 +51,62 @@ docker compose exec web python -c \
   "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/').read().decode())"
 ```
 
-For production, copy `.env.example` to your deployment environment and provide a
-strong `DJANGO_SECRET_KEY`, public `DJANGO_ALLOWED_HOSTS`, trusted origins, and the
-Neon pooled `DATABASE_URL`. The production settings fail closed when required
-security configuration is missing or unsafe.
+### Production Compose
+
+Use the standalone production file, not the local Compose configuration:
+
+```bash
+cp .env.example .env.production
+# Fill in the deployment values, then:
+docker compose --env-file .env.production -f docker-compose.production.yml up -d --build
+```
+
+Provide a strong `DJANGO_SECRET_KEY`, public `DJANGO_ALLOWED_HOSTS`, HTTPS
+`DJANGO_CSRF_TRUSTED_ORIGINS`, and the Neon pooled `DATABASE_URL` including
+`sslmode=require`. CORS origins and Gunicorn workers are also passed through.
+Compose rejects missing required values, and Django validates their security at
+startup. This file has no bundled PostgreSQL service or local database dependency.
+Do not combine it with `docker-compose.yml`, which is explicitly for local use.
+
+Connect the trusted `cloudflared` container to this Compose project's private
+default network and route the application hostname to `http://web:8000`, as
+described in [the deployment architecture](docs/architecture.md). Provisioning
+the tunnel itself remains part of the deployment work; this scaffold supplies
+the backend service. Do not publish port 8000 or attach untrusted containers.
+
+Production Django trusts `X-Forwarded-Proto` from this restricted ingress so an
+HTTPS request forwarded over Docker HTTP is not redirected back to itself.
+The ingress must supply/overwrite that header from the original request scheme;
+this trust setting is not suitable for a directly exposed Gunicorn server.
+Plain HTTP still redirects to HTTPS. Server-side database cursors are disabled
+for compatibility with Neon's transaction-pooled connection.
 
 ### Quality checks
 
 ```bash
-ruff check backend/ scripts/
-ruff format --check backend/ scripts/
+ruff check backend/ scripts/ tests/
+ruff format --check backend/ scripts/ tests/
 mypy backend/
-pytest backend/
+pytest
 python backend/manage.py check --settings=config.settings.test
 ```
 
 Pre-commit runs Ruff, Mypy, and detect-secrets. CI additionally audits Python
-dependencies and fails when pip-audit supplies High or Critical severity metadata.
+dependencies with pip-audit JSON, resolves finding IDs and aliases through the
+[OSV API](https://google.github.io/osv.dev/api/), and evaluates published CVSS
+base scores using the `cvss` library (v2/v3/v4). GitHub advisory severity labels
+are also considered. The highest available score applies: High/Critical (7.0+)
+blocks CI; classified Low/Moderate findings are reported without blocking.
+Missing/malformed severity data, skipped dependencies, or unavailable metadata
+fail the audit instead of silently passing. Transient requests are retried.
+
+The audit uses public dependency/advisory identifiers only. To reproduce it:
+
+```bash
+pip-audit -r requirements.txt --format json --aliases --output pip-audit.json
+# pip-audit exits 1 when it finds vulnerabilities; still evaluate that report:
+python scripts/enforce_pip_audit_severity.py pip-audit.json
+```
 
 ## Documentation
 

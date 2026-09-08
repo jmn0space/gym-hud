@@ -6,6 +6,11 @@ from .base import audit_security
 ENVIRONMENT = "production"
 DEBUG = False
 
+# The only ingress is the trusted cloudflared connector on the private Docker
+# network. It supplies the original scheme; never publish Gunicorn's port or
+# allow untrusted peers to supply this header (see README deployment guidance).
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
 audit_security(
     environment=ENVIRONMENT,
     debug=DEBUG,

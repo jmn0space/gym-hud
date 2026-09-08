@@ -41,6 +41,8 @@ DATABASES = {
         conn_max_age=60,
     )
 }
+# Neon uses transaction pooling: named cursors cannot survive backend switches.
+DATABASES["default"]["DISABLE_SERVER_SIDE_CURSORS"] = True
 
 INSTALLED_APPS = [
     "django.contrib.admin",
