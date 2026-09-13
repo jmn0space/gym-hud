@@ -2,6 +2,112 @@
 
 Mobile-first PAD walking and gym workout tracking application.
 
+## Backend quick start
+
+Gym HUD uses Django 6.x, Django REST Framework, PostgreSQL, and Docker Compose.
+
+### Local Python setup
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+pre-commit install
+
+export DJANGO_SETTINGS_MODULE=config.settings.local
+python backend/manage.py migrate
+python backend/manage.py runserver
+```
+
+The health endpoint is available at:
+
+```text
+GET http://127.0.0.1:8000/api/v1/health/
+```
+
+A healthy response is:
+
+```json
+{
+  "status": "ok",
+  "database": {
+    "connected": true
+  }
+}
+```
+
+### Local Docker Compose
+
+```bash
+docker compose up --build
+```
+
+The Compose topology intentionally uses `expose: ["8000"]` rather than publishing
+port 8000 to the host. This matches the production Cloudflare Tunnel topology.
+To verify the health endpoint from inside the Docker network:
+
+```bash
+docker compose exec web python -c \
+  "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/').read().decode())"
+```
+
+### Production Compose
+
+Use the standalone production file, not the local Compose configuration:
+
+```bash
+cp .env.example .env.production
+# Fill in the deployment values, then:
+docker compose --env-file .env.production -f docker-compose.production.yml up -d --build
+```
+
+Provide a strong `DJANGO_SECRET_KEY`, public `DJANGO_ALLOWED_HOSTS`, HTTPS
+`DJANGO_CSRF_TRUSTED_ORIGINS`, and the Neon pooled `DATABASE_URL` including
+`sslmode=require`. CORS origins and Gunicorn workers are also passed through.
+Compose rejects missing required values, and Django validates their security at
+startup. This file has no bundled PostgreSQL service or local database dependency.
+Do not combine it with `docker-compose.yml`, which is explicitly for local use.
+
+Connect the trusted `cloudflared` container to this Compose project's private
+default network and route the application hostname to `http://web:8000`, as
+described in [the deployment architecture](docs/architecture.md). Provisioning
+the tunnel itself remains part of the deployment work; this scaffold supplies
+the backend service. Do not publish port 8000 or attach untrusted containers.
+
+Production Django trusts `X-Forwarded-Proto` from this restricted ingress so an
+HTTPS request forwarded over Docker HTTP is not redirected back to itself.
+The ingress must supply/overwrite that header from the original request scheme;
+this trust setting is not suitable for a directly exposed Gunicorn server.
+Plain HTTP still redirects to HTTPS. Server-side database cursors are disabled
+for compatibility with Neon's transaction-pooled connection.
+
+### Quality checks
+
+```bash
+ruff check backend/ scripts/ tests/
+ruff format --check backend/ scripts/ tests/
+mypy backend/
+pytest
+python backend/manage.py check --settings=config.settings.test
+```
+
+Pre-commit runs Ruff, Mypy, and detect-secrets. CI additionally audits Python
+dependencies with pip-audit JSON, resolves finding IDs and aliases through the
+[OSV API](https://google.github.io/osv.dev/api/), and evaluates published CVSS
+base scores using the `cvss` library (v2/v3/v4). GitHub advisory severity labels
+are also considered. The highest available score applies: High/Critical (7.0+)
+blocks CI; classified Low/Moderate findings are reported without blocking.
+Missing/malformed severity data, skipped dependencies, or unavailable metadata
+fail the audit instead of silently passing. Transient requests are retried.
+
+The audit uses public dependency/advisory identifiers only. To reproduce it:
+
+```bash
+pip-audit -r requirements.txt --format json --aliases --output pip-audit.json
+# pip-audit exits 1 when it finds vulnerabilities; still evaluate that report:
+python scripts/enforce_pip_audit_severity.py pip-audit.json
+```
+
 ## Documentation
 
 The v0.1 specification is split by responsibility so implementation work can reference only the relevant parts:

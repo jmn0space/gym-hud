@@ -1,0 +1,27 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.12.11
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.17.1
+    hooks:
+      - id: mypy
+        pass_filenames: false
+        args: [backend/]
+        additional_dependencies:
+          - Django>=6.0,<6.1
+          - djangorestframework>=3.16
+          - dj-database-url>=2.2
+          - django-stubs>=5.2
+          - djangorestframework-stubs>=3.16
+          - django-cors-headers>=4.6
+          - whitenoise>=6.8
+
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
