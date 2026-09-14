@@ -1,3 +1,4 @@
+import { useId } from "react";
 import { Link } from "react-router";
 
 import { TimerDisplay } from "./TimerDisplay";
@@ -15,7 +16,7 @@ export interface ActiveSessionSummary {
 }
 
 export function ResumeCard({ session }: { session: ActiveSessionSummary }) {
-  const headingId = `resume-${session.id}`;
+  const headingId = useId();
 
   return (
     <article className="card card--highlight" aria-labelledby={headingId}>

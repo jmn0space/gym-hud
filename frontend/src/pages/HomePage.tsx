@@ -24,9 +24,10 @@ export function HomePage({ activeSessions = [] }: HomePageProps) {
         )}
       </section>
 
-      <section className="stack" aria-labelledby="start-heading">
-        <h2 id="start-heading" className="eyebrow">
-          Start new
+      {/* Becomes "Start new" once these screens can actually start a session. */}
+      <section className="stack" aria-labelledby="workouts-heading">
+        <h2 id="workouts-heading" className="eyebrow">
+          Workouts
         </h2>
         <Link className="button button--primary" to={routes.pad}>
           PAD walking
@@ -37,10 +38,11 @@ export function HomePage({ activeSessions = [] }: HomePageProps) {
         <Link className="button" to={routes.cardio}>
           Cardio machine
         </Link>
-        <Link className="button" to={routes.history}>
-          History
-        </Link>
       </section>
+
+      <Link className="button" to={routes.history}>
+        History
+      </Link>
 
       <HealthStatus />
     </Page>

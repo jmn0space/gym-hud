@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 
 import { fetchHealth, type HealthState } from "../api/health";
 
-const HEALTH_TIMEOUT_MS = 5000;
+export const HEALTH_TIMEOUT_MS = 5000;
 
 type DisplayState = HealthState | "checking";
 
@@ -16,10 +16,11 @@ const messages: Record<DisplayState, string> = {
 export function HealthStatus() {
   const [state, setState] = useState<DisplayState>("checking");
   const [attempt, setAttempt] = useState(0);
+  const isChecking = state === "checking";
 
   useEffect(() => {
     const controller = new AbortController();
-    const timeout = window.setTimeout(() => {
+    const timeout = setTimeout(() => {
       controller.abort();
     }, HEALTH_TIMEOUT_MS);
     let current = true;
@@ -32,12 +33,15 @@ export function HealthStatus() {
 
     return () => {
       current = false;
-      window.clearTimeout(timeout);
+      clearTimeout(timeout);
       controller.abort();
     };
   }, [attempt]);
 
   function recheck() {
+    if (isChecking) {
+      return;
+    }
     setState("checking");
     setAttempt((value) => value + 1);
   }
@@ -50,11 +54,12 @@ export function HealthStatus() {
       <p className={`health__status health__status--${state}`} role="status">
         {messages[state]}
       </p>
+      {/* aria-disabled, not disabled: keep focus on the button while checking. */}
       <button
         type="button"
         className="button button--quiet"
         onClick={recheck}
-        disabled={state === "checking"}
+        aria-disabled={isChecking}
       >
         Check again
       </button>

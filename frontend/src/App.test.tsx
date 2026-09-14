@@ -1,15 +1,19 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { StrictMode } from "react";
 import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
 
+// StrictMode matches the dev entry point and double-invokes effects.
 function renderApp(initialPath = "/") {
   return render(
-    <MemoryRouter initialEntries={[initialPath]}>
-      <App />
-    </MemoryRouter>,
+    <StrictMode>
+      <MemoryRouter initialEntries={[initialPath]}>
+        <App />
+      </MemoryRouter>
+    </StrictMode>,
   );
 }
 
@@ -58,6 +62,14 @@ describe("navigation smoke test", () => {
     await waitFor(() => {
       expect(pageHeading).toHaveFocus();
     });
+    expect(document.title).toBe(`${heading} · Gym HUD`);
+  });
+
+  it("leaves focus alone on first load", () => {
+    renderApp("/pad");
+
+    expect(screen.getByRole("heading", { level: 1, name: "PAD walking" })).not.toHaveFocus();
+    expect(document.body).toHaveFocus();
   });
 
   it("returns Home from a domain screen", async () => {
@@ -69,7 +81,7 @@ describe("navigation smoke test", () => {
     expect(screen.getByRole("heading", { level: 1, name: "Gym HUD" })).toBeInTheDocument();
   });
 
-  it("starts a domain screen from the Home start buttons", async () => {
+  it("opens a domain screen from the Home workout buttons", async () => {
     const user = userEvent.setup();
     renderApp();
 

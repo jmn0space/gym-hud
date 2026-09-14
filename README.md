@@ -34,6 +34,16 @@ Copy `frontend/.env.example` to `frontend/.env.local` to override:
 To try the shell on a phone on the same network, run `npm run dev -- --host` and
 open the printed network URL.
 
+Django checks the page origin on unsafe requests (login and sync, once they
+exist). Local settings trust only `http://localhost:5173`, so on the desktop open
+`localhost`, not `127.0.0.1`. For a phone, add its network origin for that run
+only, without changing the committed defaults:
+
+```bash
+export DJANGO_CSRF_TRUSTED_ORIGINS=http://192.168.1.5:5173  # your printed network URL
+python backend/manage.py runserver
+```
+
 ### Frontend quality checks
 
 ```bash

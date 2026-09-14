@@ -104,6 +104,10 @@ jobs:
       - name: Audit runtime dependencies
         run: npm audit --omit=dev --audit-level=high
 
+      # The Vite dev server is a dev dependency but may be exposed on the LAN.
+      - name: Audit development dependencies
+        run: npm audit --audit-level=critical
+
       - name: Type check
         run: npm run typecheck
 

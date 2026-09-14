@@ -6,15 +6,16 @@ import { BottomNav } from "./BottomNav";
 export function AppLayout() {
   const { pathname } = useLocation();
   const mainRef = useRef<HTMLElement>(null);
-  const isInitialRender = useRef(true);
+  const previousPathname = useRef(pathname);
 
   // Move focus to the new page heading after client-side navigation so screen
-  // readers announce the screen change. Leave focus alone on first load.
+  // readers announce the screen change. Leave focus alone on first load; comparing
+  // paths (not a first-render flag) survives StrictMode's double-invoked effects.
   useEffect(() => {
-    if (isInitialRender.current) {
-      isInitialRender.current = false;
+    if (previousPathname.current === pathname) {
       return;
     }
+    previousPathname.current = pathname;
     mainRef.current?.querySelector<HTMLElement>("h1")?.focus();
   }, [pathname]);
 

@@ -5,6 +5,8 @@
   --color-surface: #161a20;
   --color-surface-raised: #1f252d;
   --color-border: #2f3843;
+  /* At least 3:1 against the background so control outlines stay visible. */
+  --color-control-border: #6b7785;
   --color-text: #f2f5f8;
   --color-text-muted: #aab5c1;
   --color-accent: #ffb020;
@@ -65,8 +67,10 @@ p {
   width: 100%;
   max-width: var(--content-width);
   margin: 0 auto;
-  padding: max(1.25rem, env(safe-area-inset-top)) 1rem
-    calc(var(--nav-height) + env(safe-area-inset-bottom) + 1.5rem);
+  padding-top: max(1.25rem, env(safe-area-inset-top));
+  padding-right: max(1rem, env(safe-area-inset-right));
+  padding-bottom: calc(var(--nav-height) + env(safe-area-inset-bottom) + 1.5rem);
+  padding-left: max(1rem, env(safe-area-inset-left));
 }
 
 .page__heading {
@@ -104,7 +108,7 @@ p {
   width: 100%;
   min-height: var(--touch-target);
   padding: 0.5rem 1.25rem;
-  border: 2px solid var(--color-border);
+  border: 2px solid var(--color-control-border);
   border-radius: var(--radius);
   background: var(--color-surface-raised);
   color: var(--color-text);
@@ -121,7 +125,8 @@ p {
   filter: brightness(1.2);
 }
 
-.button:disabled {
+.button:disabled,
+.button[aria-disabled="true"] {
   opacity: 0.6;
   cursor: default;
 }
@@ -210,7 +215,7 @@ p {
   position: fixed;
   inset-inline: 0;
   bottom: 0;
-  padding-bottom: env(safe-area-inset-bottom);
+  padding: 0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
   border-top: 1px solid var(--color-border);
   background: var(--color-surface);
 }
