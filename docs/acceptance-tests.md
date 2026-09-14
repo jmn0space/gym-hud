@@ -4,6 +4,89 @@
 
 These tests define the minimum behaviour required for v1.
 
+## Local persistence foundation
+
+### LOCAL-01 — Atomic record and outbox commit
+
+Apply one logical action containing multiple domain-record changes.
+
+Expected: all record changes, one action receipt, the next local sequence, and one
+ordered outbox envelope become durable together. Injecting an IndexedDB request
+failure after an earlier write aborts every part of the action, and the UI does not
+report success.
+
+### LOCAL-02 — Reload and migration recovery
+
+Commit a pending action, close every repository connection, and reopen the same
+database. Also upgrade a database created with the previous schema version.
+
+Expected: live records and the ordered pending outbox survive close/reopen and a
+non-destructive schema upgrade.
+
+### LOCAL-03 — Logical PAD transitions
+
+Finish a walking bout and begin its rest in one action. In a later action, finish
+that rest and start the next bout.
+
+Expected: each transition is all-or-nothing, retains stable parent identity, and
+orders parent creates before children. Deletion actions retain tombstones, with
+child deletes ordered before parent deletes.
+
+### LOCAL-04 — Retry and ordering invariants
+
+Move the device clock backwards between actions and retry a previously committed
+action ID after acknowledging its outbox entry.
+
+Expected: persisted sequences remain strictly increasing, and the retry returns the
+original receipt without recreating the action or pending outbox entry.
+
+### LOCAL-05 — Concurrent connections
+
+Use independent connections to start two sessions of the same type, with an
+absence precondition evaluated by each action. Then start sessions of different
+types concurrently.
+
+Expected: no more than one same-type session becomes `ACTIVE`; distinct types can
+both become active. Preconditions are checked inside each write transaction.
+
+### LOCAL-06 — Cache and sync metadata
+
+Write reference-cache data and caller-owned synchronization metadata, close the
+repository, and reopen it.
+
+Expected: both survive independently of mutable workout records and internal action,
+sequence, and client metadata.
+
+### LOCAL-07 — Browser reload recovery
+
+Seed persisted `ACTIVE` sessions and interval records through the local repository,
+load Home, close its repository connection, and reload the browser page.
+
+Expected: Home reads IndexedDB again and shows one Resume card per active session
+type with PAD state and elapsed time derived from its stored intervals. A storage
+open/read failure remains visible and offers Retry; it is not presented as an empty
+database.
+
+### Follow-up Android and synchronization checklist
+
+These checks depend on PAD controls, installation/service-worker work, and the
+backend synchronization contract outside the local persistence foundation. They
+remain release checks for the complete features and have not been performed as
+part of issue #15:
+
+- [ ] Start a PAD bout while offline and confirm the saved state is visible.
+- [ ] Lock the phone long enough for the timer display to become stale, then unlock
+  and confirm elapsed time is recomputed from stored UTC timestamps.
+- [ ] Force-stop the installed PWA/browser process, reopen it, and confirm Home shows
+  `Resume PAD Walking` with the correct WALKING, PAUSED, or RESTING state.
+- [ ] Complete a multi-record transition offline, reload, and confirm its pending
+  synchronization action is still present exactly once.
+- [ ] Restore connectivity and confirm a failed synchronization attempt remains
+  pending for retry.
+
+These boxes record manual device work only. Automated browser and repository tests
+do not mark them complete.
+
 ## PAD
 
 ### PAD-01 — Lock-screen recovery

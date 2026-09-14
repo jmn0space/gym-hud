@@ -41,16 +41,88 @@ Every meaningful user action must be saved locally before the UI reports success
 ```text
 User action
     ↓
-IndexedDB transaction
+Validate the action structure
     ↓
-UI updates immediately
+One IndexedDB read/write transaction
+├── check record preconditions and active-session rules
+├── domain record changes
+├── durable action receipt and monotonic sequence
+└── one ordered outbox envelope
     ↓
-Mutation appended to outbox
+Transaction completes
+    ↓
+UI reports success from persisted state
     ↓
 Server synchronization when available
 ```
 
-This rule applies to PAD, resistance, and cardio sessions.
+This rule applies to PAD, resistance, and cardio sessions. A failed request anywhere
+in the transaction aborts the whole action, so domain records cannot be committed
+without their synchronization work. The application does not await the network
+inside an IndexedDB transaction.
+
+This is a versioned **local contract**. Its outbox envelope and ordering rules are
+provisional until the backend synchronization contract in issue #13 is agreed. It
+does not define server conflict resolution or an acknowledgement API.
+
+## Local action contract
+
+A logical user action may update several records, but it produces one commit receipt
+and one outbox envelope. The envelope captures immutable, full record changes in
+dependency order: parent creates precede children, while child deletes precede
+parents. Deletes are stored as tombstones with stable identity and timestamps so a
+later synchronization attempt can represent the deletion.
+
+```json
+{
+  "version": 1,
+  "mutation_id": "action UUID",
+  "sequence": 42,
+  "created_at": "2026-09-14T10:15:30.000Z",
+  "changes": [
+    {
+      "store": "walking_bouts",
+      "entity_type": "walking_bout",
+      "entity_id": "next bout UUID",
+      "operation": "put",
+      "record": {
+        "id": "next bout UUID",
+        "walking_session_id": "session UUID",
+        "started_at": "2026-09-14T10:15:30.000Z",
+        "ended_at": null,
+        "created_at": "2026-09-14T10:15:30.000Z",
+        "updated_at": "2026-09-14T10:15:30.000Z",
+        "deleted_at": null
+      }
+    },
+    {
+      "store": "walking_rests",
+      "entity_type": "walking_rest",
+      "entity_id": "finished rest UUID",
+      "operation": "put",
+      "record": {
+        "id": "finished rest UUID",
+        "walking_bout_id": "finished bout UUID",
+        "started_at": "2026-09-14T10:10:30.000Z",
+        "ended_at": "2026-09-14T10:15:30.000Z",
+        "created_at": "2026-09-14T10:10:30.000Z",
+        "updated_at": "2026-09-14T10:15:30.000Z",
+        "deleted_at": null
+      }
+    }
+  ]
+}
+```
+
+The repository allocates `sequence` inside the same transaction. It is the local
+edit order even if the wall clock moves backwards; timestamps remain UTC ISO
+strings for elapsed-time reconstruction and display. An `action UUID` is stable
+across retries. Its durable receipt remains after the corresponding pending outbox
+entry is acknowledged, preventing a retry from creating a second logical action.
+
+Callers may supply record preconditions. The repository evaluates them inside the
+write transaction, which prevents two tabs or independent connections from both
+successfully applying changes based on the same stale state.
 
 ## Active-session recovery
 
@@ -74,9 +146,18 @@ The same timestamp-derived approach applies to:
 
 After screen lock, reload, PWA termination, or browser-process termination, the application reconstructs state from IndexedDB and timestamps.
 
+The current local baseline allows at most one `ACTIVE` session per type: one PAD,
+one resistance, and one cardio session. Different session types may be active at
+the same time, and Home exposes one Resume card for each. This baseline is pending
+the final backend model and synchronization decisions in issue #13.
+
+Within a PAD session, the transaction also prevents two live open bouts for the
+same session and two live open pauses or rests for the same bout. This protects
+double-taps and concurrent tabs without relying on in-memory button state.
+
 ## IndexedDB stores
 
-Suggested stores:
+The current local schema version is 2. It uses these stores:
 
 ```text
 walking_sessions
@@ -90,12 +171,20 @@ resistance_rows
 cardio_sessions
 
 routine_templates
+routine_exercises
 exercise_registry
 reference_data
 
 outbox
+action_receipts
 sync_metadata
+internal_metadata
 ```
+
+`action_receipts` retains committed action IDs after pending outbox entries are
+acknowledged. `internal_metadata` owns the local sequence and client identity;
+caller synchronization metadata cannot overwrite those values. These two stores
+are repository internals rather than domain data exposed to the UI.
 
 Reference data includes what the HUD needs offline, such as:
 
@@ -108,31 +197,23 @@ Reference data includes what the HUD needs offline, such as:
 
 ## Mutation outbox
 
-Every locally persisted server-side change creates an outbox mutation.
+Every locally persisted server-side action creates one outbox mutation in the same
+transaction as its domain changes. The versioned envelope shape is shown in the
+local action contract above.
 
-Example:
-
-```json
-{
-  "mutation_id": "UUID",
-  "entity_type": "walking_bout",
-  "entity_id": "UUID",
-  "operation": "update",
-  "created_at": "...",
-  "payload": {}
-}
-```
-
-Possible `entity_type` values include:
+Possible mutable domain stores include:
 
 ```text
-walking_session
-walking_bout
-walking_pause
-walking_rest
-resistance_session
-resistance_session_exercise
-cardio_machine_session
+walking_sessions
+walking_bouts
+walking_pauses
+walking_rests
+resistance_sessions
+resistance_rows
+cardio_sessions
+routine_templates
+routine_exercises
+exercise_registry
 ```
 
 The server records processed mutation IDs. Replaying the same mutation must not duplicate logical events.
@@ -151,7 +232,9 @@ Attempt synchronization:
 
 The application must never depend on step 5.
 
-A successful mutation is removed from, or marked acknowledged in, the local outbox. Failed mutations remain queued.
+A successfully acknowledged mutation is removed from the pending local outbox.
+Its action receipt remains durable for retry deduplication. Failed mutations remain
+queued. The server acknowledgement exchange itself remains part of issue #13.
 
 ## Conflict strategy
 

@@ -34,11 +34,13 @@ Every meaningful interaction is committed locally before network synchronization
 ```text
 User action
     ↓
-IndexedDB transaction
+One IndexedDB transaction
+├── saved domain changes
+└── queued synchronization envelope
     ↓
-UI immediately reflects saved state
+Transaction completes
     ↓
-Mutation added to sync outbox
+UI reflects persisted state
     ↓
 Server synchronization when available
 ```
@@ -124,7 +126,11 @@ Suggested resistance:
 [ HISTORY ]
 ```
 
-Starting a new session while another session of the same type remains active should require resumption, discard, or explicit confirmation.
+The local persistence baseline permits at most one active PAD session, one active
+resistance session, and one active cardio session. Different types may run at the
+same time, so Home can show up to three Resume cards. Starting another session of
+an already-active type requires the existing session to be resumed or ended first.
+This local rule is provisional pending the backend contract in issue #13.
 
 ## V1 non-goals
 

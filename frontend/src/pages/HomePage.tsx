@@ -1,28 +1,63 @@
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router";
 
 import { HealthStatus } from "../components/HealthStatus";
 import { Page } from "../components/Page";
-import { type ActiveSessionSummary, ResumeCard } from "../components/ResumeCard";
+import { ResumeCard } from "../components/ResumeCard";
+import { deriveActiveSessionSummaries } from "../local/activeSessions";
+import { useLocalData } from "../local/LocalDataProvider";
 import { routes } from "../routes";
 
-interface HomePageProps {
-  /** Supplied by the local session store once sessions can be recorded. */
-  activeSessions?: readonly ActiveSessionSummary[];
-}
+export function HomePage() {
+  const { snapshot, status } = useLocalData();
+  const [now, setNow] = useState(() => Date.now());
+  const persistedSessions = useMemo(
+    () => (snapshot === null ? [] : deriveActiveSessionSummaries(snapshot, now)),
+    [now, snapshot],
+  );
+  const hasRunningTimer = persistedSessions.some((session) => session.elapsedMs !== undefined);
 
-export function HomePage({ activeSessions = [] }: HomePageProps) {
+  useEffect(() => {
+    if (!hasRunningTimer) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setNow(Date.now());
+    }, 1000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [hasRunningTimer]);
+
   return (
     <Page heading="Gym HUD" documentTitle="Gym HUD">
       <section className="stack" aria-labelledby="resume-heading">
         <h2 id="resume-heading" className="eyebrow">
           Resume
         </h2>
-        {activeSessions.length === 0 ? (
+        {snapshot === null && status === "loading" ? (
+          <p className="muted">Checking this device for active sessions…</p>
+        ) : snapshot === null ? (
+          <p className="muted">Saved sessions are unavailable.</p>
+        ) : persistedSessions.length === 0 ? (
           <p className="muted">No active session.</p>
         ) : (
-          activeSessions.map((session) => <ResumeCard key={session.id} session={session} />)
+          persistedSessions.map((session) => <ResumeCard key={session.id} session={session} />)
         )}
       </section>
+
+      {snapshot !== null && (
+        <section className="storage-queue" aria-labelledby="queue-heading">
+          <h2 id="queue-heading" className="eyebrow">
+            Saved on this device
+          </h2>
+          <p className="muted">
+            {snapshot.pendingOutbox.length === 0
+              ? "No saved changes waiting to sync."
+              : `${snapshot.pendingOutbox.length.toString()} saved ${snapshot.pendingOutbox.length === 1 ? "change" : "changes"} waiting to sync. Server sync is not available yet.`}
+          </p>
+        </section>
+      )}
 
       {/* Becomes "Start new" once these screens can actually start a session. */}
       <section className="stack" aria-labelledby="workouts-heading">

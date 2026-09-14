@@ -2,7 +2,6 @@ import { render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { describe, expect, it } from "vitest";
 
-import { HomePage } from "../pages/HomePage";
 import { ResumeCard } from "./ResumeCard";
 import { formatDuration } from "./TimerDisplay";
 
@@ -42,23 +41,6 @@ describe("ResumeCard", () => {
 
     expect(screen.getByText("4 / 7 exercises complete")).toBeInTheDocument();
     expect(document.querySelector("time")).toBeNull();
-  });
-
-  it("renders one card per active session on Home", () => {
-    render(
-      <MemoryRouter>
-        <HomePage
-          activeSessions={[
-            { id: "pad-1", title: "PAD Walking", status: "Walking", elapsedMs: 0, href: "/pad" },
-            { id: "day-3", title: "Day 3", status: "4 / 7 exercises complete", href: "/resistance" },
-          ]}
-        />
-      </MemoryRouter>,
-    );
-
-    expect(screen.queryByText("No active session.")).not.toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Resume PAD Walking" })).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Resume Day 3" })).toBeInTheDocument();
   });
 });
 

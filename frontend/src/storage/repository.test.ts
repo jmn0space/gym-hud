@@ -1,0 +1,755 @@
+import { IDBDatabase, IDBFactory } from "fake-indexeddb";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import {
+  ActionConflictError,
+  ActiveSessionConflictError,
+  createLocalRepository,
+  LocalStorageError,
+  type LocalAction,
+  type LocalRecord,
+  type LocalRepository,
+  PreconditionFailedError,
+} from "./index";
+
+const openRepositories: LocalRepository[] = [];
+let databaseNumber = 0;
+
+function repository(
+  factory: IDBFactory,
+  options: {
+    databaseName?: string;
+    now?: () => Date;
+    uuid?: () => string;
+  } = {},
+): LocalRepository {
+  const result = createLocalRepository({
+    databaseName: options.databaseName ?? `repository-test-${(databaseNumber++).toString()}`,
+    indexedDB: factory,
+    ...(options.now === undefined ? {} : { now: options.now }),
+    uuid: options.uuid ?? (() => "client-uuid"),
+  });
+  openRepositories.push(result);
+  return result;
+}
+
+afterEach(() => {
+  for (const repo of openRepositories.splice(0)) {
+    repo.close();
+  }
+});
+
+describe("LocalRepository atomic actions", () => {
+  it("opens lazily and reports missing IndexedDB through the requested operation", async () => {
+    vi.stubGlobal("indexedDB", undefined);
+    let repo: LocalRepository | undefined;
+    expect(() => {
+      repo = createLocalRepository();
+    }).not.toThrow();
+    await expect(repo?.readSnapshot()).rejects.toBeInstanceOf(LocalStorageError);
+  });
+
+  it("commits domain records, metadata, and one dependency-ordered outbox entry atomically", async () => {
+    const repo = repository(new IDBFactory(), {
+      now: () => new Date("2026-09-14T10:15:30.000Z"),
+    });
+
+    const receipt = await repo.commitAction({
+      actionId: "start-pad",
+      changes: [
+        {
+          store: "walking_bouts",
+          operation: "put",
+          record: {
+            id: "bout-1",
+            walking_session_id: "session-1",
+            started_at: "2026-09-14T10:15:30.000Z",
+          },
+        },
+        {
+          store: "walking_sessions",
+          operation: "put",
+          record: { id: "session-1", status: "ACTIVE" },
+        },
+      ],
+    });
+
+    expect(receipt).toEqual({
+      actionId: "start-pad",
+      sequence: 1,
+      committedAt: "2026-09-14T10:15:30.000Z",
+    });
+    await expect(repo.getRecord("walking_sessions", "session-1")).resolves.toMatchObject({
+      id: "session-1",
+      status: "ACTIVE",
+      created_at: receipt.committedAt,
+      updated_at: receipt.committedAt,
+      deleted_at: null,
+    });
+
+    const pending = await repo.listPendingOutbox();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({
+      version: 1,
+      mutation_id: "start-pad",
+      sequence: 1,
+      created_at: receipt.committedAt,
+    });
+    expect(pending[0]?.changes.map((change) => change.store)).toEqual([
+      "walking_sessions",
+      "walking_bouts",
+    ]);
+    expect(pending[0]?.changes.every((change) => change.entity_id.length > 0)).toBe(true);
+  });
+
+  it("rolls back earlier writes when a later IndexedDB request cannot clone its value", async () => {
+    const factory = new IDBFactory();
+    const repo = repository(factory);
+    const uncloneable = {
+      id: "bout-uncloneable",
+      walking_session_id: "session-written-first",
+      ended_at: "2026-09-14T10:00:00.000Z",
+      callback: () => undefined,
+    } as unknown as LocalRecord;
+
+    const commit = repo.commitAction({
+      actionId: "late-request-failure",
+      changes: [
+        {
+          store: "walking_sessions",
+          operation: "put",
+          record: { id: "session-written-first", status: "COMPLETED" },
+        },
+        { store: "walking_bouts", operation: "put", record: uncloneable },
+      ],
+    });
+
+    await expect(commit).rejects.toMatchObject({ name: "DataCloneError" });
+    await expect(repo.getRecord("walking_sessions", "session-written-first")).resolves.toBeUndefined();
+    await expect(repo.getRecord("walking_bouts", "bout-uncloneable")).resolves.toBeUndefined();
+    await expect(repo.listPendingOutbox()).resolves.toEqual([]);
+
+    await expect(
+      repo.commitAction({
+        actionId: "after-rollback",
+        changes: [
+          {
+            store: "cardio_sessions",
+            operation: "put",
+            record: { id: "cardio-1", status: "COMPLETED" },
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({ sequence: 1 });
+  });
+
+  it("snapshots caller input before awaiting IndexedDB", async () => {
+    const repo = repository(new IDBFactory());
+    const action: LocalAction = {
+      actionId: "immutable-input",
+      changes: [
+        {
+          store: "cardio_sessions",
+          operation: "put",
+          record: { id: "cardio-snapshot", status: "ACTIVE", machine_name: "Arm Crank" },
+        },
+      ],
+    };
+
+    const committing = repo.commitAction(action);
+    const submitted = action.changes[0];
+    if (submitted?.operation === "put") {
+      submitted.record.status = "COMPLETED";
+      submitted.record.machine_name = "Rowing Machine";
+    }
+    await committing;
+
+    await expect(repo.getRecord("cardio_sessions", "cardio-snapshot")).resolves.toMatchObject({
+      status: "ACTIVE",
+      machine_name: "Arm Crank",
+    });
+    await expect(
+      repo.commitAction({
+        actionId: "immutable-input",
+        changes: [
+          {
+            store: "cardio_sessions",
+            operation: "put",
+            record: { id: "cardio-snapshot", status: "ACTIVE", machine_name: "Arm Crank" },
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({ sequence: 1 });
+  });
+});
+
+describe("LocalRepository recovery and logical actions", () => {
+  it("recovers committed records and pending actions through close and reopen", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "close-reopen";
+    const first = repository(factory, { databaseName });
+    await first.commitAction({
+      actionId: "persist-before-close",
+      changes: [
+        {
+          store: "resistance_sessions",
+          operation: "put",
+          record: { id: "resistance-1", status: "ACTIVE", title: "Day 3" },
+        },
+      ],
+    });
+    first.close();
+    await Promise.resolve();
+
+    const reopened = repository(factory, { databaseName });
+    const snapshot = await reopened.readSnapshot();
+    expect(snapshot.records.resistance_sessions).toEqual([
+      expect.objectContaining({ id: "resistance-1", status: "ACTIVE", title: "Day 3" }),
+    ]);
+    expect(snapshot.pendingOutbox).toEqual([
+      expect.objectContaining({ mutation_id: "persist-before-close", sequence: 1 }),
+    ]);
+  });
+
+  it("persists both records for finish/rest and rest/next-bout PAD transitions", async () => {
+    const repo = repository(new IDBFactory());
+    await repo.commitAction({
+      actionId: "start-first-bout",
+      changes: [
+        {
+          store: "walking_sessions",
+          operation: "put",
+          record: { id: "pad-1", status: "ACTIVE" },
+        },
+        {
+          store: "walking_bouts",
+          operation: "put",
+          record: {
+            id: "bout-1",
+            walking_session_id: "pad-1",
+            started_at: "2026-09-14T10:00:00.000Z",
+            ended_at: null,
+          },
+        },
+      ],
+    });
+
+    await repo.commitAction({
+      actionId: "finish-bout-start-rest",
+      preconditions: [
+        { store: "walking_bouts", id: "bout-1", expected: { ended_at: null } },
+      ],
+      changes: [
+        {
+          store: "walking_bouts",
+          operation: "put",
+          record: {
+            id: "bout-1",
+            walking_session_id: "pad-1",
+            started_at: "2026-09-14T10:00:00.000Z",
+            ended_at: "2026-09-14T10:05:00.000Z",
+            pain_score: 4,
+          },
+        },
+        {
+          store: "walking_rests",
+          operation: "put",
+          record: {
+            id: "rest-1",
+            walking_bout_id: "bout-1",
+            started_at: "2026-09-14T10:05:00.000Z",
+            ended_at: null,
+          },
+        },
+      ],
+    });
+
+    await repo.commitAction({
+      actionId: "finish-rest-start-next-bout",
+      preconditions: [
+        { store: "walking_rests", id: "rest-1", expected: { ended_at: null } },
+      ],
+      changes: [
+        {
+          store: "walking_rests",
+          operation: "put",
+          record: {
+            id: "rest-1",
+            walking_bout_id: "bout-1",
+            started_at: "2026-09-14T10:05:00.000Z",
+            ended_at: "2026-09-14T10:08:00.000Z",
+          },
+        },
+        {
+          store: "walking_bouts",
+          operation: "put",
+          record: {
+            id: "bout-2",
+            walking_session_id: "pad-1",
+            started_at: "2026-09-14T10:08:00.000Z",
+            ended_at: null,
+          },
+        },
+      ],
+    });
+
+    await expect(repo.getRecord("walking_rests", "rest-1")).resolves.toMatchObject({
+      ended_at: "2026-09-14T10:08:00.000Z",
+    });
+    await expect(repo.getRecord("walking_bouts", "bout-2")).resolves.toMatchObject({
+      walking_session_id: "pad-1",
+      ended_at: null,
+    });
+    const pending = await repo.listPendingOutbox();
+    expect(pending.map((entry) => entry.changes.map((change) => change.entity_id))).toEqual([
+      ["pad-1", "bout-1"],
+      ["bout-1", "rest-1"],
+      ["bout-2", "rest-1"],
+    ]);
+  });
+
+  it("uses durable tombstones and orders child deletes before parent deletes", async () => {
+    const times = [
+      new Date("2026-09-14T10:00:00.000Z"),
+      new Date("2026-09-14T10:10:00.000Z"),
+    ];
+    const repo = repository(new IDBFactory(), { now: () => times.shift() ?? new Date(0) });
+    await repo.commitAction({
+      actionId: "create-pad-tree",
+      changes: [
+        {
+          store: "walking_sessions",
+          operation: "put",
+          record: { id: "delete-session", status: "COMPLETED" },
+        },
+        {
+          store: "walking_bouts",
+          operation: "put",
+          record: { id: "delete-bout", walking_session_id: "delete-session" },
+        },
+        {
+          store: "walking_pauses",
+          operation: "put",
+          record: { id: "delete-pause", walking_bout_id: "delete-bout" },
+        },
+      ],
+    });
+
+    await repo.commitAction({
+      actionId: "delete-pad-tree",
+      changes: [
+        { store: "walking_sessions", operation: "delete", id: "delete-session" },
+        { store: "walking_bouts", operation: "delete", id: "delete-bout" },
+        { store: "walking_pauses", operation: "delete", id: "delete-pause" },
+      ],
+    });
+
+    await expect(repo.listRecords("walking_sessions")).resolves.toEqual([]);
+    await expect(repo.getRecord("walking_sessions", "delete-session")).resolves.toBeUndefined();
+    await expect(repo.getRecord("walking_sessions", "delete-session", true)).resolves.toMatchObject({
+      id: "delete-session",
+      created_at: "2026-09-14T10:00:00.000Z",
+      updated_at: "2026-09-14T10:10:00.000Z",
+      deleted_at: "2026-09-14T10:10:00.000Z",
+    });
+
+    const pending = await repo.listPendingOutbox();
+    expect(pending[1]?.changes.map((change) => change.store)).toEqual([
+      "walking_pauses",
+      "walking_bouts",
+      "walking_sessions",
+    ]);
+    expect(pending[1]?.changes.every((change) => change.operation === "delete")).toBe(true);
+  });
+
+  it("treats a tombstoned record as absent for precondition checks", async () => {
+    const repo = repository(new IDBFactory());
+    await repo.commitAction({
+      actionId: "create-then-delete",
+      changes: [
+        {
+          store: "cardio_sessions",
+          operation: "put",
+          record: { id: "cardio-tombstoned", status: "ACTIVE" },
+        },
+      ],
+    });
+    await repo.commitAction({
+      actionId: "delete-cardio",
+      changes: [{ store: "cardio_sessions", operation: "delete", id: "cardio-tombstoned" }],
+    });
+
+    // A null (absence) precondition must succeed against a tombstoned record,
+    // consistent with delete/isOpen/isActive treating tombstones as logically gone.
+    await expect(
+      repo.commitAction({
+        actionId: "recreate-cardio",
+        preconditions: [{ store: "cardio_sessions", id: "cardio-tombstoned", expected: null }],
+        changes: [
+          {
+            store: "cardio_sessions",
+            operation: "put",
+            record: { id: "cardio-tombstoned", status: "ACTIVE" },
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({ sequence: 3 });
+
+    // An existence precondition must fail against a tombstoned record.
+    await repo.commitAction({
+      actionId: "delete-cardio-again",
+      changes: [{ store: "cardio_sessions", operation: "delete", id: "cardio-tombstoned" }],
+    });
+    await expect(
+      repo.commitAction({
+        actionId: "expect-existing-but-tombstoned",
+        preconditions: [
+          { store: "cardio_sessions", id: "cardio-tombstoned", expected: { status: "ACTIVE" } },
+        ],
+        changes: [
+          {
+            store: "exercise_registry",
+            operation: "put",
+            record: { id: "unrelated-exercise", name: "Unrelated" },
+          },
+        ],
+      }),
+    ).rejects.toBeInstanceOf(PreconditionFailedError);
+  });
+});
+
+describe("LocalRepository retry, concurrency, and ordering", () => {
+  it("deduplicates the same action after acknowledgement and rejects ID reuse", async () => {
+    const repo = repository(new IDBFactory());
+    const action: LocalAction = {
+      actionId: "stable-action-id",
+      changes: [
+        {
+          store: "exercise_registry",
+          operation: "put",
+          record: { id: "chest-press", name: "Chest Press" },
+        },
+      ],
+    };
+
+    const first = await repo.commitAction(action);
+    await repo.acknowledgeOutbox(action.actionId);
+    await expect(repo.listPendingOutbox()).resolves.toEqual([]);
+    await expect(repo.commitAction(action)).resolves.toEqual(first);
+    await expect(repo.listPendingOutbox()).resolves.toEqual([]);
+
+    await expect(
+      repo.commitAction({
+        ...action,
+        changes: [
+          {
+            store: "exercise_registry",
+            operation: "put",
+            record: { id: "chest-press", name: "Changed exercise" },
+          },
+        ],
+      }),
+    ).rejects.toBeInstanceOf(ActionConflictError);
+  });
+
+  it("evaluates stale-value preconditions inside serialized transactions", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "concurrent-preconditions";
+    const first = repository(factory, { databaseName });
+    const second = repository(factory, { databaseName });
+    await first.commitAction({
+      actionId: "create-template",
+      changes: [
+        {
+          store: "routine_templates",
+          operation: "put",
+          record: { id: "day-1", status: "DRAFT", name: "Day 1" },
+        },
+      ],
+    });
+
+    const attempts = await Promise.allSettled([
+      first.commitAction({
+        actionId: "publish-template",
+        preconditions: [
+          { store: "routine_templates", id: "day-1", expected: { status: "DRAFT" } },
+        ],
+        changes: [
+          {
+            store: "routine_templates",
+            operation: "put",
+            record: { id: "day-1", status: "PUBLISHED", name: "Day 1" },
+          },
+        ],
+      }),
+      second.commitAction({
+        actionId: "archive-template",
+        preconditions: [
+          { store: "routine_templates", id: "day-1", expected: { status: "DRAFT" } },
+        ],
+        changes: [
+          {
+            store: "routine_templates",
+            operation: "put",
+            record: { id: "day-1", status: "ARCHIVED", name: "Day 1" },
+          },
+        ],
+      }),
+    ]);
+
+    expect(attempts.filter((attempt) => attempt.status === "fulfilled")).toHaveLength(1);
+    const rejected = attempts.find((attempt) => attempt.status === "rejected");
+    expect(rejected).toBeDefined();
+    if (rejected?.status === "rejected") {
+      expect(rejected.reason).toBeInstanceOf(PreconditionFailedError);
+    }
+    const finalRecord = await first.getRecord("routine_templates", "day-1");
+    expect(["PUBLISHED", "ARCHIVED"]).toContain(finalRecord?.status);
+  });
+
+  it("permits concurrent different session types but rejects two active sessions of one type", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "concurrent-active-sessions";
+    const first = repository(factory, { databaseName });
+    const second = repository(factory, { databaseName });
+
+    await expect(
+      Promise.all([
+        first.commitAction({
+          actionId: "start-pad",
+          preconditions: [
+            { store: "walking_sessions", id: "pad-active", expected: null },
+          ],
+          changes: [
+            {
+              store: "walking_sessions",
+              operation: "put",
+              record: { id: "pad-active", status: "ACTIVE" },
+            },
+          ],
+        }),
+        second.commitAction({
+          actionId: "start-resistance",
+          preconditions: [
+            { store: "resistance_sessions", id: "resistance-active", expected: null },
+          ],
+          changes: [
+            {
+              store: "resistance_sessions",
+              operation: "put",
+              record: { id: "resistance-active", status: "ACTIVE" },
+            },
+          ],
+        }),
+      ]),
+    ).resolves.toHaveLength(2);
+
+    const sameType = await Promise.allSettled([
+      first.commitAction({
+        actionId: "start-cardio-a",
+        preconditions: [{ store: "cardio_sessions", id: "cardio-a", expected: null }],
+        changes: [
+          {
+            store: "cardio_sessions",
+            operation: "put",
+            record: { id: "cardio-a", status: "ACTIVE" },
+          },
+        ],
+      }),
+      second.commitAction({
+        actionId: "start-cardio-b",
+        preconditions: [{ store: "cardio_sessions", id: "cardio-b", expected: null }],
+        changes: [
+          {
+            store: "cardio_sessions",
+            operation: "put",
+            record: { id: "cardio-b", status: "ACTIVE" },
+          },
+        ],
+      }),
+    ]);
+
+    expect(sameType.filter((attempt) => attempt.status === "fulfilled")).toHaveLength(1);
+    const rejected = sameType.find((attempt) => attempt.status === "rejected");
+    expect(rejected).toBeDefined();
+    if (rejected?.status === "rejected") {
+      expect(rejected.reason).toBeInstanceOf(ActiveSessionConflictError);
+    }
+    await expect(first.listRecords("cardio_sessions")).resolves.toHaveLength(1);
+  });
+
+  it("serializes double-taps that create open PAD bouts and pauses", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "concurrent-pad-intervals";
+    const first = repository(factory, { databaseName });
+    const second = repository(factory, { databaseName });
+    await first.commitAction({
+      actionId: "create-pad-parent",
+      changes: [
+        {
+          store: "walking_sessions",
+          operation: "put",
+          record: { id: "pad-parent", status: "ACTIVE" },
+        },
+      ],
+    });
+
+    const boutAttempts = await Promise.allSettled([
+      first.commitAction({
+        actionId: "start-bout-a",
+        preconditions: [{ store: "walking_bouts", id: "bout-a", expected: null }],
+        changes: [
+          {
+            store: "walking_bouts",
+            operation: "put",
+            record: { id: "bout-a", walking_session_id: "pad-parent", ended_at: null },
+          },
+        ],
+      }),
+      second.commitAction({
+        actionId: "start-bout-b",
+        preconditions: [{ store: "walking_bouts", id: "bout-b", expected: null }],
+        changes: [
+          {
+            store: "walking_bouts",
+            operation: "put",
+            record: { id: "bout-b", walking_session_id: "pad-parent", ended_at: null },
+          },
+        ],
+      }),
+    ]);
+    expect(boutAttempts.filter((attempt) => attempt.status === "fulfilled")).toHaveLength(1);
+    const rejectedBout = boutAttempts.find((attempt) => attempt.status === "rejected");
+    expect(rejectedBout).toBeDefined();
+    if (rejectedBout?.status === "rejected") {
+      expect(rejectedBout.reason).toBeInstanceOf(ActiveSessionConflictError);
+    }
+
+    const [openBout] = await first.listRecords("walking_bouts");
+    expect(openBout).toBeDefined();
+    const pauseAttempts = await Promise.allSettled([
+      first.commitAction({
+        actionId: "pause-a",
+        preconditions: [{ store: "walking_pauses", id: "pause-a", expected: null }],
+        changes: [
+          {
+            store: "walking_pauses",
+            operation: "put",
+            record: { id: "pause-a", walking_bout_id: openBout?.id ?? "", ended_at: null },
+          },
+        ],
+      }),
+      second.commitAction({
+        actionId: "pause-b",
+        preconditions: [{ store: "walking_pauses", id: "pause-b", expected: null }],
+        changes: [
+          {
+            store: "walking_pauses",
+            operation: "put",
+            record: { id: "pause-b", walking_bout_id: openBout?.id ?? "", ended_at: null },
+          },
+        ],
+      }),
+    ]);
+    expect(pauseAttempts.filter((attempt) => attempt.status === "fulfilled")).toHaveLength(1);
+    const rejectedPause = pauseAttempts.find((attempt) => attempt.status === "rejected");
+    expect(rejectedPause).toBeDefined();
+    if (rejectedPause?.status === "rejected") {
+      expect(rejectedPause.reason).toBeInstanceOf(ActiveSessionConflictError);
+    }
+    await expect(first.listRecords("walking_pauses")).resolves.toHaveLength(1);
+  });
+
+  it("uses a monotonic transaction sequence when the UTC wall clock moves backwards", async () => {
+    const times = [
+      new Date("2026-09-14T12:00:00.000Z"),
+      new Date("2026-09-14T11:00:00.000Z"),
+    ];
+    const repo = repository(new IDBFactory(), { now: () => times.shift() ?? new Date(0) });
+
+    const laterClock = await repo.commitAction({
+      actionId: "clock-one",
+      changes: [
+        {
+          store: "exercise_registry",
+          operation: "put",
+          record: { id: "exercise-1", name: "First" },
+        },
+      ],
+    });
+    const rolledBackClock = await repo.commitAction({
+      actionId: "clock-two",
+      changes: [
+        {
+          store: "exercise_registry",
+          operation: "put",
+          record: { id: "exercise-2", name: "Second" },
+        },
+      ],
+    });
+
+    expect(laterClock).toMatchObject({ sequence: 1, committedAt: "2026-09-14T12:00:00.000Z" });
+    expect(rolledBackClock).toMatchObject({
+      sequence: 2,
+      committedAt: "2026-09-14T11:00:00.000Z",
+    });
+    expect((await repo.listPendingOutbox()).map((entry) => entry.sequence)).toEqual([1, 2]);
+  });
+
+  it("persists caller metadata and reference caches without colliding with internal metadata", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "metadata-and-cache";
+    const first = repository(factory, { databaseName });
+    await first.setSyncMetadata("last_sequence", { cursor: "server-17" });
+    await first.writeReferenceCache("pad-defaults", { max_bout_seconds: 300 });
+    await expect(first.listPendingOutbox()).resolves.toEqual([]);
+    first.close();
+    await Promise.resolve();
+
+    const reopened = repository(factory, { databaseName });
+    await expect(reopened.getSyncMetadata("last_sequence")).resolves.toEqual({
+      cursor: "server-17",
+    });
+    await expect(reopened.readReferenceCache("pad-defaults")).resolves.toEqual({
+      max_bout_seconds: 300,
+    });
+    await expect(
+      reopened.commitAction({
+        actionId: "first-domain-action",
+        changes: [
+          {
+            store: "exercise_registry",
+            operation: "put",
+            record: { id: "exercise-after-metadata", name: "Arm Crank" },
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({ sequence: 1 });
+  });
+
+  it("normalizes a synchronous db.transaction failure in acknowledgeOutbox and writeKeyValue", async () => {
+    const repo = repository(new IDBFactory());
+    await repo.commitAction({
+      actionId: "seed-for-transaction-failure",
+      changes: [
+        { store: "exercise_registry", operation: "put", record: { id: "seed", name: "Seed" } },
+      ],
+    });
+
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- reference is restored, never invoked unbound
+    const original = IDBDatabase.prototype.transaction;
+    IDBDatabase.prototype.transaction = function (): never {
+      throw new DOMException("Connection is closing", "InvalidStateError");
+    };
+    try {
+      await expect(repo.acknowledgeOutbox("seed-for-transaction-failure")).rejects.toBeInstanceOf(
+        LocalStorageError,
+      );
+      await expect(repo.setSyncMetadata("cursor", "server-1")).rejects.toBeInstanceOf(
+        LocalStorageError,
+      );
+    } finally {
+      IDBDatabase.prototype.transaction = original;
+    }
+  });
+});
