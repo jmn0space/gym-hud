@@ -2,6 +2,61 @@
 
 Mobile-first PAD walking and gym workout tracking application.
 
+## Frontend quick start
+
+The mobile shell in `frontend/` uses React, TypeScript, and Vite. It requires
+Node.js 24 (see `frontend/.nvmrc`); dependencies are locked in
+`frontend/package-lock.json` and pinned to exact versions.
+
+```bash
+cd frontend
+nvm use
+npm ci
+npm run dev
+```
+
+The app runs at `http://localhost:5173`. The port is fixed because Django's
+local settings trust exactly that origin for CSRF and CORS.
+
+### API configuration
+
+The frontend calls the API with same-origin requests. In development the Vite
+dev server proxies `/api` to the Django backend, so session cookies work without
+CORS. Start the backend (see below) and the Home screen reports its health from
+`GET /api/v1/health/`.
+
+Copy `frontend/.env.example` to `frontend/.env.local` to override:
+
+- `API_PROXY_TARGET` — development proxy target (default `http://127.0.0.1:8000`).
+- `VITE_API_BASE_URL` — API origin prefix compiled into the bundle (default
+  empty, meaning same-origin). `VITE_*` values are public; never put secrets there.
+
+To try the shell on a phone on the same network, run `npm run dev -- --host` and
+open the printed network URL.
+
+Django checks the page origin on unsafe requests (login and sync, once they
+exist). Local settings trust only `http://localhost:5173`, so on the desktop open
+`localhost`, not `127.0.0.1`. For a phone, add its network origin for that run
+only, without changing the committed defaults:
+
+```bash
+export DJANGO_CSRF_TRUSTED_ORIGINS=http://192.168.1.5:5173  # your printed network URL
+python backend/manage.py runserver
+```
+
+### Frontend quality checks
+
+```bash
+npm run typecheck
+npm run lint
+npm test
+npm run build
+npm run check   # all of the above
+```
+
+CI runs a locked `npm ci`, a runtime dependency audit (High/Critical fails),
+type checking, ESLint (including accessibility rules), Vitest, and a production build.
+
 ## Backend quick start
 
 Gym HUD uses Django 6.x, Django REST Framework, PostgreSQL, and Docker Compose.

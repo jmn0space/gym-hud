@@ -17,3 +17,6 @@ dist/
 build/
 *.egg-info/
 .DS_Store
+
+# Frontend
+node_modules/
