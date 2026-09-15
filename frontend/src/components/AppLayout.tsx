@@ -1,6 +1,8 @@
 import { useEffect, useRef } from "react";
 import { Outlet, useLocation } from "react-router";
 
+import { ExpiredSessionBanner } from "../auth/ExpiredSessionBanner";
+import { AccountStatus } from "./AccountStatus";
 import { BottomNav } from "./BottomNav";
 import { LocalDataStatus } from "./LocalDataStatus";
 
@@ -23,7 +25,9 @@ export function AppLayout() {
   return (
     <div className="app">
       <main ref={mainRef} className="app__main">
+        <ExpiredSessionBanner />
         <LocalDataStatus />
+        <AccountStatus />
         <Outlet />
       </main>
       <BottomNav />

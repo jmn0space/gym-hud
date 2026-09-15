@@ -100,6 +100,46 @@ A healthy response is:
 }
 ```
 
+### Provisioning the application account
+
+Gym HUD is single-user: one account is used for both the app login and
+`/admin/`. There are two supported ways to create it.
+
+Interactively (prompts for username/password):
+
+```bash
+python backend/manage.py createsuperuser
+# or, against the running Compose service:
+docker compose exec web python backend/manage.py createsuperuser
+```
+
+Non-interactively, for scripted/first-boot provisioning, use the
+`ensure_app_user` management command. It reads the credentials from the
+environment so the password is never typed as a command-line argument or
+printed to logs, validates the password against the configured password
+validators (`AUTH_PASSWORD_VALIDATORS`), and is safe to run repeatedly:
+without `--reset-password` it leaves an existing user's password untouched
+and only reconciles the superuser/staff/active flags; with `--reset-password`
+it also updates the password.
+
+```bash
+export DJANGO_APP_USERNAME=coach
+export DJANGO_APP_PASSWORD='use a strong, unique passphrase'
+python backend/manage.py ensure_app_user
+
+# or, against the running Compose service:
+docker compose exec \
+  -e DJANGO_APP_USERNAME=coach \
+  -e DJANGO_APP_PASSWORD='use a strong, unique passphrase' \
+  web python backend/manage.py ensure_app_user
+
+# to change the password of an already-provisioned account:
+docker compose exec \
+  -e DJANGO_APP_USERNAME=coach \
+  -e DJANGO_APP_PASSWORD='a new strong, unique passphrase' \
+  web python backend/manage.py ensure_app_user --reset-password
+```
+
 ### Local Docker Compose
 
 ```bash

@@ -123,11 +123,18 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework.authentication.SessionAuthentication",
+        "core.authentication.SessionAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
     ],
+    "EXCEPTION_HANDLER": "core.exceptions.exception_handler",
+    # Only the login endpoint declares the "login" throttle scope; every other
+    # view is unaffected. Overridable per deployment to tune brute-force
+    # resistance without a code change.
+    "DEFAULT_THROTTLE_RATES": {
+        "login": os.getenv("DJANGO_LOGIN_THROTTLE_RATE", "10/min"),
+    },
 }
 
 CORS_ALLOWED_ORIGINS: list[str] = [
@@ -138,7 +145,21 @@ CORS_ALLOW_CREDENTIALS = True
 SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SECURE = True
 SESSION_COOKIE_SAMESITE = "Lax"
+# Env-overridable so a deployment can shorten/lengthen how long a signed-in
+# session survives without a new login; defaults to 30 days to support the
+# "reopen the app after being offline for a while" continuity requirement.
+SESSION_COOKIE_AGE = int(os.getenv("DJANGO_SESSION_COOKIE_AGE", str(60 * 60 * 24 * 30)))
+
 CSRF_COOKIE_SECURE = True
+# The SPA reads the csrftoken cookie in JavaScript and echoes it back as the
+# X-CSRFToken header (Django's documented "AJAX" CSRF pattern), so this
+# cookie must stay readable from script. It carries no session/authentication
+# data by itself, so this does not weaken the session cookie's own HttpOnly
+# protection.
+CSRF_COOKIE_HTTPONLY = False
+# Render a JSON {"code": "csrf_failed", ...} error for /api/ paths instead of
+# Django's default HTML failure page; see core.csrf.csrf_failure.
+CSRF_FAILURE_VIEW = "core.csrf.csrf_failure"
 
 SECURE_SSL_REDIRECT = True
 SECURE_HSTS_SECONDS = 31_536_000
