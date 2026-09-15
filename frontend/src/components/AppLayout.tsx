@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { Outlet, useLocation } from "react-router";
 
 import { BottomNav } from "./BottomNav";
+import { LocalDataStatus } from "./LocalDataStatus";
 
 export function AppLayout() {
   const { pathname } = useLocation();
@@ -22,6 +23,7 @@ export function AppLayout() {
   return (
     <div className="app">
       <main ref={mainRef} className="app__main">
+        <LocalDataStatus />
         <Outlet />
       </main>
       <BottomNav />

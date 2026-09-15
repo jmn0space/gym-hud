@@ -8,18 +8,26 @@ import { NotFoundPage } from "./pages/NotFoundPage";
 import { PadPage } from "./pages/PadPage";
 import { ResistancePage } from "./pages/ResistancePage";
 import { routes } from "./routes";
+import { LocalDataProvider } from "./local/LocalDataProvider";
+import type { LocalRepository } from "./storage";
 
-export function App() {
+interface AppProps {
+  repository?: LocalRepository | undefined;
+}
+
+export function App({ repository }: AppProps) {
   return (
-    <Routes>
-      <Route element={<AppLayout />}>
-        <Route index element={<HomePage />} />
-        <Route path={routes.pad} element={<PadPage />} />
-        <Route path={routes.resistance} element={<ResistancePage />} />
-        <Route path={routes.cardio} element={<CardioPage />} />
-        <Route path={routes.history} element={<HistoryPage />} />
-        <Route path="*" element={<NotFoundPage />} />
-      </Route>
-    </Routes>
+    <LocalDataProvider repository={repository}>
+      <Routes>
+        <Route element={<AppLayout />}>
+          <Route index element={<HomePage />} />
+          <Route path={routes.pad} element={<PadPage />} />
+          <Route path={routes.resistance} element={<ResistancePage />} />
+          <Route path={routes.cardio} element={<CardioPage />} />
+          <Route path={routes.history} element={<HistoryPage />} />
+          <Route path="*" element={<NotFoundPage />} />
+        </Route>
+      </Routes>
+    </LocalDataProvider>
   );
 }

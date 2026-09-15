@@ -57,6 +57,15 @@ npm run check   # all of the above
 CI runs a locked `npm ci`, a runtime dependency audit (High/Critical fails),
 type checking, ESLint (including accessibility rules), Vitest, and a production build.
 
+### Local persistence
+
+Workout actions are written to IndexedDB together with one pending synchronization
+envelope in a single transaction. The UI reports success only after that transaction
+completes, and reload recovery reads persisted records and the pending queue back
+from IndexedDB. The versioned local envelope is provisional while the backend sync
+contract in issue #13 remains open. See [Data & synchronization](docs/data-sync.md)
+for the record, ordering, retry, and active-session rules.
+
 ## Backend quick start
 
 Gym HUD uses Django 6.x, Django REST Framework, PostgreSQL, and Docker Compose.

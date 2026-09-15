@@ -5,13 +5,14 @@ import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "./App";
+import { createLocalRepository, type LocalRepository } from "./storage";
 
 // StrictMode matches the dev entry point and double-invokes effects.
-function renderApp(initialPath = "/") {
+function renderApp(initialPath = "/", repository?: LocalRepository) {
   return render(
     <StrictMode>
       <MemoryRouter initialEntries={[initialPath]}>
-        <App />
+        <App repository={repository} />
       </MemoryRouter>
     </StrictMode>,
   );
@@ -33,7 +34,8 @@ describe("navigation smoke test", () => {
     renderApp();
 
     expect(screen.getByRole("heading", { level: 1, name: "Gym HUD" })).toBeInTheDocument();
-    expect(screen.getByText("No active session.")).toBeInTheDocument();
+    expect(await screen.findByText("No active session.")).toBeInTheDocument();
+    expect(screen.getByText("No saved changes waiting to sync.")).toBeInTheDocument();
     expect(primaryNav().getByRole("link", { name: "Home" })).toHaveAttribute(
       "aria-current",
       "page",
@@ -95,5 +97,75 @@ describe("navigation smoke test", () => {
 
     expect(screen.getByRole("heading", { level: 1, name: "Page not found" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Go to Home" })).toHaveAttribute("href", "/");
+  });
+
+  it("recovers a paused PAD session and pending change from IndexedDB", async () => {
+    const pauseStartedAt = new Date(Date.now() - 120_000).toISOString();
+    const repository = createLocalRepository({
+      databaseName: `gym-hud-app-recovery-${crypto.randomUUID()}`,
+    });
+    await repository.commitAction({
+      actionId: crypto.randomUUID(),
+      changes: [
+        {
+          store: "walking_sessions",
+          operation: "put",
+          record: {
+            id: "session-1",
+            status: "ACTIVE",
+            started_at: new Date(Date.now() - 600_000).toISOString(),
+          },
+        },
+        {
+          store: "walking_bouts",
+          operation: "put",
+          record: {
+            id: "bout-1",
+            walking_session_id: "session-1",
+            started_at: new Date(Date.now() - 480_000).toISOString(),
+            ended_at: null,
+          },
+        },
+        {
+          store: "walking_pauses",
+          operation: "put",
+          record: {
+            id: "pause-1",
+            walking_bout_id: "bout-1",
+            started_at: pauseStartedAt,
+            ended_at: null,
+          },
+        },
+      ],
+    });
+
+    const view = renderApp("/", repository);
+
+    expect(await screen.findByRole("link", { name: "Resume PAD Walking" })).toHaveAttribute(
+      "href",
+      "/pad",
+    );
+    expect(screen.getByText("Paused")).toBeInTheDocument();
+    expect(screen.getByText("02:00")).toBeInTheDocument();
+    expect(screen.getByText("1 saved change waiting to sync. Server sync is not available yet."))
+      .toBeInTheDocument();
+
+    view.unmount();
+    repository.close();
+  });
+
+  it("shows a retryable open error without claiming there is no active session", async () => {
+    const repository = {
+      readSnapshot: vi.fn(() => Promise.reject(new Error("IndexedDB blocked"))),
+      close: vi.fn(),
+    } as unknown as LocalRepository;
+    renderApp("/", repository);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Saved workout data could not be opened.",
+    );
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(screen.getByText("Saved sessions are unavailable.")).toBeInTheDocument();
+    expect(screen.queryByText("No active session.")).not.toBeInTheDocument();
   });
 });
