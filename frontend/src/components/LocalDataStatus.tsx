@@ -1,7 +1,7 @@
 import { useLocalData } from "../local/LocalDataProvider";
 
 export function LocalDataStatus() {
-  const { error, retry, snapshot, status } = useLocalData();
+  const { dismissError, error, retry, snapshot, status } = useLocalData();
 
   if (status === "loading" && snapshot === null) {
     return (
@@ -19,20 +19,26 @@ export function LocalDataStatus() {
     );
   }
 
-  if (status !== "error" || error === null) {
+  if (error === null) {
     return null;
   }
 
   return (
     <aside className="storage-error" role="alert">
       <p>{error.message}</p>
-      <button
-        className="button button--quiet"
-        type="button"
-        onClick={() => void retry().catch(() => undefined)}
-      >
-        Retry
-      </button>
+      {error.retryable ? (
+        <button
+          className="button button--quiet"
+          type="button"
+          onClick={() => void retry().catch(() => undefined)}
+        >
+          Retry
+        </button>
+      ) : (
+        <button className="button button--quiet" type="button" onClick={dismissError}>
+          Dismiss
+        </button>
+      )}
     </aside>
   );
 }

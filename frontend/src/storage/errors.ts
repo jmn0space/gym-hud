@@ -25,3 +25,14 @@ export class RecordNotFoundError extends LocalStorageError {
 export class StorageCorruptionError extends LocalStorageError {
   override readonly name = "StorageCorruptionError";
 }
+
+/**
+ * Thrown when a local write fails because the underlying IndexedDB request or
+ * transaction failed with a `QuotaExceededError` DOMException (the device or
+ * origin storage quota was reached). The original DOMException is always
+ * preserved as `cause` so callers can distinguish this from other storage
+ * failures by walking the cause chain, without depending on this class alone.
+ */
+export class StorageQuotaExceededError extends LocalStorageError {
+  override readonly name = "StorageQuotaExceededError";
+}

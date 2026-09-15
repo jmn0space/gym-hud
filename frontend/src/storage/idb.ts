@@ -5,6 +5,8 @@ import {
   upgradeDatabase,
 } from "./schema";
 
+export { requestResult, transactionComplete } from "./idb-requests";
+
 export function openLocalDatabase(
   factory: IDBFactory,
   databaseName = DEFAULT_DATABASE_NAME,
@@ -49,31 +51,6 @@ export function openLocalDatabase(
         database.close();
       };
       resolve(database);
-    };
-  });
-}
-
-export function requestResult<T>(request: IDBRequest<T>): Promise<T> {
-  return new Promise((resolve, reject) => {
-    request.onsuccess = () => {
-      resolve(request.result);
-    };
-    request.onerror = () => {
-      reject(request.error ?? new LocalStorageError("IndexedDB request failed"));
-    };
-  });
-}
-
-export function transactionComplete(transaction: IDBTransaction): Promise<void> {
-  return new Promise((resolve, reject) => {
-    transaction.oncomplete = () => {
-      resolve();
-    };
-    transaction.onabort = () => {
-      reject(transaction.error ?? new LocalStorageError("IndexedDB transaction was aborted"));
-    };
-    transaction.onerror = () => {
-      // The abort event is the authoritative transaction outcome.
     };
   });
 }

@@ -6,6 +6,7 @@ export {
   PreconditionFailedError,
   RecordNotFoundError,
   StorageCorruptionError,
+  StorageQuotaExceededError,
 } from "./errors";
 export { createUuid, utcNow } from "./helpers";
 export { createLocalRepository } from "./repository";

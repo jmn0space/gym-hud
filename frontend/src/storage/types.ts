@@ -92,6 +92,23 @@ export interface OutboxEntry {
   changes: OutboxChange[];
 }
 
+/**
+ * The startup recovery read. Bounded to live state so its cost does not grow with
+ * all-time history:
+ *
+ * - `walking_sessions`, `resistance_sessions`, `cardio_sessions`: at most one live
+ *   (non-tombstoned) ACTIVE record each, since only one session per type may be
+ *   active at a time.
+ * - `walking_bouts`, `walking_pauses`, `walking_rests`: only the live descendants
+ *   of an active walking session (bouts of that session, pauses/rests of those
+ *   bouts) — not full history, and not limited to open intervals.
+ * - `resistance_rows`: only the live rows of an active resistance session.
+ * - `routine_templates`, `routine_exercises`, `exercise_registry`: returned in
+ *   full, since they are small reference/config data rather than workout history.
+ * - `pendingOutbox`: unchanged, the full ordered pending queue.
+ *
+ * Use `listRecords`/`getRecord` for full-history access (e.g. History screens).
+ */
 export interface RecoverySnapshot {
   records: Record<DomainStore, LocalRecord[]>;
   pendingOutbox: OutboxEntry[];

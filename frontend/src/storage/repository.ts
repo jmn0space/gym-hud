@@ -6,10 +6,16 @@ import {
   PreconditionFailedError,
   RecordNotFoundError,
   StorageCorruptionError,
+  StorageQuotaExceededError,
 } from "./errors";
 import { createUuid, utcNow } from "./helpers";
 import { openLocalDatabase, requestResult, transactionComplete } from "./idb";
-import { DATABASE_STORES, DEFAULT_DATABASE_NAME, OUTBOX_SEQUENCE_INDEX } from "./schema";
+import {
+  DATABASE_STORES,
+  DEFAULT_DATABASE_NAME,
+  OUTBOX_SEQUENCE_INDEX,
+  PARENT_INDEXES,
+} from "./schema";
 import {
   DOMAIN_STORES,
   type CommitReceipt,
@@ -35,6 +41,20 @@ interface MetadataRecord {
   value: JsonValue;
 }
 
+/**
+ * A durable marker recording the currently ACTIVE session (scoped by store name)
+ * or open bout/pause/rest (scoped by parent id). Its existence and uniqueness
+ * *is* the one-active/one-open invariant: `commitAction` only ever has to look up
+ * the marker(s) for the scopes an action actually touches, instead of scanning
+ * whole stores. Never returned to callers or embedded in outbox payloads.
+ */
+interface ActiveMarkerRecord {
+  id: string;
+  store: DomainStore;
+  scopeKey: string;
+  recordId: string;
+}
+
 const LAST_SEQUENCE_KEY = "last_sequence";
 const CLIENT_ID_KEY = "client_id";
 const ACTIVE_SESSION_STORES = [
@@ -42,12 +62,23 @@ const ACTIVE_SESSION_STORES = [
   "resistance_sessions",
   "cardio_sessions",
 ] as const satisfies readonly DomainStore[];
+const OPEN_PARENT_FIELD_BY_STORE: Partial<Record<DomainStore, string>> = {
+  walking_bouts: "walking_session_id",
+  walking_pauses: "walking_bout_id",
+  walking_rests: "walking_bout_id",
+};
 const CARDINALITY_STORES = [
   ...ACTIVE_SESSION_STORES,
-  "walking_bouts",
-  "walking_pauses",
-  "walking_rests",
+  ...(Object.keys(OPEN_PARENT_FIELD_BY_STORE) as DomainStore[]),
 ] as const satisfies readonly DomainStore[];
+
+function isActiveSessionStore(store: DomainStore): boolean {
+  return (ACTIVE_SESSION_STORES as readonly DomainStore[]).includes(store);
+}
+
+function isCardinalityStore(store: DomainStore): boolean {
+  return (CARDINALITY_STORES as readonly DomainStore[]).includes(store);
+}
 
 const ENTITY_TYPES: Record<DomainStore, string> = {
   walking_sessions: "walking_session",
@@ -80,7 +111,15 @@ const COMMIT_STORES = [
   DATABASE_STORES.outbox,
   DATABASE_STORES.actionReceipts,
   DATABASE_STORES.internalMetadata,
+  DATABASE_STORES.activeMarkers,
 ];
+
+/** Reference/config stores returned in full by `readSnapshot` (small, not history). */
+const REFERENCE_DOMAIN_STORES = [
+  "routine_templates",
+  "routine_exercises",
+  "exercise_registry",
+] as const satisfies readonly DomainStore[];
 
 function isDeleted(record: LocalRecord): boolean {
   return typeof record.deleted_at === "string";
@@ -272,11 +311,29 @@ function orderChanges(changes: OutboxChange[]): OutboxChange[] {
     .map(({ change }) => change);
 }
 
+function isQuotaExceeded(error: unknown): error is DOMException {
+  return (
+    typeof DOMException !== "undefined" &&
+    error instanceof DOMException &&
+    error.name === "QuotaExceededError"
+  );
+}
+
 function normalizeError(error: unknown, context: string): Error {
+  if (isQuotaExceeded(error)) {
+    return new StorageQuotaExceededError(context, { cause: error });
+  }
   if (error instanceof Error) {
     return error;
   }
   return new LocalStorageError(context, { cause: error });
+}
+
+function isInvalidState(error: unknown): boolean {
+  return (
+    (typeof DOMException !== "undefined" && error instanceof DOMException && error.name === "InvalidStateError") ||
+    (error instanceof Error && error.name === "InvalidStateError")
+  );
 }
 
 function validSequence(value: JsonValue | undefined): number {
@@ -297,27 +354,131 @@ function isOpen(record: LocalRecord): boolean {
   return !isDeleted(record) && (record.ended_at === null || record.ended_at === undefined);
 }
 
-function assertOneOpenPerParent(
-  store: DomainStore,
-  records: Iterable<LocalRecord>,
-  parentField: string,
-): void {
-  const openParents = new Set<string>();
-  for (const record of records) {
-    if (!isOpen(record)) {
-      continue;
+function markerId(store: DomainStore, scopeKey: string): string {
+  return `${store}\u0000${scopeKey}`;
+}
+
+interface ScopeEvent {
+  /** Index into the action's `changes` array. */
+  changeIndex: number;
+  /**
+   * True for the synthetic "release" event added when a bout/pause/rest's
+   * parent id changed: the record must be treated as no longer active/open in
+   * its *previous* scope, regardless of what `persistedByTarget` says about its
+   * (new) state, so that scope's marker does not keep pointing at it.
+   */
+  forceInactive: boolean;
+}
+
+interface CardinalityScope {
+  store: DomainStore;
+  scopeKey: string;
+  /** Events for this scope, in original change-submission order. */
+  events: ScopeEvent[];
+}
+
+/**
+ * Groups the action's changes by the (store, scope) pairs that need a cardinality
+ * check: the store itself for ACTIVE_SESSION_STORES (only one active session of a
+ * given type at a time), or the parent id for open-interval stores (only one open
+ * bout per session, one open pause/rest per bout). Only scopes actually touched by
+ * this action are collected, so the check stays bounded regardless of history size.
+ *
+ * A change to a bout/pause/rest's parent id (e.g. reassigning a bout to a
+ * different session) touches *two* scopes: the new one (a normal event) and the
+ * old one (a forced "release" event, derived from the previous persisted
+ * record), so the old scope's marker does not keep pointing at a record that
+ * has moved away from it.
+ */
+function collectCardinalityScopes(
+  changes: readonly DomainChange[],
+  existing: readonly (LocalRecord | undefined)[],
+  persistedByTarget: ReadonlyMap<string, LocalRecord>,
+): CardinalityScope[] {
+  const scopes = new Map<string, CardinalityScope>();
+
+  function addEvent(store: DomainStore, scopeKey: string, changeIndex: number, forceInactive: boolean): void {
+    const key = markerId(store, scopeKey);
+    let scope = scopes.get(key);
+    if (scope === undefined) {
+      scope = { store, scopeKey, events: [] };
+      scopes.set(key, scope);
     }
-    const parentId = record[parentField];
-    if (typeof parentId !== "string" || parentId.trim().length === 0) {
-      throw new InvalidActionError(`Open ${store} record ${record.id} requires ${parentField}`);
-    }
-    if (openParents.has(parentId)) {
-      throw new ActiveSessionConflictError(
-        `Only one open ${store} record is allowed for ${parentField} ${parentId}`,
-      );
-    }
-    openParents.add(parentId);
+    scope.events.push({ changeIndex, forceInactive });
   }
+
+  changes.forEach((change, index) => {
+    if (!isCardinalityStore(change.store)) {
+      return;
+    }
+    const id = changeIdentifier(change);
+    const persisted = persistedByTarget.get(`${change.store}\u0000${id}`);
+    if (persisted === undefined) {
+      return;
+    }
+
+    if (isActiveSessionStore(change.store)) {
+      // Scope is the store name itself, so it never "moves" between scopes.
+      addEvent(change.store, change.store, index, false);
+      return;
+    }
+
+    const parentField = OPEN_PARENT_FIELD_BY_STORE[change.store];
+    if (parentField === undefined) {
+      return;
+    }
+
+    const newParentValue = persisted[parentField];
+    const hasNewParent = typeof newParentValue === "string" && newParentValue.trim().length > 0;
+    if (!hasNewParent && isOpen(persisted)) {
+      throw new InvalidActionError(`Open ${change.store} record ${id} requires ${parentField}`);
+    }
+    if (hasNewParent) {
+      addEvent(change.store, newParentValue, index, false);
+    }
+
+    // Release the OLD scope when the parent id changed (or was cleared): a
+    // stale marker would otherwise keep pointing at this record there.
+    const previous = existing[index];
+    if (previous !== undefined) {
+      const previousParentValue = previous[parentField];
+      const hadOldParent = typeof previousParentValue === "string" && previousParentValue.trim().length > 0;
+      if (hadOldParent && (!hasNewParent || previousParentValue !== newParentValue)) {
+        addEvent(change.store, previousParentValue, index, true);
+      }
+    }
+  });
+
+  return [...scopes.values()];
+}
+
+/**
+ * Verifies that a marker's holder is still genuinely active/open in that scope,
+ * by reading it directly (one extra `get`, only on the conflict path). Guards
+ * against marker drift from any source: if the holder record is missing,
+ * tombstoned, no longer active/open, or has since moved to a different scope,
+ * the marker is stale and the scope should be treated as free rather than
+ * raising a false `ActiveSessionConflictError`.
+ */
+async function holderStillValid(
+  transaction: IDBTransaction,
+  scope: CardinalityScope,
+  holderId: string,
+): Promise<boolean> {
+  const holderRecord = await requestResult(
+    transaction.objectStore(scope.store).get(holderId) as IDBRequest<LocalRecord | undefined>,
+  );
+  if (holderRecord === undefined || isDeleted(holderRecord)) {
+    return false;
+  }
+  if (isActiveSessionStore(scope.store)) {
+    return isActive(holderRecord);
+  }
+  const parentField = OPEN_PARENT_FIELD_BY_STORE[scope.store];
+  if (parentField === undefined) {
+    return false;
+  }
+  return isOpen(holderRecord) && holderRecord[parentField] === scope.scopeKey;
 }
 
 function maximumPersistedSequence(
@@ -355,32 +516,68 @@ export function createLocalRepository(options: LocalRepositoryOptions = {}): Loc
       databasePromise = undefined;
       throw error;
     });
+    // Captured so the version-change and forced-close handlers below only clear
+    // the cache if it still points at *this* opening attempt: a later call may
+    // already have reopened (e.g. after an earlier InvalidStateError), and an
+    // event arriving from this stale connection must not clobber that new cache.
     const cachedOpening = databasePromise;
     void opening.then(
       (db) => {
-        db.onversionchange = () => {
-          db.close();
+        const invalidateCache = () => {
           if (databasePromise === cachedOpening) {
             databasePromise = undefined;
           }
         };
+        db.onversionchange = () => {
+          db.close();
+          invalidateCache();
+        };
+        // A forced close (Safari/iOS storage eviction, the IDB server process
+        // being killed, the user clearing site data, ...) fires `close` without
+        // going through `onversionchange`. Without this, the cached connection
+        // stays around forever and every subsequent read/write keeps failing.
+        db.onclose = invalidateCache;
       },
       () => undefined,
     );
     return databasePromise;
   }
 
+  /**
+   * Opens a transaction, dropping the cached connection when `db.transaction()`
+   * throws `InvalidStateError` (the connection died without an `onclose` event
+   * reaching us yet, e.g. it fires synchronously on some browsers). This does not
+   * retry inside the same call: the next operation, or the UI's Retry button,
+   * will see a cleared cache and reopen. An explicit `close()` clears the cache
+   * itself first, so it is unaffected by this.
+   */
+  async function openTransaction(
+    stores: string | string[],
+    mode: IDBTransactionMode,
+    durability?: IDBTransactionDurability,
+  ): Promise<IDBTransaction> {
+    const dbPromise = database();
+    const db = await dbPromise;
+    try {
+      return durability === undefined
+        ? db.transaction(stores, mode)
+        : db.transaction(stores, mode, { durability });
+    } catch (error) {
+      if (isInvalidState(error) && databasePromise === dbPromise) {
+        databasePromise = undefined;
+      }
+      throw new LocalStorageError(
+        `Unable to start local ${mode === "readonly" ? "read" : "write"}`,
+        { cause: error },
+      );
+    }
+  }
+
   async function withReadonlyTransaction<T>(
     stores: string | string[],
     read: (transaction: IDBTransaction) => Promise<T>,
   ): Promise<T> {
-    const db = await database();
-    let transaction: IDBTransaction;
-    try {
-      transaction = db.transaction(stores, "readonly");
-    } catch (error) {
-      throw new LocalStorageError("Unable to start local read", { cause: error });
-    }
+    const transaction = await openTransaction(stores, "readonly");
     const complete = transactionComplete(transaction);
     void complete.catch(() => undefined);
     try {
@@ -397,13 +594,7 @@ export function createLocalRepository(options: LocalRepositoryOptions = {}): Loc
     const actionSnapshot = snapshotValue(action);
     validateAction(actionSnapshot);
     const fingerprint = actionFingerprint(actionSnapshot);
-    const db = await database();
-    let transaction: IDBTransaction;
-    try {
-      transaction = db.transaction(COMMIT_STORES, "readwrite");
-    } catch (error) {
-      throw new LocalStorageError("Unable to start local write", { cause: error });
-    }
+    const transaction = await openTransaction(COMMIT_STORES, "readwrite", "strict");
     const complete = transactionComplete(transaction);
     void complete.catch(() => undefined);
 
@@ -443,19 +634,10 @@ export function createLocalRepository(options: LocalRepositoryOptions = {}): Loc
         ),
       );
 
-      const cardinalityReads = CARDINALITY_STORES.map((store) =>
-        requestResult(
-          transaction.objectStore(store).getAll() as IDBRequest<LocalRecord[]>,
-        ).then((records) => [store, records] as const),
-      );
-
-      const allReads = Promise.all([
+      const [, existing] = await Promise.all([
         Promise.all(preconditionReads),
         Promise.all(existingReads),
-        Promise.all(cardinalityReads),
       ]);
-      const [, existing, cardinalityEntries] = await allReads;
-      const recordsByStore = new Map<DomainStore, LocalRecord[]>(cardinalityEntries);
 
       const timestampDate = now();
       if (Number.isNaN(timestampDate.getTime())) {
@@ -493,44 +675,72 @@ export function createLocalRepository(options: LocalRepositoryOptions = {}): Loc
         };
       });
 
-      for (const store of ACTIVE_SESSION_STORES) {
-        const prospective = new Map(
-          (recordsByStore.get(store) ?? []).map((record) => [record.id, record]),
+      // Bounded cardinality check: only the (store, scope) pairs this action
+      // actually touches are read, via the active-marker store, instead of
+      // scanning whole domain stores. See `collectCardinalityScopes`.
+      const markerStore = transaction.objectStore(DATABASE_STORES.activeMarkers);
+      const cardinalityScopes = collectCardinalityScopes(actionSnapshot.changes, existing, persistedByTarget);
+      for (const scope of cardinalityScopes) {
+        const id = markerId(scope.store, scope.scopeKey);
+        const existingMarker = await requestResult(
+          markerStore.get(id) as IDBRequest<ActiveMarkerRecord | undefined>,
         );
-        for (const change of actionSnapshot.changes) {
-          if (change.store === store) {
-            const id = changeIdentifier(change);
-            const persisted = persistedByTarget.get(`${store}\u0000${id}`);
-            if (persisted !== undefined) {
-              prospective.set(id, persisted);
-            }
-          }
-        }
-        if ([...prospective.values()].filter(isActive).length > 1) {
-          throw new ActiveSessionConflictError(
-            `Only one active session is allowed in ${store}`,
-          );
-        }
-      }
+        let holder = existingMarker?.recordId;
+        // True once `holder` refers to a record this same action has already
+        // validated as active/open in this scope (so a later conflict against
+        // it is real). False for the original marker holder, which may be
+        // stale and worth self-healing before treating it as a real conflict.
+        let holderVerifiedThisAction = false;
 
-      for (const [store, parentField] of [
-        ["walking_bouts", "walking_session_id"],
-        ["walking_pauses", "walking_bout_id"],
-        ["walking_rests", "walking_bout_id"],
-      ] as const) {
-        const prospective = new Map(
-          (recordsByStore.get(store) ?? []).map((record) => [record.id, record]),
-        );
-        for (const change of actionSnapshot.changes) {
-          if (change.store === store) {
-            const id = changeIdentifier(change);
-            const persisted = persistedByTarget.get(`${store}\u0000${id}`);
-            if (persisted !== undefined) {
-              prospective.set(id, persisted);
+        for (const event of scope.events) {
+          const change = actionSnapshot.changes[event.changeIndex];
+          if (change === undefined) {
+            continue;
+          }
+          const recordId = changeIdentifier(change);
+          let activeNow: boolean;
+          if (event.forceInactive) {
+            activeNow = false;
+          } else {
+            const persisted = persistedByTarget.get(`${scope.store}\u0000${recordId}`);
+            if (persisted === undefined) {
+              continue;
             }
+            activeNow = isActiveSessionStore(scope.store) ? isActive(persisted) : isOpen(persisted);
+          }
+
+          if (recordId === holder) {
+            holder = activeNow ? recordId : undefined;
+            holderVerifiedThisAction = activeNow;
+          } else if (activeNow) {
+            if (holder !== undefined) {
+              const stillConflicts = holderVerifiedThisAction || (await holderStillValid(transaction, scope, holder));
+              if (stillConflicts) {
+                throw new ActiveSessionConflictError(
+                  isActiveSessionStore(scope.store)
+                    ? `Only one active session is allowed in ${scope.store}`
+                    : `Only one open ${scope.store} record is allowed for scope ${scope.scopeKey}`,
+                );
+              }
+              // The marker was stale (holder missing, tombstoned, no longer
+              // active/open, or moved to a different scope): self-heal by
+              // treating the scope as free instead of failing the commit.
+            }
+            holder = recordId;
+            holderVerifiedThisAction = true;
           }
         }
-        assertOneOpenPerParent(store, prospective.values(), parentField);
+
+        if (holder === undefined) {
+          markerStore.delete(id);
+        } else {
+          markerStore.put({
+            id,
+            store: scope.store,
+            scopeKey: scope.scopeKey,
+            recordId: holder,
+          } satisfies ActiveMarkerRecord);
+        }
       }
 
       const internalStore = transaction.objectStore(DATABASE_STORES.internalMetadata);
@@ -618,41 +828,106 @@ export function createLocalRepository(options: LocalRepositoryOptions = {}): Loc
     });
   }
 
+  async function readActiveSession(
+    transaction: IDBTransaction,
+    store: (typeof ACTIVE_SESSION_STORES)[number],
+  ): Promise<LocalRecord | undefined> {
+    const markerStore = transaction.objectStore(DATABASE_STORES.activeMarkers);
+    const marker = await requestResult(
+      markerStore.get(markerId(store, store)) as IDBRequest<ActiveMarkerRecord | undefined>,
+    );
+    if (marker === undefined) {
+      return undefined;
+    }
+    const record = await requestResult(
+      transaction.objectStore(store).get(marker.recordId) as IDBRequest<LocalRecord | undefined>,
+    );
+    return record !== undefined && !isDeleted(record) ? record : undefined;
+  }
+
+  async function readLiveChildren(
+    transaction: IDBTransaction,
+    store: DomainStore,
+    parentIds: readonly string[],
+  ): Promise<LocalRecord[]> {
+    const index = PARENT_INDEXES[store];
+    if (index === undefined || parentIds.length === 0) {
+      return [];
+    }
+    const objectStore = transaction.objectStore(store).index(index.name);
+    const lists = await Promise.all(
+      parentIds.map((parentId) =>
+        requestResult(objectStore.getAll(parentId) as IDBRequest<LocalRecord[]>),
+      ),
+    );
+    return lists.flat().filter((record) => !isDeleted(record));
+  }
+
+  /**
+   * Bounded startup snapshot. See the `RecoverySnapshot` JSDoc for exactly what
+   * scope each store returns. Cost is independent of closed/tombstoned history:
+   * it looks up the active-session markers directly and walks only the live
+   * descendants of whatever is actually active, via the v3 parent-id indexes.
+   */
   async function readSnapshot(): Promise<RecoverySnapshot> {
     return withReadonlyTransaction(
-      [...DOMAIN_STORES, DATABASE_STORES.outbox],
+      [...DOMAIN_STORES, DATABASE_STORES.outbox, DATABASE_STORES.activeMarkers],
       async (transaction) => {
-        const recordEntries = await Promise.all(
-          DOMAIN_STORES.map(async (store) => {
+        const [walkingSession, resistanceSession, cardioSession] = await Promise.all([
+          readActiveSession(transaction, "walking_sessions"),
+          readActiveSession(transaction, "resistance_sessions"),
+          readActiveSession(transaction, "cardio_sessions"),
+        ]);
+
+        const walkingBouts = walkingSession !== undefined
+          ? await readLiveChildren(transaction, "walking_bouts", [walkingSession.id])
+          : [];
+        const boutIds = walkingBouts.map((bout) => bout.id);
+        const [walkingPauses, walkingRests, resistanceRows] = await Promise.all([
+          readLiveChildren(transaction, "walking_pauses", boutIds),
+          readLiveChildren(transaction, "walking_rests", boutIds),
+          resistanceSession !== undefined
+            ? readLiveChildren(transaction, "resistance_rows", [resistanceSession.id])
+            : Promise.resolve([]),
+        ]);
+
+        const referenceEntries = await Promise.all(
+          REFERENCE_DOMAIN_STORES.map(async (store) => {
             const records = await requestResult(
               transaction.objectStore(store).getAll() as IDBRequest<LocalRecord[]>,
             );
             return [store, records.filter((record) => !isDeleted(record))] as const;
           }),
         );
+
+        const records: Record<DomainStore, LocalRecord[]> = {
+          walking_sessions: walkingSession !== undefined ? [walkingSession] : [],
+          walking_bouts: walkingBouts,
+          walking_pauses: walkingPauses,
+          walking_rests: walkingRests,
+          resistance_sessions: resistanceSession !== undefined ? [resistanceSession] : [],
+          resistance_rows: resistanceRows,
+          cardio_sessions: cardioSession !== undefined ? [cardioSession] : [],
+          ...(Object.fromEntries(referenceEntries) as Record<
+            (typeof REFERENCE_DOMAIN_STORES)[number],
+            LocalRecord[]
+          >),
+        };
+
         const pendingOutbox = await requestResult(
           transaction
             .objectStore(DATABASE_STORES.outbox)
             .index(OUTBOX_SEQUENCE_INDEX)
             .getAll() as IDBRequest<OutboxEntry[]>,
         );
-        return {
-          records: Object.fromEntries(recordEntries) as Record<DomainStore, LocalRecord[]>,
-          pendingOutbox,
-        };
+        return { records, pendingOutbox };
       },
     );
   }
 
   async function acknowledgeOutbox(mutationId: string): Promise<void> {
     validateIdentifier(mutationId, "Mutation ID");
-    const db = await database();
-    let transaction: IDBTransaction;
-    try {
-      transaction = db.transaction(DATABASE_STORES.outbox, "readwrite");
-    } catch (error) {
-      throw new LocalStorageError("Unable to start local write", { cause: error });
-    }
+    const transaction = await openTransaction(DATABASE_STORES.outbox, "readwrite", "strict");
     const complete = transactionComplete(transaction);
     void complete.catch(() => undefined);
     try {
@@ -677,13 +952,7 @@ export function createLocalRepository(options: LocalRepositoryOptions = {}): Loc
 
   async function writeKeyValue(storeName: string, key: string, value: JsonValue): Promise<void> {
     validateIdentifier(key, "Metadata key");
-    const db = await database();
-    let transaction: IDBTransaction;
-    try {
-      transaction = db.transaction(storeName, "readwrite");
-    } catch (error) {
-      throw new LocalStorageError("Unable to start local write", { cause: error });
-    }
+    const transaction = await openTransaction(storeName, "readwrite", "strict");
     const complete = transactionComplete(transaction);
     void complete.catch(() => undefined);
     try {

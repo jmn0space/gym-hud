@@ -1,15 +1,17 @@
-import { IDBDatabase, IDBFactory } from "fake-indexeddb";
+import { forceCloseDatabase, IDBDatabase, IDBFactory, IDBObjectStore } from "fake-indexeddb";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ActionConflictError,
   ActiveSessionConflictError,
   createLocalRepository,
+  DATABASE_STORES,
   LocalStorageError,
   type LocalAction,
   type LocalRecord,
   type LocalRepository,
   PreconditionFailedError,
+  StorageQuotaExceededError,
 } from "./index";
 
 const openRepositories: LocalRepository[] = [];
@@ -751,5 +753,477 @@ describe("LocalRepository retry, concurrency, and ordering", () => {
     } finally {
       IDBDatabase.prototype.transaction = original;
     }
+  });
+});
+
+/** Wraps an IDBFactory so `open()` results can be captured for direct manipulation. */
+function capturingFactory(factory: IDBFactory): {
+  factory: IDBFactory;
+  connections: IDBDatabase[];
+} {
+  const connections: IDBDatabase[] = [];
+  const open = factory.open.bind(factory);
+  const wrapped: IDBFactory = Object.create(factory) as IDBFactory;
+  wrapped.open = (...args: Parameters<IDBFactory["open"]>) => {
+    const request = open(...args);
+    request.addEventListener("success", () => {
+      connections.push(request.result);
+    });
+    return request;
+  };
+  return { factory: wrapped, connections };
+}
+
+describe("LocalRepository connection recovery", () => {
+  it("reopens after the underlying connection is forcibly closed", async () => {
+    const { factory: wrapped, connections } = capturingFactory(new IDBFactory());
+    const repo = repository(wrapped);
+    await repo.commitAction({
+      actionId: "before-forced-close",
+      changes: [
+        { store: "exercise_registry", operation: "put", record: { id: "before-close", name: "Before" } },
+      ],
+    });
+    expect(connections).toHaveLength(1);
+
+    // Simulate the browser force-closing the connection (Safari/iOS storage
+    // eviction, the IDB server process dying, the user clearing site data):
+    // this fires `close` on the IDBDatabase without going through
+    // `onversionchange`.
+    // fake-indexeddb's type declares this parameter as the class rather than an
+    // instance (a typo upstream); the runtime function takes an IDBDatabase.
+    forceCloseDatabase(connections[0] as unknown as typeof IDBDatabase);
+
+    // Every read and write must recover by reopening, not stay stuck on the
+    // dead cached connection.
+    await expect(repo.readSnapshot()).resolves.toBeDefined();
+    await expect(
+      repo.commitAction({
+        actionId: "after-forced-close",
+        changes: [
+          { store: "exercise_registry", operation: "put", record: { id: "after-close", name: "After" } },
+        ],
+      }),
+    ).resolves.toMatchObject({ sequence: 2 });
+    expect(connections.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("reopens after db.transaction() throws InvalidStateError", async () => {
+    const repo = repository(new IDBFactory());
+    await repo.commitAction({
+      actionId: "before-invalid-state",
+      changes: [
+        { store: "exercise_registry", operation: "put", record: { id: "before", name: "Before" } },
+      ],
+    });
+
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- reference is restored, never invoked unbound
+    const original = IDBDatabase.prototype.transaction;
+    let thrown = false;
+    IDBDatabase.prototype.transaction = function (
+      this: IDBDatabase,
+      ...args: Parameters<IDBDatabase["transaction"]>
+    ) {
+      if (!thrown) {
+        thrown = true;
+        throw new DOMException("Connection is closing", "InvalidStateError");
+      }
+      return original.apply(this, args);
+    };
+    try {
+      await expect(repo.commitAction({
+        actionId: "during-invalid-state",
+        changes: [
+          { store: "exercise_registry", operation: "put", record: { id: "during", name: "During" } },
+        ],
+      })).rejects.toBeInstanceOf(LocalStorageError);
+
+      // The next call must not reuse the dead cached connection.
+      await expect(
+        repo.commitAction({
+          actionId: "after-invalid-state",
+          changes: [
+            { store: "exercise_registry", operation: "put", record: { id: "after", name: "After" } },
+          ],
+        }),
+      ).resolves.toMatchObject({ sequence: 2 });
+    } finally {
+      IDBDatabase.prototype.transaction = original;
+    }
+  });
+
+  it("still allows an explicit close() to stop the repository", async () => {
+    const repo = repository(new IDBFactory());
+    await repo.commitAction({
+      actionId: "before-explicit-close",
+      changes: [
+        { store: "exercise_registry", operation: "put", record: { id: "seed", name: "Seed" } },
+      ],
+    });
+    repo.close();
+    // close() itself must not be treated as a failure requiring reopen; a
+    // subsequent operation reopens a fresh connection and finds the data.
+    await expect(repo.getRecord("exercise_registry", "seed")).resolves.toMatchObject({
+      id: "seed",
+      name: "Seed",
+    });
+  });
+});
+
+describe("LocalRepository durability", () => {
+  it("requests strict durability for commits, outbox acknowledgement, and metadata/cache writes", async () => {
+    const repo = repository(new IDBFactory());
+    await repo.commitAction({
+      actionId: "seed-for-durability",
+      changes: [
+        { store: "exercise_registry", operation: "put", record: { id: "seed", name: "Seed" } },
+      ],
+    });
+
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- spy restored in finally
+    const original = IDBDatabase.prototype.transaction;
+    const durabilities: (IDBTransactionOptions | undefined)[] = [];
+    IDBDatabase.prototype.transaction = function (
+      this: IDBDatabase,
+      storeNames: string | string[],
+      mode?: IDBTransactionMode,
+      options?: IDBTransactionOptions,
+    ) {
+      if (mode === "readwrite") {
+        durabilities.push(options);
+      }
+      return original.call(this, storeNames, mode, options);
+    };
+    try {
+      await repo.commitAction({
+        actionId: "durable-commit",
+        changes: [
+          { store: "exercise_registry", operation: "put", record: { id: "durable", name: "Durable" } },
+        ],
+      });
+      await repo.acknowledgeOutbox("durable-commit");
+      await repo.setSyncMetadata("cursor", "server-1");
+      await repo.writeReferenceCache("pad-defaults", { max_bout_seconds: 300 });
+    } finally {
+      IDBDatabase.prototype.transaction = original;
+    }
+
+    expect(durabilities).toHaveLength(4);
+    for (const options of durabilities) {
+      expect(options?.durability).toBe("strict");
+    }
+  });
+});
+
+describe("LocalRepository quota errors", () => {
+  it("wraps a QuotaExceededError from a failing write request as StorageQuotaExceededError", async () => {
+    const repo = repository(new IDBFactory());
+
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- restored in finally
+    const original = IDBObjectStore.prototype.add;
+    IDBObjectStore.prototype.add = function (): never {
+      throw new DOMException("Storage quota exceeded", "QuotaExceededError");
+    };
+    try {
+      const commit = repo.commitAction({
+        actionId: "quota-exceeded",
+        changes: [
+          { store: "exercise_registry", operation: "put", record: { id: "quota", name: "Quota" } },
+        ],
+      });
+      await expect(commit).rejects.toBeInstanceOf(StorageQuotaExceededError);
+      const rejection = await commit.catch((error: unknown) => error);
+      expect(rejection).toBeInstanceOf(StorageQuotaExceededError);
+      const cause = rejection instanceof Error ? rejection.cause : undefined;
+      expect(cause).toBeInstanceOf(DOMException);
+      expect((cause as DOMException).name).toBe("QuotaExceededError");
+    } finally {
+      IDBObjectStore.prototype.add = original;
+    }
+  });
+
+  it("wraps a QuotaExceededError surfaced through transaction.error as StorageQuotaExceededError", async () => {
+    const repo = repository(new IDBFactory());
+
+    // Simulate the transaction itself failing (not just one request) with a
+    // QuotaExceededError, e.g. the final commit flush hitting the device quota.
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- restored in finally
+    const original = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.put = function (this: IDBObjectStore, value: unknown, key?: IDBValidKey) {
+      if (this.name === "internal_metadata") {
+        throw new DOMException("Storage quota exceeded", "QuotaExceededError");
+      }
+      return original.call(this, value, key);
+    };
+    try {
+      const commit = repo.commitAction({
+        actionId: "quota-exceeded-metadata",
+        changes: [
+          { store: "exercise_registry", operation: "put", record: { id: "quota-2", name: "Quota 2" } },
+        ],
+      });
+      await expect(commit).rejects.toBeInstanceOf(StorageQuotaExceededError);
+      const rejection = await commit.catch((error: unknown) => error);
+      expect(rejection).toBeInstanceOf(StorageQuotaExceededError);
+      const cause = rejection instanceof Error ? rejection.cause : undefined;
+      expect(cause).toBeInstanceOf(DOMException);
+      expect((cause as DOMException).name).toBe("QuotaExceededError");
+    } finally {
+      IDBObjectStore.prototype.put = original;
+    }
+  });
+});
+
+/** The internal marker id format: `${store}\0${scopeKey}` (see `repository.ts`). */
+function markerRecordId(store: string, scopeKey: string): string {
+  return `${store}${String.fromCharCode(0)}${scopeKey}`;
+}
+
+/** Writes an active-marker row directly, bypassing `commitAction`, to simulate drift. */
+function writeMarker(
+  factory: IDBFactory,
+  databaseName: string,
+  marker: { store: string; scopeKey: string; recordId: string },
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const request = factory.open(databaseName);
+    request.onerror = () => {
+      reject(request.error ?? new Error("Opening the database to corrupt a marker failed"));
+    };
+    request.onsuccess = () => {
+      const db = request.result;
+      const transaction = db.transaction(DATABASE_STORES.activeMarkers, "readwrite");
+      transaction.objectStore(DATABASE_STORES.activeMarkers).put({
+        id: markerRecordId(marker.store, marker.scopeKey),
+        store: marker.store,
+        scopeKey: marker.scopeKey,
+        recordId: marker.recordId,
+      });
+      transaction.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      transaction.onerror = () => {
+        db.close();
+        reject(transaction.error ?? new Error("Writing the corrupted marker failed"));
+      };
+    };
+  });
+}
+
+/** Reads an active-marker row directly, bypassing the bounded repository API. */
+function readMarker(
+  factory: IDBFactory,
+  databaseName: string,
+  store: string,
+  scopeKey: string,
+): Promise<{ recordId: string } | undefined> {
+  return new Promise((resolve, reject) => {
+    const request = factory.open(databaseName);
+    request.onerror = () => {
+      reject(request.error ?? new Error("Opening the database to read a marker failed"));
+    };
+    request.onsuccess = () => {
+      const db = request.result;
+      const transaction = db.transaction(DATABASE_STORES.activeMarkers, "readonly");
+      const readRequest = transaction.objectStore(DATABASE_STORES.activeMarkers).get(
+        markerRecordId(store, scopeKey),
+      ) as IDBRequest<{ recordId: string } | undefined>;
+      transaction.oncomplete = () => {
+        db.close();
+        resolve(readRequest.result);
+      };
+      transaction.onerror = () => {
+        db.close();
+        reject(transaction.error ?? new Error("Reading the marker failed"));
+      };
+    };
+  });
+}
+
+describe("LocalRepository active-marker scope changes", () => {
+  it("releases the previous-scope marker when a bout's parent session changes", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "release-old-scope-on-reassign";
+    const repo = repository(factory, { databaseName });
+    await repo.commitAction({
+      actionId: "open-bout-in-session-a",
+      changes: [
+        {
+          store: "walking_bouts",
+          operation: "put",
+          record: { id: "bout-1", walking_session_id: "session-a", ended_at: null },
+        },
+      ],
+    });
+
+    // Reassign bout-1 from session-a to session-b while it stays open. Before
+    // the fix, the session-a marker kept pointing at bout-1, so a genuinely new
+    // open bout under session-a would be falsely rejected below.
+    await repo.commitAction({
+      actionId: "reassign-bout-to-session-b",
+      changes: [
+        {
+          store: "walking_bouts",
+          operation: "put",
+          record: { id: "bout-1", walking_session_id: "session-b", ended_at: null },
+        },
+      ],
+    });
+
+    // Assert the internal marker store directly: the old scope must be
+    // released eagerly by the commit itself, not merely left for a future
+    // conflict to self-heal (that is fix #2's job, and a separate concern).
+    await expect(readMarker(factory, databaseName, "walking_bouts", "session-a")).resolves.toBeUndefined();
+    await expect(readMarker(factory, databaseName, "walking_bouts", "session-b")).resolves.toMatchObject({
+      recordId: "bout-1",
+    });
+
+    await expect(
+      repo.commitAction({
+        actionId: "open-bout-in-freed-session-a",
+        preconditions: [{ store: "walking_bouts", id: "bout-2", expected: null }],
+        changes: [
+          {
+            store: "walking_bouts",
+            operation: "put",
+            record: { id: "bout-2", walking_session_id: "session-a", ended_at: null },
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({ sequence: 3 });
+
+    // session-b now genuinely holds bout-1 as its open marker: a second open
+    // bout there must still be rejected as a real conflict.
+    await expect(
+      repo.commitAction({
+        actionId: "second-open-bout-in-session-b",
+        preconditions: [{ store: "walking_bouts", id: "bout-3", expected: null }],
+        changes: [
+          {
+            store: "walking_bouts",
+            operation: "put",
+            record: { id: "bout-3", walking_session_id: "session-b", ended_at: null },
+          },
+        ],
+      }),
+    ).rejects.toBeInstanceOf(ActiveSessionConflictError);
+  });
+
+  it("releases the previous-scope marker when a pause's parent bout changes", async () => {
+    const repo = repository(new IDBFactory());
+    await repo.commitAction({
+      actionId: "open-pause-in-bout-a",
+      changes: [
+        {
+          store: "walking_pauses",
+          operation: "put",
+          record: { id: "pause-1", walking_bout_id: "bout-a", ended_at: null },
+        },
+      ],
+    });
+
+    await repo.commitAction({
+      actionId: "reassign-pause-to-bout-b",
+      changes: [
+        {
+          store: "walking_pauses",
+          operation: "put",
+          record: { id: "pause-1", walking_bout_id: "bout-b", ended_at: null },
+        },
+      ],
+    });
+
+    await expect(
+      repo.commitAction({
+        actionId: "open-pause-in-freed-bout-a",
+        preconditions: [{ store: "walking_pauses", id: "pause-2", expected: null }],
+        changes: [
+          {
+            store: "walking_pauses",
+            operation: "put",
+            record: { id: "pause-2", walking_bout_id: "bout-a", ended_at: null },
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({ sequence: 3 });
+  });
+});
+
+describe("LocalRepository active-marker self-healing", () => {
+  it("self-heals a stale active-session marker instead of throwing a false conflict", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "self-heal-stale-session-marker";
+    const repo = repository(factory, { databaseName });
+    // Force the schema (including active_markers) to exist before corrupting it.
+    await repo.readSnapshot();
+
+    // Simulate drift: a marker claims a walking session is ACTIVE, but no such
+    // record actually exists (it could equally be tombstoned or COMPLETED).
+    await writeMarker(factory, databaseName, {
+      store: "walking_sessions",
+      scopeKey: "walking_sessions",
+      recordId: "phantom-session",
+    });
+
+    await expect(
+      repo.commitAction({
+        actionId: "start-pad-after-stale-marker",
+        preconditions: [{ store: "walking_sessions", id: "pad-1", expected: null }],
+        changes: [
+          { store: "walking_sessions", operation: "put", record: { id: "pad-1", status: "ACTIVE" } },
+        ],
+      }),
+    ).resolves.toMatchObject({ sequence: 1 });
+
+    // The marker must now point at the real session, and further genuine
+    // conflicts must still be rejected.
+    await expect(
+      repo.commitAction({
+        actionId: "start-second-pad-after-heal",
+        preconditions: [{ store: "walking_sessions", id: "pad-2", expected: null }],
+        changes: [
+          { store: "walking_sessions", operation: "put", record: { id: "pad-2", status: "ACTIVE" } },
+        ],
+      }),
+    ).rejects.toBeInstanceOf(ActiveSessionConflictError);
+  });
+
+  it("self-heals a stale open-bout marker whose record moved to a different session", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "self-heal-stale-bout-marker";
+    const repo = repository(factory, { databaseName });
+    await repo.commitAction({
+      actionId: "open-bout-elsewhere",
+      changes: [
+        {
+          store: "walking_bouts",
+          operation: "put",
+          record: { id: "bout-real", walking_session_id: "session-real", ended_at: null },
+        },
+      ],
+    });
+
+    // Corrupt the session-fake scope to falsely claim bout-real is open there
+    // too (bout-real's actual record belongs to session-real).
+    await writeMarker(factory, databaseName, {
+      store: "walking_bouts",
+      scopeKey: "session-fake",
+      recordId: "bout-real",
+    });
+
+    await expect(
+      repo.commitAction({
+        actionId: "open-bout-in-session-fake",
+        preconditions: [{ store: "walking_bouts", id: "bout-new", expected: null }],
+        changes: [
+          {
+            store: "walking_bouts",
+            operation: "put",
+            record: { id: "bout-new", walking_session_id: "session-fake", ended_at: null },
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({ sequence: 2 });
   });
 });
