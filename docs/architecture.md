@@ -155,6 +155,12 @@ WhiteNoise may serve these directly from the Django container.
 
 No persistent volume is required for static files. Persistent local storage should only be introduced later if uploaded or locally generated files become part of the product.
 
+As of this change, the production `Dockerfile` collects and serves only
+Django's own static assets (`collectstatic`, via WhiteNoise); it does not yet
+copy a compiled `frontend/` build into the image or serve it. See
+[Authentication](#authentication) for how that gap affects the public
+endpoint list today.
+
 ## Cloudflare Tunnel
 
 Conceptual ingress:
@@ -178,23 +184,141 @@ Use Django's standard user model. V1 contains one application user; no custom mu
 
 The same account may access `/admin/`.
 
-Authentication uses normal Django session authentication:
+Authentication uses normal Django session authentication (`django.contrib.sessions`
+plus DRF's `SessionAuthentication`), driven by three JSON endpoints under
+`core/urls.py`:
 
-```text
-username
-password
-```
+| Endpoint | Method | Auth required | CSRF enforced | Purpose |
+| --- | --- | --- | --- | --- |
+| `/api/v1/auth/session/` | GET | No | No (safe method) | Report the current authentication state and always set the `csrftoken` cookie, including for a caller who has never logged in. |
+| `/api/v1/auth/login/` | POST | No | **Yes, even for anonymous callers** | Authenticate with `{"username", "password"}`, start a session, rotate the session key and CSRF token. |
+| `/api/v1/auth/logout/` | POST | No | Yes | End the session if one exists. Idempotent: succeeds (204) even when already anonymous. |
 
-Recommended production settings include:
+`GET /api/v1/auth/session/` responds `200 {"authenticated": true, "username":
+"<name>"}` or `200 {"authenticated": false, "username": null}`, and is marked
+`no-store` so the browser and any intermediary never caches a stale
+authentication state. `POST /api/v1/auth/login/` responds `200 {"authenticated":
+true, "username": "..."}` on success; bad credentials or an inactive user
+return `400 {"code": "invalid_credentials", ...}`; a missing/empty username or
+password returns `400 {"code": "invalid_request", ...}`. `POST
+/api/v1/auth/logout/` responds `204 No Content`.
+
+### CSRF on the login/logout endpoints
+
+DRF's `SessionAuthentication` only enforces CSRF for requests that are
+*already* authenticated by a session cookie — by design, it skips the check
+for anonymous requests, since DRF assumes anonymous endpoints don't need it.
+That default is wrong for a login endpoint: an attacker's page could still
+force an anonymous browser to POST a login. `LoginView` and `LogoutView`
+therefore opt back into Django's ordinary CSRF middleware protection with
+`django.views.decorators.csrf.csrf_protect`, which checks the CSRF cookie
+against the `X-CSRFToken` header (or `csrfmiddlewaretoken` field) regardless
+of authentication state.
+
+Because DRF's `APIView` exempts itself from `CsrfViewMiddleware` by default, a
+CSRF failure on these two endpoints is *not* routed through DRF's normal
+exception handling — Django's CSRF middleware short-circuits the request and
+renders `settings.CSRF_FAILURE_VIEW` directly. `CSRF_FAILURE_VIEW` is set to
+`core.csrf.csrf_failure`, which returns `403 {"code": "csrf_failed", "detail":
+"..."}` for any path under `/api/`, and falls back to Django's normal HTML
+failure page everywhere else (so `/admin/` keeps its usual behavior).
+
+### Uniform API error shape
+
+Every `/api/v1/` error response — other than a CSRF failure, handled above —
+takes the shape `{"code": "...", "detail": "..."}`, produced by
+`core.exceptions.exception_handler` (`REST_FRAMEWORK["EXCEPTION_HANDLER"]`):
+
+| Situation | Status | `code` |
+| --- | --- | --- |
+| No session / expired session on a protected endpoint | 401 | `not_authenticated` |
+| CSRF check failed (login/logout) | 403 | `csrf_failed` |
+| Authenticated but not permitted | 403 | `permission_denied` |
+| Login throttled | 429 | `throttled` |
+
+DRF's default `SessionAuthentication` returns **403** for an unauthenticated
+request, not 401, because it advertises no `WWW-Authenticate` scheme (DRF only
+emits 401 when an authenticator's `authenticate_header` returns something).
+`core.authentication.SessionAuthentication` (the configured
+`DEFAULT_AUTHENTICATION_CLASSES` entry) overrides `authenticate_header` to
+return `"Session"` — a non-`Basic` scheme name — which both restores the
+correct 401 and avoids triggering a browser's native credential-prompt dialog
+(which happens for the `Basic` scheme).
+
+### Public vs. protected endpoints
+
+Public (no authentication required):
+
+- `GET /api/v1/health/`
+- `GET /api/v1/auth/session/`
+- `POST /api/v1/auth/login/` (CSRF-enforced instead)
+- `POST /api/v1/auth/logout/` (CSRF-enforced instead)
+- Static assets served by WhiteNoise (`/static/...`)
+- The Django Admin login page itself (`/admin/login/`); the rest of `/admin/`
+  requires an authenticated staff/superuser session, enforced by Django admin
+  independently of the DRF settings below.
+
+Everything else under `/api/v1/` (workout, configuration, sync, export, and
+any future endpoints) is protected by default: `REST_FRAMEWORK`'s
+`DEFAULT_PERMISSION_CLASSES` is `["rest_framework.permissions.IsAuthenticated"]`
+and `DEFAULT_AUTHENTICATION_CLASSES` is
+`["core.authentication.SessionAuthentication"]`, so a new view is private
+unless it explicitly opts out (as the endpoints above do with
+`permission_classes = [AllowAny]`).
+
+The SPA shell itself is **not currently served by Django**: the production
+`Dockerfile` builds and runs only the Django/Gunicorn image; it does not copy
+a compiled `frontend/` build into `STATICFILES_DIRS` or add a catch-all route
+for it. Serving the built SPA (and deciding whether that route is public) is
+therefore still open work, not something this change silently adds.
+
+### Cookies and CSRF settings
 
 ```text
 SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SECURE = True
-CSRF_COOKIE_SECURE = True
 SESSION_COOKIE_SAMESITE = "Lax"
+SESSION_COOKIE_AGE = <DJANGO_SESSION_COOKIE_AGE, default 30 days>
+CSRF_COOKIE_SECURE = True
+CSRF_COOKIE_HTTPONLY = False
 ```
 
+`SESSION_COOKIE_AGE` is overridable via the `DJANGO_SESSION_COOKIE_AGE`
+environment variable (seconds) and defaults to 30 days, so a signed-in device
+stays authenticated across being closed and reopened offline for a while,
+consistent with the app's offline-continuation behavior, without the session
+living forever.
+
+`CSRF_COOKIE_HTTPONLY` is deliberately `False` (Django's own default): the
+SPA reads the `csrftoken` cookie from JavaScript and echoes it back as the
+`X-CSRFToken` request header on unsafe requests, which is Django's documented
+pattern for JavaScript clients. This does not weaken session security — the
+CSRF cookie carries no authentication data by itself, and
+`SESSION_COOKIE_HTTPONLY` (which protects the actual session identifier)
+stays `True`.
+
 Credentials and authentication tokens must never be stored in `localStorage`.
+
+### Brute-force login protection
+
+`POST /api/v1/auth/login/` is throttled using DRF's `ScopedRateThrottle`
+(`throttle_scope = "login"`), rate-limited per client IP via
+`REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]["login"]`, itself overridable
+through the `DJANGO_LOGIN_THROTTLE_RATE` environment variable (default
+`10/min`). This is a minimal mitigation appropriate for a single-account app
+behind Cloudflare; it does not replace Cloudflare-level protections (e.g.
+rate limiting or WAF rules on the tunnel hostname), which remain the primary
+defense against sustained credential-guessing traffic and are configured
+outside this repository.
+
+### Provisioning the application account
+
+See the [README](../README.md#provisioning-the-application-account) for the
+`createsuperuser` and `ensure_app_user` provisioning workflows. In short:
+`ensure_app_user` reads `DJANGO_APP_USERNAME`/`DJANGO_APP_PASSWORD` from the
+environment, is idempotent, validates the password against
+`AUTH_PASSWORD_VALIDATORS`, never logs the password, and only changes an
+existing user's password when `--reset-password` is passed explicitly.
 
 ## Public exposure rules
 

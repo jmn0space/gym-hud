@@ -295,6 +295,75 @@ A successfully acknowledged mutation is removed from the pending local outbox.
 Its action receipt remains durable for retry deduplication. Failed mutations remain
 queued. The server acknowledgement exchange itself remains part of issue #13.
 
+## Authentication and offline continuation
+
+The frontend uses Django session authentication (see [Architecture](architecture.md)).
+Credentials, session ids, and tokens are never stored client-side; the session
+cookie is `HttpOnly` and managed entirely by the browser. The only thing this
+app persists locally about authentication is a non-secret **auth marker**,
+`{ username, lastVerifiedAt }`, written to the `internal_metadata` store
+through the local repository's `getAuthMarker`/`setAuthMarker`/`clearAuthMarker`
+API. It records nothing more than "this device has signed in before, as whom,
+and when that was last confirmed with the server," and shares
+`internal_metadata`'s existing atomic single-key writes without affecting the
+repository's own sequence/client-id bookkeeping there or the outbox/domain
+commit transaction.
+
+### Auth status state machine
+
+The frontend tracks one `authStatus`:
+
+```text
+checking       -- startup only, before the marker read and (if online) the
+                  session check both resolve
+login-required -- no marker on this device, or the user just signed out;
+                  app routes are not rendered
+unverified     -- a marker exists but this reopening could not reach the
+                  server (offline, or a network failure): "offline
+                  continuation" -- the app opens normally from local data
+authenticated  -- the server confirmed the session is valid
+expired        -- a marker exists but the server reported no session; local
+                  data and the outbox are preserved and the app stays usable
+```
+
+Behavior by scenario:
+
+- **First login.** No marker: show a Login screen; app routes do not render.
+  Offline with no marker: the Login screen explains that a network connection
+  is required for the first sign-in on this device.
+- **Reopen offline with a marker.** The app opens normally from local data.
+  `authStatus` is `unverified`; network synchronization stays paused.
+- **Reopen online.** `GET /api/v1/auth/session/` decides the status:
+  authenticated refreshes the marker; not authenticated while a marker exists
+  moves to `expired` (never clears the marker) with a persistent,
+  non-dismissable "Session expired — sign in to sync" banner and a sign-in
+  action; sync stays paused until re-login succeeds. Coming back online while
+  `unverified` re-checks the session automatically.
+- **Different-user re-login.** If the entered username differs from the
+  marker's username while pending outbox entries exist, sign-in is blocked
+  with an explanation (single-user app; local data is never silently mixed
+  between accounts).
+- **Logout.** Requires network. If pending outbox entries exist, it confirms
+  first, stating they stay on this device and sync after the next sign-in. On
+  success the marker is cleared -- local data and the outbox are not -- and
+  the Login screen is shown. Offline, logout explains it needs a connection.
+- **401 anywhere.** Any API response reporting `not_authenticated` flips
+  `authenticated` to `expired` from the frontend's central fetch wrapper, not
+  just from the session-check call.
+
+### Sync gate
+
+There is no sync engine yet (issue #13). The frontend exposes one gate a future
+sync engine must consult before attempting network synchronization:
+
+```text
+canSync(authStatus, online) := authStatus == "authenticated" AND online
+```
+
+`unverified` and `expired` both pause synchronization while leaving pending
+outbox entries queued, consistent with the local-first rule above: nothing is
+discarded, sync simply waits for a confirmed, reachable session.
+
 ## Conflict strategy
 
 The Android phone is the primary workout-entry device, so complex multi-device merging is outside v1 scope.
