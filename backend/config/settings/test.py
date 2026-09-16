@@ -22,3 +22,17 @@ SECURE_SSL_REDIRECT = False
 SECURE_HSTS_SECONDS = 0
 SECURE_HSTS_INCLUDE_SUBDOMAINS = False
 SECURE_HSTS_PRELOAD = False
+
+# The production/base WhiteNoise manifest storage requires a manifest built
+# by `collectstatic`, which the test suite never runs; without this
+# override, rendering any real Django page that uses the `{% static %}`
+# template tag (e.g. the /admin/login/ form exercised by
+# core.tests.test_throttling) fails with "Missing staticfiles manifest
+# entry". Plain StaticFilesStorage resolves files straight from the
+# staticfiles finders (django.contrib.staticfiles is in INSTALLED_APPS),
+# no manifest needed -- fine for tests, which never serve static assets for
+# real.
+STORAGES = {  # noqa: F405
+    **STORAGES,  # noqa: F405
+    "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+}

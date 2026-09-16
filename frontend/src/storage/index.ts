@@ -32,6 +32,7 @@ export type {
   OutboxChange,
   OutboxDeleteChange,
   OutboxEntry,
+  OutboxOwner,
   OutboxPutChange,
   PutDomainChange,
   RecordPrecondition,

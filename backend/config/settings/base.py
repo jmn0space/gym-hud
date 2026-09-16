@@ -18,6 +18,29 @@ logger = logging.getLogger("security_audit")
 ENVIRONMENT = os.getenv("DJANGO_ENV", "local").strip().lower()
 DEBUG = False
 
+
+def _env_str(name: str, default: str) -> str:
+    """Read a string env var, treating unset *or empty* as "use the default".
+
+    Plain ``os.getenv(name, default)`` only falls back when the variable is
+    entirely unset; an explicitly-empty value (e.g. an unfilled ``VAR=`` line
+    reaching the process environment) passes straight through instead of
+    falling back, which is rarely what's wanted for an "optional, defaulted"
+    setting.
+    """
+    return os.getenv(name, "").strip() or default
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an integer env var the same empty-is-unset way as :func:`_env_str`.
+
+    Without this, ``int(os.getenv(name, default))`` crashes on an
+    explicitly-empty value instead of using the default, since ``int("")``
+    raises ``ValueError``.
+    """
+    return int(_env_str(name, str(default)))
+
+
 _DEFAULT_LOCAL_SECRET = "insecure-local-development-key-do-not-use-in-production"  # noqa: S105
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", _DEFAULT_LOCAL_SECRET)
 
@@ -45,7 +68,9 @@ DATABASES = {
 DATABASES["default"]["DISABLE_SERVER_SIDE_CURSORS"] = True
 
 INSTALLED_APPS = [
-    "django.contrib.admin",
+    # Points django.contrib.admin.site at core.admin.ThrottledAdminSite so
+    # /admin/login/ shares the API login throttle; see core.admin.
+    "core.admin.ThrottledAdminConfig",
     "django.contrib.auth",
     "django.contrib.contenttypes",
     "django.contrib.sessions",
@@ -129,11 +154,12 @@ REST_FRAMEWORK = {
         "rest_framework.permissions.IsAuthenticated",
     ],
     "EXCEPTION_HANDLER": "core.exceptions.exception_handler",
-    # Only the login endpoint declares the "login" throttle scope; every other
-    # view is unaffected. Overridable per deployment to tune brute-force
+    # Only the login endpoint (and, via core.admin.ThrottledAdminSite,
+    # /admin/login/) declares the "login" throttle scope; every other view
+    # is unaffected. Overridable per deployment to tune brute-force
     # resistance without a code change.
     "DEFAULT_THROTTLE_RATES": {
-        "login": os.getenv("DJANGO_LOGIN_THROTTLE_RATE", "10/min"),
+        "login": _env_str("DJANGO_LOGIN_THROTTLE_RATE", "10/min"),
     },
 }
 
@@ -148,7 +174,10 @@ SESSION_COOKIE_SAMESITE = "Lax"
 # Env-overridable so a deployment can shorten/lengthen how long a signed-in
 # session survives without a new login; defaults to 30 days to support the
 # "reopen the app after being offline for a while" continuity requirement.
-SESSION_COOKIE_AGE = int(os.getenv("DJANGO_SESSION_COOKIE_AGE", str(60 * 60 * 24 * 30)))
+# core.views.SessionView refreshes this on every authenticated session
+# check, so in practice it is 30 days since the last check-in, not since
+# login; see docs/architecture.md.
+SESSION_COOKIE_AGE = _env_int("DJANGO_SESSION_COOKIE_AGE", 60 * 60 * 24 * 30)
 
 CSRF_COOKIE_SECURE = True
 # The SPA reads the csrftoken cookie in JavaScript and echoes it back as the

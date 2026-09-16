@@ -10,22 +10,27 @@ import { ResistancePage } from "./pages/ResistancePage";
 import { routes } from "./routes";
 import { AuthProvider, useAuth } from "./auth/AuthProvider";
 import { LoginPage } from "./auth/LoginPage";
+import { StorageWarningBanner } from "./auth/StorageWarningBanner";
 import { LocalDataProvider } from "./local/LocalDataProvider";
 import type { LocalRepository } from "./storage";
 
 interface AppProps {
   repository?: LocalRepository | undefined;
   /**
-   * Repository for the auth marker/session state machine. Defaults to its own
-   * connection (independent of `repository`) so a minimal LocalDataProvider
-   * test double never has to also implement the auth-marker methods.
+   * Repository for the auth marker/session state machine. Defaults to
+   * `repository` (not its own independent connection) so that when a caller
+   * supplies one repository, logout confirmation and different-user/owner
+   * checks read the same outbox LocalDataProvider writes to (finding #19).
+   * Only truly defaults to its own connection when neither prop is given, as
+   * in production (see main.tsx), where both providers' own default
+   * connections point at the same underlying database anyway.
    */
   authRepository?: LocalRepository | undefined;
 }
 
 export function App({ authRepository, repository }: AppProps) {
   return (
-    <AuthProvider repository={authRepository}>
+    <AuthProvider repository={authRepository ?? repository}>
       <LocalDataProvider repository={repository}>
         <AuthGate />
       </LocalDataProvider>
@@ -33,20 +38,30 @@ export function App({ authRepository, repository }: AppProps) {
   );
 }
 
-/** Renders the login screen or the app shell depending on authStatus; app routes never render while sign-in is required. */
+/**
+ * Renders the login/checking screens or the app shell depending on
+ * authStatus; app routes never render while sign-in is required or the
+ * server cannot be reached. The login/checking screens get their own minimal
+ * `<main>` landmark (finding #11) instead of AppLayout's, since the app shell
+ * (nav, account status, etc.) does not apply until there is a session to show
+ * it for.
+ */
 function AuthGate() {
   const { status } = useAuth();
 
-  if (status === "checking") {
+  if (status === "checking" || status === "login-required" || status === "server-unreachable") {
     return (
-      <p className="storage-notice muted" role="status">
-        Checking sign-in…
-      </p>
+      <main className="app__main">
+        <StorageWarningBanner />
+        {status === "checking" ? (
+          <p className="storage-notice muted" role="status">
+            Checking sign-in…
+          </p>
+        ) : (
+          <LoginPage />
+        )}
+      </main>
     );
-  }
-
-  if (status === "login-required") {
-    return <LoginPage />;
   }
 
   return (

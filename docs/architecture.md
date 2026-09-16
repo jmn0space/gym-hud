@@ -213,28 +213,63 @@ force an anonymous browser to POST a login. `LoginView` and `LogoutView`
 therefore opt back into Django's ordinary CSRF middleware protection with
 `django.views.decorators.csrf.csrf_protect`, which checks the CSRF cookie
 against the `X-CSRFToken` header (or `csrfmiddlewaretoken` field) regardless
-of authentication state.
+of authentication state. `LoginView` applies it to `dispatch` (not just
+`post`), so an invalid/missing CSRF token is rejected *before*
+`APIView.initial()` runs — and therefore before `check_throttles` — so a
+CSRF-failing request never consumes a login attempt from the throttle
+described below.
 
 Because DRF's `APIView` exempts itself from `CsrfViewMiddleware` by default, a
-CSRF failure on these two endpoints is *not* routed through DRF's normal
-exception handling — Django's CSRF middleware short-circuits the request and
-renders `settings.CSRF_FAILURE_VIEW` directly. `CSRF_FAILURE_VIEW` is set to
-`core.csrf.csrf_failure`, which returns `403 {"code": "csrf_failed", "detail":
-"..."}` for any path under `/api/`, and falls back to Django's normal HTML
-failure page everywhere else (so `/admin/` keeps its usual behavior).
+CSRF failure on these two endpoints is usually *not* routed through DRF's
+normal exception handling — Django's CSRF middleware short-circuits the
+request and renders `settings.CSRF_FAILURE_VIEW` directly. `CSRF_FAILURE_VIEW`
+is set to `core.csrf.csrf_failure`, which returns `403 {"code": "csrf_failed",
+"detail": "..."}` for any path under `/api/`, and falls back to Django's
+normal HTML failure page everywhere else (so `/admin/` keeps its usual
+behavior).
+
+### CSRF on every other authenticated endpoint
+
+The paragraph above covers the *anonymous* CSRF path. DRF's own
+`SessionAuthentication.enforce_csrf` separately enforces CSRF for any request
+that *does* carry a valid session — on every protected view, not just
+login/logout — but it raises the generic `rest_framework.exceptions.
+PermissionDenied`, which `core.exceptions.exception_handler` would report as
+`{"code": "permission_denied", ...}`: a different code than the anonymous case
+above for what is, from the client's point of view, the same failure.
+`core.authentication.SessionAuthentication.enforce_csrf` overrides this to
+raise `core.authentication.CsrfFailed` instead — a `PermissionDenied`
+subclass with `default_code = "csrf_failed"` — and
+`core.exceptions._CODES_BY_EXCEPTION` matches it *before* the generic
+`PermissionDenied` entry (subclass-before-superclass, since the lookup
+returns on the first `isinstance()` match). The net effect: **an authenticated
+CSRF failure gets the same `403 {"code": "csrf_failed"}` shape as an
+anonymous one, on any endpoint**, regardless of which of the two mechanisms
+above actually intercepts a given request. `LogoutView` (whose
+`csrf_protect` decorates `post`, not `dispatch`) is a concrete case where an
+authenticated caller's CSRF failure is caught by *this* path rather than the
+anonymous one; `core.tests.test_auth` has regression tests for both.
 
 ### Uniform API error shape
 
-Every `/api/v1/` error response — other than a CSRF failure, handled above —
-takes the shape `{"code": "...", "detail": "..."}`, produced by
-`core.exceptions.exception_handler` (`REST_FRAMEWORK["EXCEPTION_HANDLER"]`):
+Every `/api/v1/` error response takes the shape `{"code": "...", "detail":
+"..."}`. Errors raised inside a DRF view go through
+`core.exceptions.exception_handler` (`REST_FRAMEWORK["EXCEPTION_HANDLER"]`);
+a CSRF failure (handled outside DRF's exception machinery, as above) and a
+request matching no URL pattern or raising an exception no DRF view ever sees
+(handled by `config.urls.handler404`/`handler500`) produce the same shape by
+construction rather than by sharing that code path:
 
 | Situation | Status | `code` |
 | --- | --- | --- |
 | No session / expired session on a protected endpoint | 401 | `not_authenticated` |
-| CSRF check failed (login/logout) | 403 | `csrf_failed` |
+| CSRF check failed, anonymous or authenticated, any endpoint | 403 | `csrf_failed` |
 | Authenticated but not permitted | 403 | `permission_denied` |
-| Login throttled | 429 | `throttled` |
+| Login rejected: missing/empty/non-string username or password | 400 | `invalid_request` |
+| Login rejected: well-formed but wrong credentials, or inactive user | 400 | `invalid_credentials` |
+| Login throttled (`POST /api/v1/auth/login/`) | 429 | `throttled` |
+| No URL pattern matches an `/api/` path | 404 | `not_found` |
+| Unhandled exception under `/api/` | 500 | `server_error` |
 
 DRF's default `SessionAuthentication` returns **403** for an unauthenticated
 request, not 401, because it advertises no `WWW-Authenticate` scheme (DRF only
@@ -244,6 +279,19 @@ emits 401 when an authenticator's `authenticate_header` returns something).
 return `"Session"` — a non-`Basic` scheme name — which both restores the
 correct 401 and avoids triggering a browser's native credential-prompt dialog
 (which happens for the `Basic` scheme).
+
+`config.urls.handler404`/`handler500` close the last gap in this contract: a
+path matching *no* URL pattern at all, or an exception that
+`core.exceptions.exception_handler` doesn't recognize (so DRF re-raises it),
+never reaches a DRF view or its exception handler and would otherwise fall
+through to Django's default HTML error pages even under `/api/`. Both check
+`request.path` and return the JSON shape above only for `/api/`-prefixed
+paths, leaving Django's ordinary behavior everywhere else (in particular,
+`/admin/` is unaffected). `handler500`'s `detail` is deliberately generic
+(matching Django's own default 500 page), since it is reached precisely when
+the error is unexpected. Both are only invoked when `DEBUG` is `False`
+(Django's debug pages take over otherwise), which is the case in every
+environment except a developer's own explicit opt-in.
 
 ### Public vs. protected endpoints
 
@@ -264,7 +312,11 @@ any future endpoints) is protected by default: `REST_FRAMEWORK`'s
 and `DEFAULT_AUTHENTICATION_CLASSES` is
 `["core.authentication.SessionAuthentication"]`, so a new view is private
 unless it explicitly opts out (as the endpoints above do with
-`permission_classes = [AllowAny]`).
+`permission_classes = [AllowAny]`). `core.tests.test_url_auth_coverage` walks
+every URL pattern actually registered under `/api/v1/` at test time and
+asserts that each one outside the allowlist above rejects an anonymous
+request with `401`, so a future endpoint that forgets to think about this
+fails a test instead of shipping open.
 
 The SPA shell itself is **not currently served by Django**: the production
 `Dockerfile` builds and runs only the Django/Gunicorn image; it does not copy
@@ -289,6 +341,20 @@ stays authenticated across being closed and reopened offline for a while,
 consistent with the app's offline-continuation behavior, without the session
 living forever.
 
+This expiry is **rolling, not fixed**: `core.views.SessionView.get` marks an
+authenticated request's session modified (`request.session.modified = True`),
+which makes `SessionMiddleware.process_response` re-save it with a fresh
+`SESSION_COOKIE_AGE` from *now*. In practice this means "30 days since the
+app last confirmed the session with the server," not "30 days since login" —
+a daily user is never signed out mid-use just because their first login was
+a month ago. `SESSION_SAVE_EVERY_REQUEST` stays `False` so only this one
+endpoint (which the frontend already polls to confirm the session is alive;
+see [Data & synchronization](data-sync.md)) pays the extra session write,
+not every request. `core.tests.test_auth.
+test_session_check_refreshes_expiry_for_authenticated_caller` covers the
+refresh; the anonymous case is a no-op (there is no authenticated session to
+extend, and none is created just from checking).
+
 `CSRF_COOKIE_HTTPONLY` is deliberately `False` (Django's own default): the
 SPA reads the `csrftoken` cookie from JavaScript and echoes it back as the
 `X-CSRFToken` request header on unsafe requests, which is Django's documented
@@ -301,8 +367,9 @@ Credentials and authentication tokens must never be stored in `localStorage`.
 
 ### Brute-force login protection
 
-`POST /api/v1/auth/login/` is throttled using DRF's `ScopedRateThrottle`
-(`throttle_scope = "login"`), rate-limited per client IP via
+`POST /api/v1/auth/login/` is throttled using
+`core.throttling.CloudflareScopedRateThrottle`, a `ScopedRateThrottle`
+subclass (`throttle_scope = "login"`) rate-limited via
 `REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]["login"]`, itself overridable
 through the `DJANGO_LOGIN_THROTTLE_RATE` environment variable (default
 `10/min`). This is a minimal mitigation appropriate for a single-account app
@@ -311,14 +378,78 @@ rate limiting or WAF rules on the tunnel hostname), which remain the primary
 defense against sustained credential-guessing traffic and are configured
 outside this repository.
 
+**Client identity.** The only ingress to this application is the trusted
+`cloudflared` connector on the private Docker network — the same trust
+boundary the production `SECURE_PROXY_SSL_HEADER` setting relies on for the
+request scheme (see the README's Production Compose section). `cloudflared`
+forwards Cloudflare's `CF-Connecting-IP` header, which Cloudflare's edge sets to the
+real client IP and which nothing else can reach Django to spoof, since
+Gunicorn's port is never published. `CloudflareScopedRateThrottle.get_ident`
+therefore keys on `HTTP_CF_CONNECTING_IP`, falling back to `REMOTE_ADDR` only
+when that header is absent (e.g. local development without the tunnel in
+front) — **never** on `X-Forwarded-For`, which DRF's stock
+`ScopedRateThrottle` would otherwise use (as the whole, externally-settable
+header value, absent `NUM_PROXIES`) and which an external client can freely
+rewrite to reset its own bucket on every request. A request rejected for CSRF
+(see above) is rejected before `check_throttles` runs and so never consumes a
+login attempt either. Regression tests for all of this live in
+`core.tests.test_throttling`.
+
+**`/admin/login/` shares the bucket.** The account `ensure_app_user`
+provisions is also the Django superuser (see below), so `/admin/login/` is an
+equally valuable credential-guessing target as the API login — but it is a
+plain Django view that never goes through DRF's throttle machinery, and was
+previously entirely unthrottled. `core.admin.ThrottledAdminSite` (wired in as
+`django.contrib.admin`'s `default_site` via the `core.admin.
+ThrottledAdminConfig` app config in `INSTALLED_APPS`) calls
+`core.throttling.check_login_rate_limit` before delegating to the real admin
+login view. That helper — rather than a second `CloudflareScopedRateThrottle`
+instance — reimplements just the cache-bucket algorithm against a plain
+`HttpRequest`, because `/admin/login/` has no DRF `Request`/`APIView` to give
+a real DRF throttle's `allow_request(request, view)`; fabricating one would
+be worse than a second entry point, since a bare `rest_framework.request.
+Request(request)` with no authenticators configured resolves `.user` to
+`AnonymousUser` unconditionally, unlike `SessionAuthentication`, which reads
+the underlying Django request's already-resolved `.user`. Both entry points
+read the same `ScopedRateThrottle.THROTTLE_RATES["login"]`, the same cache,
+and the same cache-key format, so a client is limited identically — and
+shares one budget — regardless of which login form it uses.
+
+### Cache backend
+
+The throttle above stores its per-client attempt history in Django's default
+cache (`django.core.cache.cache`). Gunicorn runs `GUNICORN_WORKERS` separate
+worker processes, each with its own memory, so the default `LocMemCache`
+would give every worker an independent counter — a client could regain
+throttle budget just by landing on a different worker on its next attempt.
+`config.settings.production` configures a `DatabaseCache` instead, visible to
+every worker: `CACHES["default"]["BACKEND"] =
+"django.core.cache.backends.db.DatabaseCache"`. `deploy/entrypoint.sh` runs
+`manage.py createcachetable` (idempotent) immediately after migrations and
+before Gunicorn starts, so the table always exists before any worker serves a
+request. Local development and the test suite are unaffected —
+`config.settings.base` doesn't configure `CACHES` at all, so Django's
+`LocMemCache` default applies there, which is fine for a single process.
+
 ### Provisioning the application account
 
 See the [README](../README.md#provisioning-the-application-account) for the
-`createsuperuser` and `ensure_app_user` provisioning workflows. In short:
-`ensure_app_user` reads `DJANGO_APP_USERNAME`/`DJANGO_APP_PASSWORD` from the
-environment, is idempotent, validates the password against
-`AUTH_PASSWORD_VALIDATORS`, never logs the password, and only changes an
-existing user's password when `--reset-password` is passed explicitly.
+full `createsuperuser` and `ensure_app_user` provisioning workflows. In
+short: `ensure_app_user` reads `DJANGO_APP_USERNAME`/`DJANGO_APP_PASSWORD`
+from the environment (interactively, via `read -rs`, per the README — never
+as a command-line argument), is idempotent, validates the password against
+`AUTH_PASSWORD_VALIDATORS`, and never logs the password. Re-running it with
+no flags is a safe no-op against an existing user: it deliberately leaves
+`is_active`/`is_staff`/`is_superuser` **and** the password untouched, so a
+routine deploy/boot script invoking it can never silently revive an account
+that was deliberately deactivated (e.g. because a session was believed
+compromised) — only `--reset-flags` reconciles those flags, and only
+`--reset-password` rotates the password. Rotating the password invalidates
+every session issued under the old one the next time each is used (Django
+compares each session's stored auth hash, derived from the password hash,
+against the current one), which is also how `ensure_app_user
+--reset-password` is the supported way to force a full sign-out after a
+suspected compromise.
 
 ## Public exposure rules
 

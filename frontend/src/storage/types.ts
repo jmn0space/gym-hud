@@ -135,6 +135,19 @@ export interface AuthMarker {
   [key: string]: JsonValue;
 }
 
+/**
+ * The durable record of which locally-authenticated user's data (in
+ * particular, the pending outbox) is on this device. Unlike `AuthMarker`,
+ * this is never cleared by logout -- see docs/data-sync.md's "Different-user
+ * protection" note and finding #2 of the session-auth review. Set whenever
+ * authentication succeeds (login or verify) and either it is absent yet, or
+ * there are no pending outbox entries to protect.
+ */
+export interface OutboxOwner {
+  username: string;
+  [key: string]: JsonValue;
+}
+
 export interface LocalRepository {
   commitAction(action: LocalAction): Promise<CommitReceipt>;
   readSnapshot(): Promise<RecoverySnapshot>;
@@ -156,5 +169,7 @@ export interface LocalRepository {
   getAuthMarker(): Promise<AuthMarker | undefined>;
   setAuthMarker(marker: AuthMarker): Promise<void>;
   clearAuthMarker(): Promise<void>;
+  getOutboxOwner(): Promise<OutboxOwner | undefined>;
+  setOutboxOwner(owner: OutboxOwner): Promise<void>;
   close(): void;
 }

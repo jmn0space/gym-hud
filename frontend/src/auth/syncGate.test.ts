@@ -3,7 +3,15 @@ import { describe, expect, it } from "vitest";
 import type { AuthStatus } from "./AuthProvider";
 import { canSync } from "./syncGate";
 
-const STATUSES: AuthStatus[] = ["checking", "login-required", "unverified", "authenticated", "expired"];
+const STATUSES: AuthStatus[] = [
+  "checking",
+  "login-required",
+  "server-unreachable",
+  "unverified",
+  "authenticated",
+  "expired",
+  "account-mismatch",
+];
 
 describe("canSync", () => {
   it("is true only for authenticated + online", () => {

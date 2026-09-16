@@ -65,6 +65,12 @@ def test_production_compose_uses_deployment_values_without_local_database():
         **PRODUCTION_ENV,
         "DJANGO_SETTINGS_MODULE": "config.settings.production",
         "DJANGO_ENV": "production",
+        # Not set in PRODUCTION_ENV: both are optional, defaulted in the
+        # Compose file itself, and must still reach the container so
+        # config.settings.base picks them up instead of silently running
+        # with whatever the image's own defaults happen to be.
+        "DJANGO_SESSION_COOKIE_AGE": "2592000",
+        "DJANGO_LOGIN_THROTTLE_RATE": "10/min",
     }
     assert not web.get("ports")
     assert not web.get("depends_on")
@@ -114,6 +120,7 @@ for proto in ("https", "http", ""):
 results["cursors_disabled"] = settings.DATABASES["default"]["DISABLE_SERVER_SIDE_CURSORS"]
 results["sslmode"] = settings.DATABASES["default"]["OPTIONS"]["sslmode"]
 results["debug"] = settings.DEBUG
+results["cache_backend"] = settings.CACHES["default"]["BACKEND"]
 print(json.dumps(results))
 """
     # Fixed test program, run with the current virtual environment's interpreter.
@@ -138,3 +145,17 @@ print(json.dumps(results))
     assert observed["cursors_disabled"] is True
     assert observed["sslmode"] == "require"
     assert observed["debug"] is False
+    # A per-process cache (the LocMemCache default) would give every Gunicorn
+    # worker its own login-throttle counter; production needs one every
+    # worker shares. See deploy/entrypoint.sh's createcachetable step, and
+    # test_entrypoint_creates_cache_table_before_gunicorn_starts below.
+    assert observed["cache_backend"] == "django.core.cache.backends.db.DatabaseCache"
+
+
+def test_entrypoint_creates_cache_table_before_gunicorn_starts():
+    """The shared throttle cache's table must exist before any worker serves a request."""
+    entrypoint = (ROOT / "deploy" / "entrypoint.sh").read_text()
+    migrate_index = entrypoint.index("manage.py migrate")
+    createcachetable_index = entrypoint.index("manage.py createcachetable")
+    gunicorn_index = entrypoint.index("exec gunicorn")
+    assert migrate_index < createcachetable_index < gunicorn_index

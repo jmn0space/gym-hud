@@ -119,6 +119,21 @@ p {
   color: var(--color-text);
 }
 
+.storage-warning {
+  display: grid;
+  gap: 0.75rem;
+  padding: 1rem;
+  margin-bottom: 1rem;
+  border: 2px solid var(--color-warn);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  color: var(--color-warn);
+}
+
+.storage-warning .button {
+  color: var(--color-text);
+}
+
 .storage-queue {
   display: grid;
   gap: 0.35rem;
@@ -166,6 +181,20 @@ p {
   font-size: 1rem;
 }
 
+/*
+ * A compact, secondary sizing for controls that sit on every screen and must
+ * not read as the primary action there -- e.g. the always-visible Sign out
+ * control (finding #12). Still comfortably above the ~44px minimum touch
+ * target despite being far smaller than the full-width `--touch-target`
+ * controls used for primary actions.
+ */
+.button--compact {
+  width: auto;
+  min-height: 2.75rem;
+  padding: 0.4rem 1rem;
+  font-size: 0.95rem;
+}
+
 .field {
   display: grid;
   gap: 0.35rem;
@@ -193,9 +222,18 @@ p {
 }
 
 .account-status {
-  display: grid;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
   gap: 0.5rem;
   margin-bottom: 1rem;
+}
+
+/* The confirmation replaces the compact Sign out control; unlike it, this
+   takes the full row so its explanatory text has room to wrap. */
+.account-status__confirm {
+  width: 100%;
 }
 
 .card {

@@ -2,44 +2,15 @@
 
 from __future__ import annotations
 
-from typing import cast
+from typing import Any
 
 import pytest
-from django.contrib.auth import get_user_model
+from django.conf import settings
 from django.contrib.auth.models import User
-from django.core.cache import cache
 from rest_framework.test import APIClient
 from rest_framework.throttling import ScopedRateThrottle
 
-USERNAME = "coach"
-PASSWORD = "correct-horse-battery-staple"  # noqa: S105
-
-
-@pytest.fixture(autouse=True)
-def _clear_throttle_cache() -> None:
-    """Reset the shared throttle cache so login attempts do not leak between tests."""
-    cache.clear()
-
-
-@pytest.fixture
-def user(db: None) -> User:
-    """A single ordinary (non-superuser) application account for login tests."""
-    return get_user_model().objects.create_user(username=USERNAME, password=PASSWORD)
-
-
-@pytest.fixture
-def csrf_client() -> APIClient:
-    """A client that actually enforces CSRF, like a real browser would."""
-    return APIClient(enforce_csrf_checks=True)
-
-
-def _csrf_token(client: APIClient) -> str:
-    response = client.get("/api/v1/auth/session/")
-    assert response.status_code == 200
-    token = client.cookies["csrftoken"].value
-    assert token
-    return cast(str, token)
-
+from core.tests.conftest import PASSWORD, USERNAME, csrf_token
 
 # --- GET /api/v1/auth/session/ -----------------------------------------------
 
@@ -66,13 +37,60 @@ def test_session_endpoint_authenticated(client: APIClient, user: User) -> None:
     assert response.json() == {"authenticated": True, "username": USERNAME}
 
 
+@pytest.mark.django_db
+def test_session_check_refreshes_expiry_for_authenticated_caller(
+    csrf_client: APIClient, user: User
+) -> None:
+    """GET /auth/session/ while authenticated pushes the session's expiry further out.
+
+    This is what makes SESSION_COOKIE_AGE "30 days since the app last
+    confirmed the session with the server" rather than a hard 30 days from
+    login (see docs/architecture.md), so a daily user is never signed out
+    mid-use.
+    """
+    token = csrf_token(csrf_client)
+    login_response = csrf_client.post(
+        "/api/v1/auth/login/",
+        {"username": USERNAME, "password": PASSWORD},
+        format="json",
+        HTTP_X_CSRFTOKEN=token,
+    )
+    assert login_response.status_code == 200
+    expiry_at_login = csrf_client.session.get_expiry_date()
+
+    response = csrf_client.get("/api/v1/auth/session/")
+
+    assert response.status_code == 200
+    expiry_after_check = csrf_client.session.get_expiry_date()
+    assert expiry_after_check > expiry_at_login
+
+
+@pytest.mark.django_db
+def test_session_check_does_not_create_a_session_for_anonymous_caller(
+    csrf_client: APIClient,
+) -> None:
+    """An anonymous session check has no authenticated session to extend, and creates none.
+
+    Checks the response's own Set-Cookie rather than the test client's
+    `.session` property: merely accessing that property creates and saves a
+    blank session as a side effect (Django's own test Client does this so
+    it can always hand back a usable SessionStore), which would make this
+    assertion pass regardless of what the server did.
+    """
+    response = csrf_client.get("/api/v1/auth/session/")
+
+    assert response.status_code == 200
+    assert response.json() == {"authenticated": False, "username": None}
+    assert settings.SESSION_COOKIE_NAME not in response.cookies
+
+
 # --- POST /api/v1/auth/login/ ------------------------------------------------
 
 
 @pytest.mark.django_db
 def test_login_success_rotates_session_key(csrf_client: APIClient, user: User) -> None:
     """A correct login authenticates the session and rotates its session key."""
-    token = _csrf_token(csrf_client)
+    token = csrf_token(csrf_client)
     pre_login_key = csrf_client.session.session_key
 
     response = csrf_client.post(
@@ -91,7 +109,7 @@ def test_login_success_rotates_session_key(csrf_client: APIClient, user: User) -
 @pytest.mark.django_db
 def test_login_bad_credentials(csrf_client: APIClient, user: User) -> None:
     """Wrong credentials are rejected without authenticating the session."""
-    token = _csrf_token(csrf_client)
+    token = csrf_token(csrf_client)
 
     response = csrf_client.post(
         "/api/v1/auth/login/",
@@ -112,7 +130,7 @@ def test_login_inactive_user_rejected(csrf_client: APIClient, user: User) -> Non
     """An inactive account cannot authenticate even with the right password."""
     user.is_active = False
     user.save()
-    token = _csrf_token(csrf_client)
+    token = csrf_token(csrf_client)
 
     response = csrf_client.post(
         "/api/v1/auth/login/",
@@ -137,7 +155,7 @@ def test_login_inactive_user_rejected(csrf_client: APIClient, user: User) -> Non
 )
 def test_login_missing_fields(csrf_client: APIClient, payload: dict[str, str]) -> None:
     """Missing or empty credentials are a 400 invalid_request, not invalid_credentials."""
-    token = _csrf_token(csrf_client)
+    token = csrf_token(csrf_client)
 
     response = csrf_client.post(
         "/api/v1/auth/login/", payload, format="json", HTTP_X_CSRFTOKEN=token
@@ -148,9 +166,73 @@ def test_login_missing_fields(csrf_client: APIClient, payload: dict[str, str]) -
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"username": USERNAME, "password": 1},
+        {"username": "unknown-user", "password": 1},
+        {"username": USERNAME, "password": ["a", "list"]},
+        {"username": USERNAME, "password": None},
+        {"username": USERNAME, "password": True},
+        {"username": USERNAME, "password": {"nested": "dict"}},
+        {"username": 1, "password": PASSWORD},
+        {"username": ["a", "list"], "password": PASSWORD},
+        {"username": None, "password": PASSWORD},
+    ],
+    ids=[
+        "known-user-int-password",
+        "unknown-user-int-password",
+        "list-password",
+        "null-password",
+        "bool-password",
+        "dict-password",
+        "int-username",
+        "list-username",
+        "null-username",
+    ],
+)
+def test_login_non_string_fields_are_uniformly_invalid_request(
+    csrf_client: APIClient, user: User, payload: dict[str, object]
+) -> None:
+    """A non-string username/password is rejected identically for known and unknown users.
+
+    Before this validation, an unknown username with a non-string password
+    crashed ModelBackend's dummy-hasher run (500), while a known username's
+    real check_password() tended not to -- a status-code oracle for
+    username enumeration, on top of the 500 itself. Every case here must
+    produce the same 400 invalid_request regardless of whether `username`
+    happens to exist.
+    """
+    token = csrf_token(csrf_client)
+
+    response = csrf_client.post(
+        "/api/v1/auth/login/", payload, format="json", HTTP_X_CSRFTOKEN=token
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_request"
+
+
+@pytest.mark.django_db
+def test_login_non_object_body_is_invalid_request(csrf_client: APIClient) -> None:
+    """A JSON body that isn't an object (e.g. a bare list) is rejected cleanly, not a 500."""
+    token = csrf_token(csrf_client)
+
+    response = csrf_client.post(
+        "/api/v1/auth/login/",
+        ["not", "an", "object"],
+        format="json",
+        HTTP_X_CSRFTOKEN=token,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_request"
+
+
+@pytest.mark.django_db
 def test_login_without_csrf_token_is_rejected(csrf_client: APIClient, user: User) -> None:
     """A login POST without a CSRF token fails closed, even though the caller is anonymous."""
-    _csrf_token(csrf_client)  # Sets the cookie, but the header below is deliberately omitted.
+    csrf_token(csrf_client)  # Sets the cookie, but the header below is deliberately omitted.
 
     response = csrf_client.post(
         "/api/v1/auth/login/", {"username": USERNAME, "password": PASSWORD}, format="json"
@@ -164,24 +246,13 @@ def test_login_without_csrf_token_is_rejected(csrf_client: APIClient, user: User
     assert not csrf_client.session.get("_auth_user_id")
 
 
-# --- POST /api/v1/auth/logout/ -----------------------------------------------
-
-
 @pytest.mark.django_db
-def test_logout_without_csrf_token_is_rejected(csrf_client: APIClient, user: User) -> None:
-    """Logout also fails closed without a valid CSRF token."""
-    _csrf_token(csrf_client)
-
-    response = csrf_client.post("/api/v1/auth/logout/")
-
-    assert response.status_code == 403
-    assert response.json()["code"] == "csrf_failed"
-
-
-@pytest.mark.django_db
-def test_logout_then_protected_call_is_unauthenticated(csrf_client: APIClient, user: User) -> None:
-    """After logout, a previously authenticated session can no longer reach protected APIs."""
-    token = _csrf_token(csrf_client)
+@pytest.mark.parametrize("bad_token", [None, "not-the-real-token"], ids=["missing", "bad"])
+def test_login_while_already_authenticated_still_requires_valid_csrf(
+    csrf_client: APIClient, user: User, bad_token: str | None
+) -> None:
+    """An already-authenticated re-post to /login/ still gets csrf_failed, not permission_denied."""
+    token = csrf_token(csrf_client)
     login_response = csrf_client.post(
         "/api/v1/auth/login/",
         {"username": USERNAME, "password": PASSWORD},
@@ -190,25 +261,120 @@ def test_logout_then_protected_call_is_unauthenticated(csrf_client: APIClient, u
     )
     assert login_response.status_code == 200
 
-    # login() rotates the CSRF token, so the pre-login token is now stale;
-    # read the cookie the login response just set.
-    rotated_token = csrf_client.cookies["csrftoken"].value
-    logout_response = csrf_client.post("/api/v1/auth/logout/", HTTP_X_CSRFTOKEN=rotated_token)
-    assert logout_response.status_code == 204
-    assert logout_response.content == b""
+    kwargs: dict[str, Any] = {} if bad_token is None else {"HTTP_X_CSRFTOKEN": bad_token}
+    response = csrf_client.post(
+        "/api/v1/auth/login/",
+        {"username": USERNAME, "password": PASSWORD},
+        format="json",
+        **kwargs,
+    )
 
-    session_response = csrf_client.get("/api/v1/auth/session/")
-    assert session_response.json() == {"authenticated": False, "username": None}
+    assert response.status_code == 403
+    assert response.json()["code"] == "csrf_failed"
+
+
+# --- POST /api/v1/auth/logout/ -----------------------------------------------
+
+
+@pytest.mark.django_db
+def test_logout_without_csrf_token_is_rejected(csrf_client: APIClient, user: User) -> None:
+    """Logout also fails closed without a valid CSRF token."""
+    csrf_token(csrf_client)
+
+    response = csrf_client.post("/api/v1/auth/logout/")
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "csrf_failed"
 
 
 @pytest.mark.django_db
 def test_logout_is_idempotent_for_anonymous_callers(csrf_client: APIClient) -> None:
     """Logging out while already anonymous still succeeds, given a valid CSRF token."""
-    token = _csrf_token(csrf_client)
+    token = csrf_token(csrf_client)
 
     response = csrf_client.post("/api/v1/auth/logout/", HTTP_X_CSRFTOKEN=token)
 
     assert response.status_code == 204
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("bad_token", [None, "not-the-real-token"], ids=["missing", "bad"])
+def test_logout_authenticated_without_valid_csrf_is_csrf_failed(
+    csrf_client: APIClient, user: User, bad_token: str | None
+) -> None:
+    """An authenticated logout with a missing/bad CSRF token gets csrf_failed.
+
+    Not permission_denied: DRF's stock SessionAuthentication.enforce_csrf raises the generic
+    PermissionDenied here, which core.exceptions.exception_handler would
+    report as permission_denied -- inconsistent with the anonymous CSRF
+    failure below. core.authentication.SessionAuthentication.enforce_csrf
+    (and the CsrfFailed/exception_handler wiring) exists specifically to
+    close that gap; this asserts the outcome directly. Because
+    initial()/perform_authentication runs before LogoutView.post's own
+    csrf_protect decorator, this is the code path actually exercised for an
+    authenticated caller.
+    """
+    token = csrf_token(csrf_client)
+    login_response = csrf_client.post(
+        "/api/v1/auth/login/",
+        {"username": USERNAME, "password": PASSWORD},
+        format="json",
+        HTTP_X_CSRFTOKEN=token,
+    )
+    assert login_response.status_code == 200
+
+    kwargs: dict[str, Any] = {} if bad_token is None else {"HTTP_X_CSRFTOKEN": bad_token}
+    response = csrf_client.post("/api/v1/auth/logout/", **kwargs)
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "csrf_failed"
+    # The session must still be alive: a bad CSRF token must not itself log
+    # the user out.
+    assert csrf_client.session.get("_auth_user_id") is not None
+
+
+@pytest.mark.django_db
+@pytest.mark.urls("core.tests.test_auth_urls")
+def test_logout_invalidates_the_session_and_rotates_the_csrf_token(
+    csrf_client: APIClient, user: User
+) -> None:
+    """Logout invalidates the session server-side and rotates the CSRF token.
+
+    Replays the captured pre-logout session cookie against a real protected
+    endpoint (rather than re-reading /auth/session/ with the *same* client,
+    whose cookie jar Django's test client already moved on from) to prove
+    the old session id is rejected server-side, not just that this client's
+    own cookie jar changed. Also confirms Django's logout() does not itself
+    rotate the CSRF token (contrary to a stale comment this test used to
+    rely on) by checking the token changes both after login and after
+    logout.
+    """
+    pre_login_token = csrf_token(csrf_client)
+    login_response = csrf_client.post(
+        "/api/v1/auth/login/",
+        {"username": USERNAME, "password": PASSWORD},
+        format="json",
+        HTTP_X_CSRFTOKEN=pre_login_token,
+    )
+    assert login_response.status_code == 200
+    post_login_token = csrf_client.cookies["csrftoken"].value
+    assert post_login_token != pre_login_token  # login() rotates the CSRF token.
+
+    pre_logout_session_key = csrf_client.session.session_key
+    assert pre_logout_session_key is not None
+
+    logout_response = csrf_client.post("/api/v1/auth/logout/", HTTP_X_CSRFTOKEN=post_login_token)
+    assert logout_response.status_code == 204
+    assert logout_response.content == b""
+
+    post_logout_token = csrf_client.cookies["csrftoken"].value
+    assert post_logout_token != post_login_token  # logout() also rotates it.
+
+    replay_client = APIClient()
+    replay_client.cookies[settings.SESSION_COOKIE_NAME] = pre_logout_session_key
+    response = replay_client.get("/api/v1/protected-ping/")
+    assert response.status_code == 401
+    assert response.json()["code"] == "not_authenticated"
 
 
 # --- Protected endpoint boundary ---------------------------------------------
@@ -240,9 +406,39 @@ def test_authenticated_access_to_protected_endpoint_succeeds(client: APIClient, 
 
 @pytest.mark.django_db
 @pytest.mark.urls("core.tests.test_auth_urls")
+@pytest.mark.parametrize("bad_token", [None, "not-the-real-token"], ids=["missing", "bad"])
+def test_authenticated_unsafe_method_without_valid_csrf_is_csrf_failed(
+    csrf_client: APIClient, user: User, bad_token: str | None
+) -> None:
+    """An unsafe request on an ordinary protected endpoint enforces CSRF too, uniformly.
+
+    Unlike login/logout, ProtectedPingView does not opt into csrf_protect
+    itself -- this exercises only
+    core.authentication.SessionAuthentication.enforce_csrf, the general fix
+    for finding 1 (as opposed to the login/logout-specific csrf_protect
+    decorators).
+    """
+    token = csrf_token(csrf_client)
+    login_response = csrf_client.post(
+        "/api/v1/auth/login/",
+        {"username": USERNAME, "password": PASSWORD},
+        format="json",
+        HTTP_X_CSRFTOKEN=token,
+    )
+    assert login_response.status_code == 200
+
+    kwargs: dict[str, Any] = {} if bad_token is None else {"HTTP_X_CSRFTOKEN": bad_token}
+    response = csrf_client.post("/api/v1/protected-ping/", **kwargs)
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "csrf_failed"
+
+
+@pytest.mark.django_db
+@pytest.mark.urls("core.tests.test_auth_urls")
 def test_expired_session_is_401_and_relogin_works(csrf_client: APIClient, user: User) -> None:
     """A session that has expired behaves like no session at all, and re-login recovers it."""
-    token = _csrf_token(csrf_client)
+    token = csrf_token(csrf_client)
     login_response = csrf_client.post(
         "/api/v1/auth/login/",
         {"username": USERNAME, "password": PASSWORD},
@@ -263,7 +459,7 @@ def test_expired_session_is_401_and_relogin_works(csrf_client: APIClient, user: 
     assert response.status_code == 401
     assert response.json()["code"] == "not_authenticated"
 
-    relogin_token = _csrf_token(csrf_client)
+    relogin_token = csrf_token(csrf_client)
     relogin_response = csrf_client.post(
         "/api/v1/auth/login/",
         {"username": USERNAME, "password": PASSWORD},
@@ -289,7 +485,7 @@ def test_login_is_throttled_after_repeated_failures(
     # patch the throttle class directly instead.
     monkeypatch.setattr(ScopedRateThrottle, "THROTTLE_RATES", {"login": "2/min"})
 
-    token = _csrf_token(csrf_client)
+    token = csrf_token(csrf_client)
     statuses = []
     for _ in range(3):
         response = csrf_client.post(

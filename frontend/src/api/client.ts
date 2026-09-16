@@ -3,9 +3,12 @@ import { API_BASE_URL, apiUrl } from "./config";
 export type ApiErrorCode =
   | "not_authenticated"
   | "csrf_failed"
+  | "permission_denied"
   | "invalid_credentials"
   | "invalid_request"
   | "throttled"
+  | "not_found"
+  | "server_error"
   | "network"
   | "unknown";
 
@@ -22,13 +25,17 @@ export class ApiError extends Error {
   }
 }
 
-type UnauthenticatedListener = () => void;
+/**
+ * Called with the session generation the failing request captured when it was
+ * sent (see `bumpSessionGeneration`).
+ */
+type UnauthenticatedListener = (generation: number) => void;
 const unauthenticatedListeners = new Set<UnauthenticatedListener>();
 
 /**
  * Lets the auth provider learn about a 401 from any `apiFetch` call, anywhere
  * in the app, without every call site having to report it individually. The
- * only current subscriber flips authenticated -> expired.
+ * only current subscriber flips authenticated/unverified -> expired.
  */
 export function onUnauthenticated(listener: UnauthenticatedListener): () => void {
   unauthenticatedListeners.add(listener);
@@ -37,25 +44,72 @@ export function onUnauthenticated(listener: UnauthenticatedListener): () => void
   };
 }
 
-function notifyUnauthenticated(): void {
+function notifyUnauthenticated(generation: number): void {
   for (const listener of unauthenticatedListeners) {
-    listener();
+    listener(generation);
   }
+}
+
+/**
+ * Bumped by the auth provider whenever it establishes a session (a
+ * successful login, or a startup/background check confirming one). A request
+ * captures the current generation when it is sent; if its 401 response
+ * arrives after a *newer* session has since been established, the generation
+ * comparison lets the listener recognize the 401 as stale and ignore it,
+ * instead of flipping the new session back to "expired" (see finding #17 of
+ * the session-auth review and docs/data-sync.md).
+ */
+let sessionGeneration = 0;
+
+export function bumpSessionGeneration(): number {
+  sessionGeneration += 1;
+  return sessionGeneration;
+}
+
+export function currentSessionGeneration(): number {
+  return sessionGeneration;
 }
 
 // Dev uses a same-origin Vite proxy and production is a same-origin deployment,
 // so cookies just work with "same-origin". A cross-origin API base (a non-empty
 // API_BASE_URL) needs "include" instead, or the browser will not send/accept them.
+// Note this does not make cross-origin authenticated calls work end to end: the
+// page can only ever read a `csrftoken` cookie set for *its own* origin, so a
+// cross-origin API_BASE_URL leaves this browser unable to read the API's CSRF
+// cookie at all (see `readCsrfCookie`) and unsafe requests will fail CSRF
+// checks. Supporting that properly (e.g. a CSRF token delivered some other
+// way) is out of scope here; same-origin (dev proxy or production) is the
+// supported deployment shape.
 const CREDENTIALS: RequestCredentials = API_BASE_URL === "" ? "same-origin" : "include";
 
 const CSRF_COOKIE_NAME = "csrftoken";
 const CSRF_HEADER_NAME = "X-CSRFToken";
 export const SESSION_PATH = "/api/v1/auth/session/" as const;
 
+/**
+ * Reads the `csrftoken` cookie. When a name appears more than once (distinct
+ * paths), Django's own cookie parsing (`http.cookies.SimpleCookie`) keeps the
+ * *last* occurrence, so this does the same for consistency with what the
+ * server would parse back. A malformed percent-encoding is treated as "no
+ * cookie" rather than thrown -- this is a CSRF token, not something that
+ * should ever surface as a network-class failure (see finding #18).
+ */
 function readCsrfCookie(): string | undefined {
   const prefix = `${CSRF_COOKIE_NAME}=`;
-  const entry = document.cookie.split("; ").find((part) => part.startsWith(prefix));
-  return entry === undefined ? undefined : decodeURIComponent(entry.slice(prefix.length));
+  let raw: string | undefined;
+  for (const part of document.cookie.split("; ")) {
+    if (part.startsWith(prefix)) {
+      raw = part.slice(prefix.length);
+    }
+  }
+  if (raw === undefined) {
+    return undefined;
+  }
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -92,9 +146,12 @@ function isKnownCode(code: string): code is ApiErrorCode {
   return (
     code === "not_authenticated" ||
     code === "csrf_failed" ||
+    code === "permission_denied" ||
     code === "invalid_credentials" ||
     code === "invalid_request" ||
     code === "throttled" ||
+    code === "not_found" ||
+    code === "server_error" ||
     code === "unknown"
   );
 }
@@ -140,6 +197,10 @@ async function performFetch<T>(
   options: ApiFetchOptions,
   retried: boolean,
 ): Promise<T> {
+  // Captured up front so a 401 this request eventually produces is reported
+  // against the session that was active when the request was *sent*, not
+  // whatever is active by the time the response arrives (see finding #17).
+  const requestGeneration = currentSessionGeneration();
   const { method = "GET", body, csrf = false, signal } = options;
   const headers: Record<string, string> = { Accept: "application/json" };
   if (body !== undefined) {
@@ -168,18 +229,22 @@ async function performFetch<T>(
   }
 
   if (response.status === 401) {
-    notifyUnauthenticated();
+    notifyUnauthenticated(requestGeneration);
     const payload = await safeJson(response);
     throw new ApiError(401, codeFromPayload(payload) ?? "not_authenticated", detailFromPayload(payload));
   }
 
   if (response.status === 403 && !retried) {
     const payload = await safeJson(response);
-    if (codeFromPayload(payload) === "csrf_failed") {
+    const code = codeFromPayload(payload);
+    if (code === "csrf_failed") {
       await primeCsrfCookie();
       return performFetch<T>(path, options, true);
     }
-    throw new ApiError(403, "csrf_failed", detailFromPayload(payload));
+    // Only an explicit csrf_failed code triggers the retry/label above -- any
+    // other 403 (permission_denied, or an unparseable proxy/WAF page with no
+    // JSON body at all) must not be mislabeled as csrf_failed (finding #8).
+    throw new ApiError(403, code ?? "unknown", detailFromPayload(payload));
   }
 
   if (response.status === 429) {

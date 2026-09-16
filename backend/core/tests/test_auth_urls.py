@@ -22,6 +22,16 @@ class ProtectedPingView(APIView):
         """Return a static payload; reaching this at all proves authentication passed."""
         return Response({"pong": True})
 
+    def post(self, _request: Request) -> Response:
+        """An unsafe method, so that CSRF enforcement on a plain protected endpoint is testable.
+
+        This view does not opt into ``csrf_protect`` itself -- unlike
+        ``LoginView``/``LogoutView`` -- so reaching this at all for an
+        authenticated caller exercises only the default
+        ``core.authentication.SessionAuthentication.enforce_csrf`` path.
+        """
+        return Response({"pong": True})
+
 
 # Mirror the real API root (api/v1/, including the real auth endpoints) plus
 # one extra protected-only route, so tests can exercise the auth boundary

@@ -10,8 +10,20 @@ from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
-from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
+
+from core.throttling import CloudflareScopedRateThrottle
+
+
+def _is_nonempty_str(value: object) -> bool:
+    """True only for an actual, non-empty ``str``.
+
+    Rejects everything ``dict.get()`` might otherwise hand a password field
+    from arbitrary JSON -- ``int``, ``list``, ``dict``, ``None``, and (since
+    ``bool`` is an ``int`` subclass, not a ``str``) ``True``/``False`` too --
+    not just the empty string.
+    """
+    return isinstance(value, str) and bool(value)
 
 
 @method_decorator(
@@ -73,7 +85,21 @@ class SessionView(APIView):
 
     @method_decorator(ensure_csrf_cookie)
     def get(self, request: Request) -> Response:
-        """Return the current authentication state without caching it."""
+        """Return the current authentication state without caching it.
+
+        For an authenticated caller, this also marks the session modified so
+        Django re-saves it (``SessionMiddleware.process_response``), which
+        refreshes its expiry to a fresh ``SESSION_COOKIE_AGE`` from now. That
+        makes the effective session lifetime "30 days since the app last
+        confirmed the session with the server" rather than a hard 30 days
+        from login, so a daily user is never signed out mid-use; see
+        docs/architecture.md. ``SESSION_SAVE_EVERY_REQUEST`` stays ``False``
+        so only this endpoint -- which the frontend already calls to confirm
+        the session is alive (see docs/data-sync.md) -- does this, not every
+        request.
+        """
+        if request.user.is_authenticated:
+            request.session.modified = True
         return Response(_session_payload(request))
 
 
@@ -81,25 +107,41 @@ class SessionView(APIView):
     cache_control(no_cache=True, no_store=True, must_revalidate=True),
     name="dispatch",
 )
+@method_decorator(csrf_protect, name="dispatch")
 class LoginView(APIView):
     """Authenticate with a username and password and start a Django session.
 
-    CSRF is enforced explicitly (``csrf_protect``) because DRF's
-    ``SessionAuthentication`` only checks CSRF for already-authenticated
-    requests, and this endpoint must reject anonymous CSRF failures too.
+    CSRF is enforced explicitly (``csrf_protect``, applied to ``dispatch``
+    rather than just ``post``) because DRF's ``SessionAuthentication`` only
+    checks CSRF for already-authenticated requests, and this endpoint must
+    reject anonymous CSRF failures too. Wrapping ``dispatch`` -- instead of
+    just ``post``, as previously -- runs the CSRF check *before*
+    ``APIView.initial()`` (and therefore before ``check_throttles``), so an
+    anonymous request with no/an invalid CSRF token is rejected without
+    consuming a login attempt from the throttle below; it also still runs
+    inside the ``cache_control`` wrapper, so even a CSRF-failure response
+    carries the same no-store headers as everything else this view returns.
     """
 
     permission_classes = [AllowAny]
-    throttle_classes = [ScopedRateThrottle]
+    throttle_classes = [CloudflareScopedRateThrottle]
     throttle_scope = "login"
 
-    @method_decorator(csrf_protect)
     def post(self, request: Request) -> Response:
         """Validate credentials, log the user in, and rotate the session and CSRF token."""
         data = request.data if isinstance(request.data, dict) else {}
         username = data.get("username")
         password = data.get("password")
-        if not username or not password:
+        if not _is_nonempty_str(username) or not _is_nonempty_str(password):
+            # Reject non-string/empty/missing fields (and non-object JSON
+            # bodies, via the isinstance check above) before ever reaching
+            # authenticate(): Django's ModelBackend calls set_password()/
+            # check_password() with whatever was sent, and a non-string
+            # password crashes the dummy hasher run for an *unknown*
+            # username (500) while a known username's real check_password()
+            # tends not to -- a status-code oracle for username enumeration,
+            # on top of the 500 itself. Validating the type here closes both
+            # at once, uniformly, before either code path is reached.
             return Response(
                 {"code": "invalid_request", "detail": "Username and password are required."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -135,9 +177,11 @@ class LogoutView(APIView):
         """Flush the session (if authenticated) and rotate the CSRF token."""
         if request.user.is_authenticated:
             logout(request)
-        else:
-            # logout() only rotates the CSRF token as a side effect of
-            # flushing a real session; do it explicitly for the no-op path too
-            # so a stale anonymous CSRF token is never reused across logins.
-            rotate_token(request)
+        # Django's logout() does not rotate the CSRF token itself -- it only
+        # sends user_logged_out, flushes the session, and resets
+        # request.user to AnonymousUser. Rotate explicitly and
+        # unconditionally (for both the just-logged-out and the
+        # already-anonymous no-op path) so a CSRF token issued before this
+        # call is never still valid afterwards.
+        rotate_token(request)
         return Response(status=status.HTTP_204_NO_CONTENT)

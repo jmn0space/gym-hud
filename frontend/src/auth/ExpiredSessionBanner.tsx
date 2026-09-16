@@ -12,13 +12,32 @@ import { LoginForm } from "./LoginForm";
 export function ExpiredSessionBanner() {
   const { status } = useAuth();
   const [showForm, setShowForm] = useState(false);
+  // Tracks the previously-rendered status purely to detect the transition
+  // below; this component stays mounted even while it renders null, so
+  // `showForm` would otherwise survive from one "expired" episode to the
+  // next. Adjusted during render (React's supported pattern for resetting
+  // state in response to a prop/derived-value change) rather than in a
+  // `useEffect`, so a later expiry starts back on the "Sign in" button
+  // instead of the open form without an extra render round-trip (finding
+  // #15).
+  const [trackedStatus, setTrackedStatus] = useState(status);
+  if (status !== trackedStatus) {
+    setTrackedStatus(status);
+    if (status !== "expired") {
+      setShowForm(false);
+    }
+  }
 
   if (status !== "expired") {
     return null;
   }
 
   return (
-    <aside className="storage-error" role="alert">
+    // "status", not "alert": the form below has its own role="alert" for a
+    // sign-in error, and a live region should not nest inside another one
+    // (finding #15). This banner's own presence is announced once when it
+    // appears; it does not need to keep re-asserting itself as an alert.
+    <aside className="storage-error" role="status">
       <p>Session expired — sign in to sync</p>
       {showForm ? (
         <LoginForm />

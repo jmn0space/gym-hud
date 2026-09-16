@@ -262,11 +262,52 @@ Run the production Docker Compose deployment.
 
 Expected: Django is reachable from `cloudflared` through `http://web:8000`, but port 8000 is not published directly to the VPS host.
 
-### AUTH-01 — Unauthenticated access
+### AUTH-01 — Unauthenticated access and offline continuation
 
-Open the application hostname without a valid Django session.
+**(a) No valid session, protected API endpoint**
 
-Expected: protected application/API routes are inaccessible until authentication succeeds.
+Call a protected `/api/v1/` endpoint (i.e. anything outside the public
+allowlist in [Architecture: public vs. protected
+endpoints](architecture.md#public-vs-protected-endpoints)) without a valid
+Django session.
+
+Expected: `401 {"code": "not_authenticated"}`. Separately, an unsafe request
+(a state-changing method) without a valid CSRF token is rejected with `403
+{"code": "csrf_failed"}` regardless of session state — session validity and
+CSRF validity are independent checks, and neither substitutes for the
+other. See [Architecture: uniform API error shape](architecture.md#uniform-api-error-shape).
+
+**(b) Device that has never signed in**
+
+Open the application on a device that has never completed a successful
+login.
+
+Expected: only the login screen is shown. No local workout data exists yet
+to expose, and none is fetched.
+
+**(c) Previously signed-in device without a currently valid session**
+
+Open the application on a device that has signed in before, while offline,
+or after the server-side session has expired or been invalidated (e.g. by
+`ensure_app_user --reset-password`; see
+[Architecture: provisioning the application account](architecture.md#provisioning-the-application-account)).
+
+Expected: the application opens its local (IndexedDB) data immediately,
+shows it read-only or with synchronization paused, and prompts for
+sign-in. Pending unsynchronized mutations (see [Data &
+synchronization](data-sync.md)) are preserved, never discarded, while this
+state is resolved — sign-in success resumes synchronization; the user may
+also continue working locally.
+
+This case is why session expiry is rolling rather than fixed: see
+[Architecture: rolling session expiry](architecture.md#cookies-and-csrf-settings).
+
+A backend guard test (`core.tests.test_url_auth_coverage`) walks every URL
+pattern actually registered under `/api/v1/` and asserts that each one
+outside the documented public allowlist (health, auth/session, auth/login,
+auth/logout) requires authentication, so a future endpoint added without
+explicit `permission_classes`/`authentication_classes` cannot silently
+become case (a)'s counterexample.
 
 ## Overall v1 continuity criterion
 

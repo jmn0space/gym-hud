@@ -10,6 +10,21 @@ export function LoginForm() {
   const usernameId = useId();
   const passwordId = useId();
 
+  // Clear the password after a failed attempt too, not only on success
+  // (finding #16): a wrong-password typo or a blocked different-user attempt
+  // should not leave the previous password sitting in the field. `login`
+  // always sets a brand-new `loginError` object (or null), so comparing by
+  // reference against the last one we saw detects each new failure -- this
+  // is adjusted during render (React's supported pattern for reacting to a
+  // prop/derived-value change) rather than in a `useEffect`.
+  const [trackedLoginError, setTrackedLoginError] = useState(loginError);
+  if (loginError !== trackedLoginError) {
+    setTrackedLoginError(loginError);
+    if (loginError !== null && (loginError.kind === "invalid_credentials" || loginError.kind === "different_user")) {
+      setPassword("");
+    }
+  }
+
   async function handleSubmit(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
     if (loginPending) {
@@ -44,6 +59,9 @@ export function LoginForm() {
           name="username"
           type="text"
           autoComplete="username"
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
           className="text-input"
           value={username}
           onChange={(event) => {

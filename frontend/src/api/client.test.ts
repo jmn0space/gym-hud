@@ -1,6 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { apiFetch, ApiError, onUnauthenticated, SESSION_PATH } from "./client";
+import {
+  apiFetch,
+  ApiError,
+  bumpSessionGeneration,
+  currentSessionGeneration,
+  onUnauthenticated,
+  SESSION_PATH,
+} from "./client";
 
 function stubFetch(implementation: (url: string, init?: RequestInit) => Promise<Response>) {
   const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -106,6 +113,16 @@ describe("apiFetch", () => {
 
     expect(result).toEqual({ authenticated: true, username: "juan" });
     expect(fetchMock).toHaveBeenCalledTimes(3); // login (403) -> session (prime) -> login (retry)
+    // The retried request must carry the freshly-rotated token, not the
+    // stale one that just failed (finding #14) -- re-attaching the same
+    // stale cookie would just 403 again.
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      "/api/v1/auth/login/",
+      expect.objectContaining({
+        headers: expect.objectContaining({ "X-CSRFToken": "rotated-token" }) as unknown,
+      }),
+    );
   });
 
   it("does not retry a second time after another csrf_failed", async () => {
@@ -153,5 +170,116 @@ describe("apiFetch", () => {
       code: "throttled",
       status: 429,
     });
+  });
+
+  it("does not mislabel a non-CSRF 403 as csrf_failed and does not retry it (finding #8)", async () => {
+    setCookie("csrftoken=t");
+    const fetchMock = stubFetch(() =>
+      Promise.resolve(Response.json({ code: "permission_denied", detail: "nope" }, { status: 403 })),
+    );
+
+    await expect(
+      apiFetch("/api/v1/x/", { method: "POST", csrf: true }),
+    ).rejects.toMatchObject({ status: 403, code: "permission_denied" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("labels an unparseable 403 body (e.g. a WAF/proxy HTML page) as unknown, not csrf_failed (finding #8)", async () => {
+    const fetchMock = stubFetch(() => Promise.resolve(new Response("<html>Forbidden</html>", { status: 403 })));
+
+    await expect(apiFetch("/api/v1/x/")).rejects.toMatchObject({ status: 403, code: "unknown" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("labels a second, different 403 after a csrf_failed retry by its own code, not csrf_failed again (finding #8)", async () => {
+    setCookie("csrftoken=stale");
+    let attempts = 0;
+    stubFetch((url) => {
+      if (url === SESSION_PATH) {
+        setCookie("csrftoken=fresh");
+        return Promise.resolve(anonymousSession());
+      }
+      attempts += 1;
+      return Promise.resolve(
+        attempts === 1
+          ? Response.json({ code: "csrf_failed" }, { status: 403 })
+          : Response.json({ code: "permission_denied" }, { status: 403 }),
+      );
+    });
+
+    await expect(
+      apiFetch("/api/v1/x/", { method: "POST", csrf: true }),
+    ).rejects.toMatchObject({ status: 403, code: "permission_denied" });
+  });
+
+  it("keeps the last csrftoken cookie when the name appears more than once, matching Django's own parsing", async () => {
+    // A real browser can hold two same-named cookies scoped to distinct
+    // paths at once; jsdom's own cookie jar collapses same-path writes, so
+    // the getter is stubbed directly to exercise that raw multi-occurrence
+    // string deterministically (finding #18).
+    const cookieDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "cookie");
+    Object.defineProperty(document, "cookie", {
+      configurable: true,
+      get: () => "csrftoken=first-path; csrftoken=second-path",
+    });
+    try {
+      const fetchMock = stubFetch(() => Promise.resolve(Response.json({ authenticated: true, username: "juan" })));
+
+      await apiFetch("/api/v1/auth/login/", { method: "POST", body: {}, csrf: true });
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/auth/login/",
+        expect.objectContaining({ headers: expect.objectContaining({ "X-CSRFToken": "second-path" }) as unknown }),
+      );
+    } finally {
+      if (cookieDescriptor) {
+        Object.defineProperty(document, "cookie", cookieDescriptor);
+      }
+    }
+  });
+
+  it("treats a malformed percent-encoded csrftoken cookie as missing rather than throwing (finding #18)", async () => {
+    setCookie("csrftoken=%");
+    const fetchMock = stubFetch((url) => {
+      if (url === SESSION_PATH) {
+        setCookie("csrftoken=valid-token");
+        return Promise.resolve(anonymousSession());
+      }
+      return Promise.resolve(Response.json({ authenticated: true, username: "juan" }));
+    });
+
+    // A malformed cookie must fall back to (re)priming a fresh one instead of
+    // surfacing as a thrown/network-class error.
+    await expect(
+      apiFetch("/api/v1/auth/login/", { method: "POST", body: {}, csrf: true }),
+    ).resolves.toEqual({ authenticated: true, username: "juan" });
+    expect(fetchMock).toHaveBeenNthCalledWith(1, SESSION_PATH, expect.anything());
+  });
+});
+
+function anonymousSession() {
+  return Response.json({ authenticated: false, username: null });
+}
+
+describe("session generation", () => {
+  it("reports the generation a request captured when it was sent, not when it resolves (finding #17)", async () => {
+    let resolveResponse: ((response: Response) => void) | undefined;
+    stubFetch(() => new Promise<Response>((resolve) => { resolveResponse = resolve; }));
+
+    const listener = vi.fn();
+    const unsubscribe = onUnauthenticated(listener);
+    const generationAtSend = currentSessionGeneration();
+
+    const pending = apiFetch("/api/v1/some-endpoint/").catch((error: unknown) => error);
+    // A newer session (e.g. a fresh login) is established while the request
+    // above is still in flight.
+    bumpSessionGeneration();
+    resolveResponse?.(Response.json({ code: "not_authenticated" }, { status: 401 }));
+    await pending;
+
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(listener).toHaveBeenCalledWith(generationAtSend);
+    expect(listener.mock.calls[0]?.[0]).not.toBe(currentSessionGeneration());
+    unsubscribe();
   });
 });

@@ -115,30 +115,55 @@ docker compose exec web python backend/manage.py createsuperuser
 
 Non-interactively, for scripted/first-boot provisioning, use the
 `ensure_app_user` management command. It reads the credentials from the
-environment so the password is never typed as a command-line argument or
-printed to logs, validates the password against the configured password
-validators (`AUTH_PASSWORD_VALIDATORS`), and is safe to run repeatedly:
-without `--reset-password` it leaves an existing user's password untouched
-and only reconciles the superuser/staff/active flags; with `--reset-password`
-it also updates the password.
+environment, only reading/requiring the password when it will actually be
+used, and validates it against the configured password validators
+(`AUTH_PASSWORD_VALIDATORS`) at that point. It is safe to run repeatedly:
+
+- Without any flags, an existing user is left untouched -- including its
+  password and its superuser/staff/active flags -- and the command reports
+  whether anything differs from the expected state; it never types a
+  password on the command line, since none is needed for this no-op path.
+- `--reset-flags` reconciles an existing user's superuser/staff/active flags
+  back to the expected state. This is opt-in and separate from the default
+  run specifically so that re-running this command as part of a routine
+  deploy/boot script can never silently reactivate an account someone
+  deliberately deactivated (e.g. in response to a compromised session).
+- `--reset-password` updates the password of an existing user. Rotating the
+  password also invalidates every session issued under the old password,
+  the next time each one is used.
+
+Enter the password interactively so it never appears in shell history or in
+a process listing (`export FOO=bar` and `docker ... -e FOO=bar` both do):
 
 ```bash
 export DJANGO_APP_USERNAME=coach
-export DJANGO_APP_PASSWORD='use a strong, unique passphrase'
+read -rsp 'App password: ' DJANGO_APP_PASSWORD && export DJANGO_APP_PASSWORD; echo
 python backend/manage.py ensure_app_user
 
-# or, against the running Compose service:
+# or, against the running Compose service (bare -e forwards the value from
+# this shell's environment instead of taking a literal on the command line):
 docker compose exec \
-  -e DJANGO_APP_USERNAME=coach \
-  -e DJANGO_APP_PASSWORD='use a strong, unique passphrase' \
+  -e DJANGO_APP_USERNAME \
+  -e DJANGO_APP_PASSWORD \
   web python backend/manage.py ensure_app_user
 
 # to change the password of an already-provisioned account:
 docker compose exec \
-  -e DJANGO_APP_USERNAME=coach \
-  -e DJANGO_APP_PASSWORD='a new strong, unique passphrase' \
+  -e DJANGO_APP_USERNAME \
+  -e DJANGO_APP_PASSWORD \
   web python backend/manage.py ensure_app_user --reset-password
+
+# to restore superuser/staff/active status after confirming a deactivation
+# was accidental (does not by itself touch the password):
+docker compose exec \
+  -e DJANGO_APP_USERNAME \
+  web python backend/manage.py ensure_app_user --reset-flags
 ```
+
+`backend/manage.py` matches the Dockerfile's layout: the image's `WORKDIR`
+is `/app` and `COPY backend /app/backend`, so `docker compose exec web`
+(which runs inside that `WORKDIR`) can reach it at the same relative
+`backend/manage.py` path used above and elsewhere in this README.
 
 ### Local Docker Compose
 

@@ -1,7 +1,9 @@
 import { useEffect, useRef } from "react";
 import { Outlet, useLocation } from "react-router";
 
+import { AccountMismatchBanner } from "../auth/AccountMismatchBanner";
 import { ExpiredSessionBanner } from "../auth/ExpiredSessionBanner";
+import { StorageWarningBanner } from "../auth/StorageWarningBanner";
 import { AccountStatus } from "./AccountStatus";
 import { BottomNav } from "./BottomNav";
 import { LocalDataStatus } from "./LocalDataStatus";
@@ -25,7 +27,9 @@ export function AppLayout() {
   return (
     <div className="app">
       <main ref={mainRef} className="app__main">
+        <StorageWarningBanner />
         <ExpiredSessionBanner />
+        <AccountMismatchBanner />
         <LocalDataStatus />
         <AccountStatus />
         <Outlet />

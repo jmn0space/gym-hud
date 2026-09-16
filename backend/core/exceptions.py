@@ -16,8 +16,11 @@ from rest_framework import exceptions
 from rest_framework.response import Response
 from rest_framework.views import exception_handler as drf_exception_handler
 
+from core.authentication import CsrfFailed
+
 _NOT_AUTHENTICATED = "not_authenticated"
 _PERMISSION_DENIED = "permission_denied"
+_CSRF_FAILED = "csrf_failed"
 _THROTTLED = "throttled"
 _VALIDATION_ERROR = "validation_error"
 _NOT_FOUND = "not_found"
@@ -26,6 +29,10 @@ _PARSE_ERROR = "parse_error"
 _ERROR = "error"
 
 _CODES_BY_EXCEPTION: tuple[tuple[type[exceptions.APIException], str], ...] = (
+    # CsrfFailed is a PermissionDenied subclass (see core.authentication), so
+    # it must be matched before the generic PermissionDenied entry below --
+    # _code_for() returns on the first isinstance() match.
+    (CsrfFailed, _CSRF_FAILED),
     (exceptions.NotAuthenticated, _NOT_AUTHENTICATED),
     (exceptions.AuthenticationFailed, _NOT_AUTHENTICATED),
     (exceptions.PermissionDenied, _PERMISSION_DENIED),

@@ -771,6 +771,30 @@ describe("LocalRepository retry, concurrency, and ordering", () => {
     await expect(reopened.listPendingOutbox()).resolves.toHaveLength(1);
   });
 
+  it("persists the outbox owner independently of the auth marker, surviving logout", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "outbox-owner-roundtrip";
+    const repo = repository(factory, { databaseName });
+    await expect(repo.getOutboxOwner()).resolves.toBeUndefined();
+
+    await repo.setAuthMarker({ username: "juan", lastVerifiedAt: "2026-09-14T10:00:00.000Z" });
+    await repo.setOutboxOwner({ username: "juan" });
+    await repo.commitAction({
+      actionId: "outbox-owner-pending-action",
+      changes: [
+        { store: "exercise_registry", operation: "put", record: { id: "exercise-1", name: "Row" } },
+      ],
+    });
+
+    // Logout (clearAuthMarker) must never clear the outbox owner: it is the
+    // durable record of whose pending outbox entries are on this device (see
+    // the `OutboxOwner` JSDoc and docs/data-sync.md's different-user note).
+    await repo.clearAuthMarker();
+    await expect(repo.getAuthMarker()).resolves.toBeUndefined();
+    await expect(repo.getOutboxOwner()).resolves.toEqual({ username: "juan" });
+    await expect(repo.listPendingOutbox()).resolves.toHaveLength(1);
+  });
+
   it("rejects a corrupted persisted auth marker instead of trusting it", async () => {
     const factory = new IDBFactory();
     const databaseName = "corrupted-auth-marker";
@@ -805,6 +829,39 @@ describe("LocalRepository retry, concurrency, and ordering", () => {
 
     const reopened = repository(factory, { databaseName });
     await expect(reopened.getAuthMarker()).rejects.toThrow(/auth marker/i);
+  });
+
+  it("rejects a corrupted persisted outbox owner instead of trusting it", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "corrupted-outbox-owner";
+    const repo = repository(factory, { databaseName });
+    await repo.getOutboxOwner();
+    repo.close();
+    await Promise.resolve();
+
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = factory.open(databaseName);
+      request.addEventListener("success", () => {
+        resolve(request.result);
+      });
+      request.addEventListener("error", () => {
+        reject(new Error("open failed"));
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(DATABASE_STORES.internalMetadata, "readwrite");
+      transaction.objectStore(DATABASE_STORES.internalMetadata).put({ key: "outbox_owner", value: 42 });
+      transaction.addEventListener("complete", () => {
+        resolve();
+      });
+      transaction.addEventListener("error", () => {
+        reject(new Error("write failed"));
+      });
+    });
+    database.close();
+
+    const reopened = repository(factory, { databaseName });
+    await expect(reopened.getOutboxOwner()).rejects.toThrow(/outbox owner/i);
   });
 
   it("normalizes a synchronous db.transaction failure in acknowledgeOutbox and writeKeyValue", async () => {

@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { StrictMode } from "react";
 import { MemoryRouter } from "react-router";
@@ -251,7 +251,13 @@ describe("authentication gate", () => {
     expect(await screen.findByText("Session expired — sign in to sync")).toBeInTheDocument();
     expect(sessionCallCount).toBeGreaterThan(0);
 
+    // The banner is persistent: it must still be there after navigating to
+    // another screen, not just on the one it first appeared on (finding #14).
     const user = userEvent.setup();
+    await user.click((await primaryNav()).getByRole("link", { name: "History" }));
+    expect(await screen.findByRole("heading", { level: 1, name: "History" })).toBeInTheDocument();
+    expect(screen.getByText("Session expired — sign in to sync")).toBeInTheDocument();
+
     await user.click(screen.getByRole("button", { name: "Sign in" }));
     await user.type(screen.getByLabelText("Username"), "tester");
     await user.type(screen.getByLabelText("Password"), "hunter2");
@@ -262,5 +268,129 @@ describe("authentication gate", () => {
     });
 
     authRepository.close();
+  });
+
+  it("recovers automatically once the network returns after a genuinely-online check failure, not just navigator.onLine=false (finding #14)", async () => {
+    let sessionCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        if (url.includes("/auth/session/")) {
+          sessionCalls += 1;
+          return sessionCalls === 1
+            ? Promise.reject(new TypeError("Failed to fetch"))
+            : Promise.resolve(Response.json({ authenticated: true, username: "tester" }));
+        }
+        return Promise.resolve(Response.json({ status: "ok", database: { connected: true } }));
+      }),
+    );
+    const authRepository = createLocalRepository({
+      databaseName: `gym-hud-auth-online-recovery-${crypto.randomUUID()}`,
+    });
+    await authRepository.setAuthMarker({ username: "tester", lastVerifiedAt: "2026-09-01T00:00:00.000Z" });
+
+    renderApp("/", undefined, authRepository);
+
+    // navigator.onLine is true the whole time here (unlike the offline test
+    // above) -- the check itself failed over what is genuinely an online
+    // connection, and the app must still open from local data.
+    expect(await screen.findByRole("heading", { level: 1, name: "Gym HUD" })).toBeInTheDocument();
+    expect(await screen.findByText(/Last verified/)).toBeInTheDocument();
+
+    act(() => {
+      window.dispatchEvent(new Event("online"));
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByText(/Last verified/)).not.toBeInTheDocument();
+    });
+    expect(screen.getByText("tester")).toBeInTheDocument();
+    authRepository.close();
+  });
+
+  it("shows Server unreachable with the sign-in form reachable when the startup check hits a 5xx (finding #1)", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("<html>Bad Gateway</html>", { status: 502 }))));
+    const authRepository = createLocalRepository({
+      databaseName: `gym-hud-auth-5xx-${crypto.randomUUID()}`,
+    });
+
+    renderApp("/", undefined, authRepository);
+
+    expect(await screen.findByRole("heading", { level: 1, name: "Sign in" })).toBeInTheDocument();
+    expect(screen.getByText("Server unreachable")).toBeInTheDocument();
+    expect(screen.getByLabelText("Username")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    authRepository.close();
+  });
+
+  it("still opens the app, usable but unverified, when the local auth marker is corrupted/unreadable (finding #7)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(Response.json({ authenticated: false, username: null }))),
+    );
+    const authRepository = createLocalRepository({
+      databaseName: `gym-hud-auth-corrupt-marker-${crypto.randomUUID()}`,
+    });
+    vi.spyOn(authRepository, "getAuthMarker").mockRejectedValue(new Error("corrupt marker"));
+
+    renderApp("/", undefined, authRepository);
+
+    expect(await screen.findByRole("heading", { level: 1, name: "Gym HUD" })).toBeInTheDocument();
+    expect(await screen.findByText("No active session.")).toBeInTheDocument();
+    authRepository.close();
+  });
+
+  it("blocks signing in as a different user after logging out with pending entries still on the device (finding #2)", async () => {
+    let sessionAuthenticated = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        if (url.includes("/auth/logout/")) {
+          sessionAuthenticated = false;
+          return Promise.resolve(new Response(null, { status: 204 }));
+        }
+        if (url.includes("/auth/login/")) {
+          sessionAuthenticated = true;
+          return Promise.resolve(Response.json({ authenticated: true, username: "juan" }));
+        }
+        if (url.includes("/auth/session/")) {
+          return Promise.resolve(
+            Response.json({ authenticated: sessionAuthenticated, username: sessionAuthenticated ? "juan" : null }),
+          );
+        }
+        return Promise.resolve(Response.json({ status: "ok", database: { connected: true } }));
+      }),
+    );
+    // A single repository shared by both providers (no separate
+    // `authRepository`) so App.tsx's finding-#19 fix is exercised too: the
+    // logout confirmation and different-user guard must see the same
+    // outbox as the one the pending action below is committed to.
+    const repository = createLocalRepository({ databaseName: `gym-hud-shared-owner-${crypto.randomUUID()}` });
+    await repository.setAuthMarker({ username: "juan", lastVerifiedAt: "2026-09-01T00:00:00.000Z" });
+    await repository.setOutboxOwner({ username: "juan" });
+    await repository.commitAction({
+      actionId: "pending-workout",
+      changes: [{ store: "exercise_registry", operation: "put", record: { id: "exercise-1", name: "Row" } }],
+    });
+
+    renderApp("/", repository);
+
+    expect(await screen.findByRole("heading", { level: 1, name: "Gym HUD" })).toBeInTheDocument();
+
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Sign out" }));
+    await user.click(await screen.findByRole("button", { name: "Sign out anyway" }));
+
+    expect(await screen.findByRole("heading", { level: 1, name: "Sign in" })).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText("Username"), "someone-else");
+    await user.type(screen.getByLabelText("Password"), "hunter2");
+    await user.click(screen.getByRole("button", { name: "Sign in" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/unsynced workouts for "juan"/);
+    expect(screen.queryByRole("navigation", { name: "Primary" })).not.toBeInTheDocument();
+    repository.close();
   });
 });
