@@ -17,6 +17,7 @@ def test_production_security_audit_rejects_insecure_settings() -> None:
             allowed_hosts=["localhost"],
             csrf_trusted_origins=[],
             database_url="sqlite:///db.sqlite3",
+            login_throttle_rate="10/min",
         )
 
 
@@ -38,6 +39,7 @@ def test_production_security_audit_requires_postgresql(database_url: str) -> Non
             allowed_hosts=["gym.example.com"],
             csrf_trusted_origins=["https://gym.example.com"],
             database_url=database_url,
+            login_throttle_rate="10/min",
         )
 
 
@@ -57,6 +59,7 @@ def test_production_security_audit_accepts_postgresql(database_url: str) -> None
         allowed_hosts=["gym.example.com"],
         csrf_trusted_origins=["https://gym.example.com"],
         database_url=database_url,
+        login_throttle_rate="10/min",
     )
 
 
@@ -80,6 +83,7 @@ def test_production_security_audit_requires_secure_csrf_origins(
             allowed_hosts=["gym.example.com"],
             csrf_trusted_origins=csrf_trusted_origins,
             database_url="postgresql://gymhud:password@db/gymhud",
+            login_throttle_rate="10/min",
         )
 
 
@@ -93,8 +97,61 @@ def test_local_security_audit_emits_warning() -> None:
             allowed_hosts=["localhost"],
             csrf_trusted_origins=["http://localhost:5173"],
             database_url="sqlite:///db.sqlite3",
+            login_throttle_rate="10/min",
         )
 
     messages = " ".join(str(call) for call in warning.call_args_list)
     assert "SECURITY" in messages
     assert "DEBUG=True" in messages
+
+
+# --- A malformed DJANGO_LOGIN_THROTTLE_RATE must fail at startup -------------
+
+
+@pytest.mark.parametrize(
+    "rate",
+    ["", "abc", "10", "10/", "10/fortnight", "0/min", "-5/min"],
+    ids=[
+        "empty",
+        "not-a-rate",
+        "no-period",
+        "empty-period",
+        "unknown-period",
+        "zero-requests",
+        "negative-requests",
+    ],
+)
+def test_audit_security_rejects_a_malformed_login_throttle_rate(rate: str) -> None:
+    """Every malformed DJANGO_LOGIN_THROTTLE_RATE shape must fail at startup, not at request time.
+
+    Without this, core.throttling.check_login_rate_limit and DRF's own
+    ScopedRateThrottle only discover a bad rate the first time a request
+    needs to parse it: manage.py check reports no issues, the health probe
+    passes, and then every login (API and /admin/) 500s. See
+    config.settings.base._validate_login_throttle_rate's docstring for the
+    exact exception each of these shapes raises downstream.
+    """
+    with pytest.raises(ImproperlyConfigured, match="DJANGO_LOGIN_THROTTLE_RATE"):
+        audit_security(
+            environment="local",
+            debug=True,
+            secret_key="insecure-local-development-key-do-not-use-in-production",
+            allowed_hosts=["localhost"],
+            csrf_trusted_origins=["http://localhost:5173"],
+            database_url="sqlite:///db.sqlite3",
+            login_throttle_rate=rate,
+        )
+
+
+@pytest.mark.parametrize("rate", ["10/min", "3/s", "1000/day"])
+def test_audit_security_accepts_a_well_formed_login_throttle_rate(rate: str) -> None:
+    """A syntactically valid, positive rate must not be rejected."""
+    audit_security(
+        environment="local",
+        debug=True,
+        secret_key="insecure-local-development-key-do-not-use-in-production",
+        allowed_hosts=["localhost"],
+        csrf_trusted_origins=["http://localhost:5173"],
+        database_url="sqlite:///db.sqlite3",
+        login_throttle_rate=rate,
+    )

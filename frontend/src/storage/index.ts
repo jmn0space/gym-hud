@@ -18,6 +18,7 @@ export {
 } from "./schema";
 export { DOMAIN_STORES } from "./types";
 export type {
+  AuthMarker,
   CommitReceipt,
   DeleteDomainChange,
   DomainChange,
@@ -31,6 +32,7 @@ export type {
   OutboxChange,
   OutboxDeleteChange,
   OutboxEntry,
+  OutboxOwner,
   OutboxPutChange,
   PutDomainChange,
   RecordPrecondition,

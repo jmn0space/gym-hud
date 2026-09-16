@@ -295,6 +295,172 @@ A successfully acknowledged mutation is removed from the pending local outbox.
 Its action receipt remains durable for retry deduplication. Failed mutations remain
 queued. The server acknowledgement exchange itself remains part of issue #13.
 
+## Authentication and offline continuation
+
+The frontend uses Django session authentication (see [Architecture](architecture.md)).
+Credentials, session ids, and tokens are never stored client-side; the session
+cookie is `HttpOnly` and managed entirely by the browser. A second cookie,
+`csrftoken`, is deliberately *not* `HttpOnly` -- Django's CSRF protection
+requires JavaScript to read it and echo it back in an `X-CSRFToken` header, so
+this cookie being script-readable is by design. It is a CSRF token, not an
+auth credential: it proves the request came from this site's own page, not
+that the caller is signed in, and holding it grants no access on its own.
+Reading it (and the unsafe-request retry after a rotated token) requires the
+frontend and API to be same-origin -- the dev Vite proxy, or a same-origin
+production deployment; a cross-origin `VITE_API_BASE_URL` would leave the
+browser unable to read the API's own `csrftoken` cookie at all.
+
+The only things this app persists locally about authentication are two
+non-secret records in the `internal_metadata` store, through the local
+repository's API:
+
+- The **auth marker**, `{ username, lastVerifiedAt }`
+  (`getAuthMarker`/`setAuthMarker`/`clearAuthMarker`). Records "this device
+  has signed in before, as whom, and when that was last confirmed with the
+  server." Cleared on logout. `lastVerifiedAt` is shown to the user directly:
+  the account row names when the session was last confirmed while
+  `authStatus` is `unverified`.
+- The **outbox owner**, `{ username }` (`getOutboxOwner`/`setOutboxOwner`).
+  Records which locally-authenticated user's pending outbox entries are on
+  this device. Set whenever authentication succeeds (login or a background
+  verify) and either it was absent yet or nothing was pending at that moment.
+  Logout deliberately does **not** clear it -- see "Different-user
+  protection" below.
+
+Both share `internal_metadata`'s existing atomic single-key writes without
+affecting the repository's own sequence/client-id bookkeeping there or the
+outbox/domain commit transaction.
+
+### Auth status state machine
+
+The frontend tracks one `authStatus`:
+
+```text
+checking            -- startup only: the marker read is resolving, or (only
+                        when no marker exists yet) the initial session check
+                        is still running
+login-required      -- no marker on this device, or the user just signed out;
+                        app routes are not rendered. While offline this reads
+                        as "Network required" and shows no form -- a first
+                        sign-in needs a connection. While online the sign-in
+                        form is always reachable
+server-unreachable  -- no marker, online, but the session check could not get
+                        a decisive answer; app routes are not rendered, but
+                        the sign-in form stays reachable next to a Retry
+                        action
+unverified          -- a marker exists (or could not be ruled out) but this
+                        reopening could not decisively reach the server, or
+                        the marker itself could not be read: "offline
+                        continuation" -- the app opens normally from local
+                        data and sync stays paused
+authenticated       -- the server confirmed the session is valid for this
+                        device's outbox owner
+expired             -- a marker exists but the server reported no session (or
+                        any request got a 401); local data and the outbox are
+                        preserved and the app stays usable
+account-mismatch    -- the server-authenticated user does not match this
+                        device's outbox owner while pending outbox entries
+                        exist (or ownership could not be confirmed at all);
+                        the app never adopts that session
+```
+
+Behavior by scenario:
+
+- **First login.** No marker: show the sign-in screen; app routes do not
+  render. Offline: "Network required," no form -- reconnecting re-checks
+  automatically and clears it on its own, with no manual retry needed since
+  there is nothing to retry yet. Online but the check itself is inconclusive
+  (network failure, timeout, a 5xx, a non-JSON body from a proxy):
+  `server-unreachable` -- the form stays reachable next to a Retry action, so
+  an online user is never told to "connect to the internet" when the real
+  problem is the server.
+- **Reopen with a marker.** The app renders immediately as `unverified` from
+  local data without waiting on the network -- a hung captive-portal Wi-Fi
+  must never block resuming an active workout -- while a bounded (~5s
+  timeout) session check runs in the background. Offline, or the check comes
+  back inconclusive, it stays `unverified`; a decisive `authenticated` or
+  anonymous answer moves it to `authenticated` (after the ownership check
+  below) or `expired`. If the marker itself cannot be read, it is retried
+  once; if it still fails, the device opens `unverified` with an unknown
+  username rather than locking the user out of their own local data --
+  `canSync` stays false until a successful verify or login.
+- **Re-checking while not yet confirmed.** `checking`, `login-required`,
+  `server-unreachable`, `unverified`, and `account-mismatch` all re-check
+  automatically: when the `online` event fires, when the page becomes visible
+  again, and on window focus -- unless a sign-in is currently submitting, in
+  which case these all stand down rather than race it (a submitted sign-in
+  always resolves to its own outcome regardless of what a background check
+  finds meanwhile). Triggered this way, a check already in flight queues one
+  follow-up instead of starting a second, overlapping one; the background
+  backoff retry below and the manual Retry action instead call the check
+  directly and can still overlap an existing one, but only the most recently
+  started check may report "no longer checking" or launch a queued follow-up
+  once it finishes, so a superseded check finishing first can never be
+  mistaken for "nothing in flight" or launch a redundant follow-up on a newer
+  check's behalf. While online and getting inconclusive answers, a background
+  retry also runs on its own with exponential backoff (~5s, 10s, ... capped at
+  5 minutes, likewise skipped while a sign-in is submitting), reset by any
+  decisive answer or explicit re-check trigger.
+- **Different-user protection.** A device's outbox owner is compared against
+  the *server-confirmed* username (not merely the typed one) both before
+  attempting sign-in (a cheap pre-check against the typed username) and after
+  the server responds (the authoritative check). If they differ while pending
+  outbox entries exist, sign-in is blocked with an explanation naming the
+  device's owner (single-user app; local data is never silently mixed between
+  accounts). This also covers a background verify: it never silently re-owns
+  a device with pending entries to whoever the server now says is signed in
+  -- it moves to `account-mismatch` instead, with a persistent banner naming
+  the owner and offering sign-out, until the rightful owner signs the
+  mismatched session out and back in. A failure reading the owner/outbox
+  record fails *closed* (blocks the change) rather than open, both for
+  sign-in and for sign-out.
+- **Logout.** Requires network and always asks for confirmation first, even
+  with nothing pending -- the control is intentionally small and secondary
+  rather than a full-width, top-of-screen button, but confirmation is a
+  second line of defense against an accidental tap. If pending outbox entries
+  exist, the confirmation states they stay on this device and sync after the
+  next sign-in. The server session is treated as gone -- and the login screen
+  shown -- as soon as the server confirms sign-out, even if clearing the
+  local marker then fails; that failure surfaces as a separate, non-blocking
+  storage warning rather than "sign-out failed." The outbox owner is
+  deliberately left untouched by logout, which is what makes the
+  different-user protection above survive a sign-out with pending entries.
+- **Error classification.** A session check's outcome is either decisive or
+  ambiguous, never guessed: a `401` or an explicit `{authenticated: false}`
+  from the server is decisive -- anonymous -- and (with a marker on this
+  device) moves the status to `expired`. A network failure, an aborted/timed
+  out request, a 5xx, or a non-JSON response body proves nothing either way
+  and is treated as connectivity-class ambiguity -- `unverified` when a
+  marker exists, `server-unreachable`/`login-required` when none does --
+  never as a decisive sign-out. Any `401` from *any* API call, not just the
+  session check, expires the session from `authenticated` or `unverified` the
+  same way, through the frontend's central fetch wrapper. A stale response
+  cannot resurrect or expire a session it no longer applies to: a session
+  generation counter, bumped on every login/logout/background verify, is
+  captured by each request when it is sent, so a slow request's late `401`
+  is ignored once a newer sign-in has superseded it.
+- **Storage failures are distinct from network/server failures.** A marker
+  that cannot be written after a successful server login or verify, or
+  cannot be cleared after a successful logout, is never reported as a
+  network problem or a failed sign-in/sign-out -- the server-confirmed
+  outcome always wins, surfaced separately through a dismissable storage
+  warning banner.
+
+### Sync gate
+
+There is no sync engine yet (issue #13). The frontend exposes one gate a future
+sync engine must consult before attempting network synchronization:
+
+```text
+canSync(authStatus, online) := authStatus == "authenticated" AND online
+```
+
+Every other status -- including `unverified`, `expired`, and
+`account-mismatch` -- pauses synchronization while leaving pending outbox
+entries queued, consistent with the local-first rule above: nothing is
+discarded, sync simply waits for a confirmed, reachable session owned by
+this device.
+
 ## Conflict strategy
 
 The Android phone is the primary workout-entry device, so complex multi-device merging is outside v1 scope.

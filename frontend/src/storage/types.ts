@@ -121,6 +121,33 @@ export interface LocalRepositoryOptions {
   uuid?: () => string;
 }
 
+/**
+ * The only device-local record of "this browser has signed in before". Never
+ * holds a password, session id, or token -- see docs/data-sync.md's
+ * "Authentication and offline continuation" section. Stored in the
+ * repository-internal `internal_metadata` store under a dedicated key, so it
+ * shares that store's atomic single-key writes without affecting the
+ * commit-action sequence/client-id keys the repository also keeps there.
+ */
+export interface AuthMarker {
+  username: string;
+  lastVerifiedAt: string;
+  [key: string]: JsonValue;
+}
+
+/**
+ * The durable record of which locally-authenticated user's data (in
+ * particular, the pending outbox) is on this device. Unlike `AuthMarker`,
+ * this is never cleared by logout -- see docs/data-sync.md's "Different-user
+ * protection" note and finding #2 of the session-auth review. Set whenever
+ * authentication succeeds (login or verify) and either it is absent yet, or
+ * there are no pending outbox entries to protect.
+ */
+export interface OutboxOwner {
+  username: string;
+  [key: string]: JsonValue;
+}
+
 export interface LocalRepository {
   commitAction(action: LocalAction): Promise<CommitReceipt>;
   readSnapshot(): Promise<RecoverySnapshot>;
@@ -139,5 +166,10 @@ export interface LocalRepository {
   setSyncMetadata(key: string, value: JsonValue): Promise<void>;
   readReferenceCache(key: string): Promise<JsonValue | undefined>;
   writeReferenceCache(key: string, value: JsonValue): Promise<void>;
+  getAuthMarker(): Promise<AuthMarker | undefined>;
+  setAuthMarker(marker: AuthMarker): Promise<void>;
+  clearAuthMarker(): Promise<void>;
+  getOutboxOwner(): Promise<OutboxOwner | undefined>;
+  setOutboxOwner(owner: OutboxOwner): Promise<void>;
   close(): void;
 }

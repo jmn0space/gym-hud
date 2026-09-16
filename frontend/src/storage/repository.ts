@@ -18,6 +18,7 @@ import {
 } from "./schema";
 import {
   DOMAIN_STORES,
+  type AuthMarker,
   type CommitReceipt,
   type DomainChange,
   type DomainStore,
@@ -28,6 +29,7 @@ import {
   type LocalRepositoryOptions,
   type OutboxChange,
   type OutboxEntry,
+  type OutboxOwner,
   type RecordPrecondition,
   type RecoverySnapshot,
 } from "./types";
@@ -57,6 +59,19 @@ interface ActiveMarkerRecord {
 
 const LAST_SEQUENCE_KEY = "last_sequence";
 const CLIENT_ID_KEY = "client_id";
+/**
+ * Key for the `AuthMarker` in `internal_metadata`, distinct from the sequence
+ * and client-id keys above so `getAuthMarker`/`setAuthMarker`/`clearAuthMarker`
+ * can never collide with the repository's own bookkeeping.
+ */
+const AUTH_MARKER_KEY = "auth_marker";
+/**
+ * Key for the `OutboxOwner` in `internal_metadata`. Deliberately separate from
+ * `AUTH_MARKER_KEY`: logout clears the auth marker but must never clear this,
+ * since it is the durable record of whose pending outbox entries are on this
+ * device (see the `OutboxOwner` JSDoc and docs/data-sync.md).
+ */
+const OUTBOX_OWNER_KEY = "outbox_owner";
 const ACTIVE_SESSION_STORES = [
   "walking_sessions",
   "resistance_sessions",
@@ -344,6 +359,22 @@ function validSequence(value: JsonValue | undefined): number {
     throw new StorageCorruptionError("Persisted local action sequence is invalid");
   }
   return value;
+}
+
+function isAuthMarker(value: JsonValue): value is AuthMarker {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const { username, lastVerifiedAt } = value as Record<string, JsonValue>;
+  return typeof username === "string" && typeof lastVerifiedAt === "string";
+}
+
+function isOutboxOwner(value: JsonValue): value is OutboxOwner {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const { username } = value as Record<string, JsonValue>;
+  return typeof username === "string";
 }
 
 function isActive(record: LocalRecord): boolean {
@@ -965,6 +996,55 @@ export function createLocalRepository(options: LocalRepositoryOptions = {}): Loc
     }
   }
 
+  async function deleteKeyValue(storeName: string, key: string): Promise<void> {
+    validateIdentifier(key, "Metadata key");
+    const transaction = await openTransaction(storeName, "readwrite", "strict");
+    const complete = transactionComplete(transaction);
+    void complete.catch(() => undefined);
+    try {
+      transaction.objectStore(storeName).delete(key);
+      await complete;
+    } catch (error) {
+      abortQuietly(transaction);
+      await complete.catch(() => undefined);
+      throw normalizeError(error, "Unable to delete local metadata");
+    }
+  }
+
+  async function getAuthMarker(): Promise<AuthMarker | undefined> {
+    const value = await readKeyValue(DATABASE_STORES.internalMetadata, AUTH_MARKER_KEY);
+    if (value === undefined) {
+      return undefined;
+    }
+    if (!isAuthMarker(value)) {
+      throw new StorageCorruptionError("Persisted auth marker is invalid");
+    }
+    return value;
+  }
+
+  async function setAuthMarker(marker: AuthMarker): Promise<void> {
+    await writeKeyValue(DATABASE_STORES.internalMetadata, AUTH_MARKER_KEY, marker);
+  }
+
+  async function clearAuthMarker(): Promise<void> {
+    await deleteKeyValue(DATABASE_STORES.internalMetadata, AUTH_MARKER_KEY);
+  }
+
+  async function getOutboxOwner(): Promise<OutboxOwner | undefined> {
+    const value = await readKeyValue(DATABASE_STORES.internalMetadata, OUTBOX_OWNER_KEY);
+    if (value === undefined) {
+      return undefined;
+    }
+    if (!isOutboxOwner(value)) {
+      throw new StorageCorruptionError("Persisted outbox owner is invalid");
+    }
+    return value;
+  }
+
+  async function setOutboxOwner(owner: OutboxOwner): Promise<void> {
+    await writeKeyValue(DATABASE_STORES.internalMetadata, OUTBOX_OWNER_KEY, owner);
+  }
+
   return {
     commitAction,
     readSnapshot,
@@ -976,6 +1056,11 @@ export function createLocalRepository(options: LocalRepositoryOptions = {}): Loc
     setSyncMetadata: (key, value) => writeKeyValue(DATABASE_STORES.syncMetadata, key, value),
     readReferenceCache: (key) => readKeyValue(DATABASE_STORES.referenceData, key),
     writeReferenceCache: (key, value) => writeKeyValue(DATABASE_STORES.referenceData, key, value),
+    getAuthMarker,
+    setAuthMarker,
+    clearAuthMarker,
+    getOutboxOwner,
+    setOutboxOwner,
     close: () => {
       const opening = databasePromise;
       databasePromise = undefined;

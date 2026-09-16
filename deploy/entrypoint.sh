@@ -11,6 +11,10 @@ fi
 export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-config.settings.production}"
 
 python /app/backend/manage.py migrate --noinput
+# Idempotent (no-ops if the table exists, and if the active settings module
+# has no database-backed cache configured at all); must run before Gunicorn
+# starts so every worker's first request can use the shared login throttle.
+python /app/backend/manage.py createcachetable
 python /app/backend/manage.py collectstatic --noinput
 
 exec gunicorn \

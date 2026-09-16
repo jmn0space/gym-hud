@@ -729,6 +729,141 @@ describe("LocalRepository retry, concurrency, and ordering", () => {
     ).resolves.toMatchObject({ sequence: 1 });
   });
 
+  it("persists the auth marker independently of domain records and metadata, and clears it on logout", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "auth-marker-roundtrip";
+    const first = repository(factory, { databaseName });
+    await expect(first.getAuthMarker()).resolves.toBeUndefined();
+
+    await first.setAuthMarker({ username: "juan", lastVerifiedAt: "2026-09-14T10:00:00.000Z" });
+    await expect(first.getAuthMarker()).resolves.toEqual({
+      username: "juan",
+      lastVerifiedAt: "2026-09-14T10:00:00.000Z",
+    });
+    // Re-verifying (e.g. app reopened online) overwrites in place rather than
+    // accumulating separate records.
+    await first.setAuthMarker({ username: "juan", lastVerifiedAt: "2026-09-14T11:00:00.000Z" });
+    await expect(first.getAuthMarker()).resolves.toEqual({
+      username: "juan",
+      lastVerifiedAt: "2026-09-14T11:00:00.000Z",
+    });
+    first.close();
+    await Promise.resolve();
+
+    const reopened = repository(factory, { databaseName });
+    await expect(reopened.getAuthMarker()).resolves.toEqual({
+      username: "juan",
+      lastVerifiedAt: "2026-09-14T11:00:00.000Z",
+    });
+
+    // Logout clears the marker but must never touch domain data or the outbox.
+    await reopened.commitAction({
+      actionId: "domain-action-alongside-marker",
+      changes: [
+        { store: "exercise_registry", operation: "put", record: { id: "exercise-1", name: "Row" } },
+      ],
+    });
+    await reopened.clearAuthMarker();
+    await expect(reopened.getAuthMarker()).resolves.toBeUndefined();
+    await expect(reopened.listRecords("exercise_registry")).resolves.toEqual([
+      expect.objectContaining({ id: "exercise-1" }),
+    ]);
+    await expect(reopened.listPendingOutbox()).resolves.toHaveLength(1);
+  });
+
+  it("persists the outbox owner independently of the auth marker, surviving logout", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "outbox-owner-roundtrip";
+    const repo = repository(factory, { databaseName });
+    await expect(repo.getOutboxOwner()).resolves.toBeUndefined();
+
+    await repo.setAuthMarker({ username: "juan", lastVerifiedAt: "2026-09-14T10:00:00.000Z" });
+    await repo.setOutboxOwner({ username: "juan" });
+    await repo.commitAction({
+      actionId: "outbox-owner-pending-action",
+      changes: [
+        { store: "exercise_registry", operation: "put", record: { id: "exercise-1", name: "Row" } },
+      ],
+    });
+
+    // Logout (clearAuthMarker) must never clear the outbox owner: it is the
+    // durable record of whose pending outbox entries are on this device (see
+    // the `OutboxOwner` JSDoc and docs/data-sync.md's different-user note).
+    await repo.clearAuthMarker();
+    await expect(repo.getAuthMarker()).resolves.toBeUndefined();
+    await expect(repo.getOutboxOwner()).resolves.toEqual({ username: "juan" });
+    await expect(repo.listPendingOutbox()).resolves.toHaveLength(1);
+  });
+
+  it("rejects a corrupted persisted auth marker instead of trusting it", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "corrupted-auth-marker";
+    const repo = repository(factory, { databaseName });
+    // Force the schema (including internal_metadata) to exist before opening
+    // a second, raw connection below to corrupt it.
+    await repo.getAuthMarker();
+    repo.close();
+    await Promise.resolve();
+
+    // Bypass the public API to write a value that does not satisfy AuthMarker.
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = factory.open(databaseName);
+      request.addEventListener("success", () => {
+        resolve(request.result);
+      });
+      request.addEventListener("error", () => {
+        reject(new Error("open failed"));
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(DATABASE_STORES.internalMetadata, "readwrite");
+      transaction.objectStore(DATABASE_STORES.internalMetadata).put({ key: "auth_marker", value: "not-an-object" });
+      transaction.addEventListener("complete", () => {
+        resolve();
+      });
+      transaction.addEventListener("error", () => {
+        reject(new Error("write failed"));
+      });
+    });
+    database.close();
+
+    const reopened = repository(factory, { databaseName });
+    await expect(reopened.getAuthMarker()).rejects.toThrow(/auth marker/i);
+  });
+
+  it("rejects a corrupted persisted outbox owner instead of trusting it", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "corrupted-outbox-owner";
+    const repo = repository(factory, { databaseName });
+    await repo.getOutboxOwner();
+    repo.close();
+    await Promise.resolve();
+
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = factory.open(databaseName);
+      request.addEventListener("success", () => {
+        resolve(request.result);
+      });
+      request.addEventListener("error", () => {
+        reject(new Error("open failed"));
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(DATABASE_STORES.internalMetadata, "readwrite");
+      transaction.objectStore(DATABASE_STORES.internalMetadata).put({ key: "outbox_owner", value: 42 });
+      transaction.addEventListener("complete", () => {
+        resolve();
+      });
+      transaction.addEventListener("error", () => {
+        reject(new Error("write failed"));
+      });
+    });
+    database.close();
+
+    const reopened = repository(factory, { databaseName });
+    await expect(reopened.getOutboxOwner()).rejects.toThrow(/outbox owner/i);
+  });
+
   it("normalizes a synchronous db.transaction failure in acknowledgeOutbox and writeKeyValue", async () => {
     const repo = repository(new IDBFactory());
     await repo.commitAction({
