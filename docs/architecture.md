@@ -155,9 +155,9 @@ WhiteNoise may serve these directly from the Django container.
 
 No persistent volume is required for static files. Persistent local storage should only be introduced later if uploaded or locally generated files become part of the product.
 
-As of this change, the production `Dockerfile` collects and serves only
-Django's own static assets (`collectstatic`, via WhiteNoise); it does not yet
-copy a compiled `frontend/` build into the image or serve it. See
+The production `Dockerfile` collects and serves only Django's own static
+assets (`collectstatic`, via WhiteNoise); it does not copy a compiled
+`frontend/` build into the image or serve it. See
 [Authentication](#authentication) for how that gap affects the public
 endpoint list today.
 
@@ -231,24 +231,16 @@ behavior).
 ### CSRF on every other authenticated endpoint
 
 The paragraph above covers the *anonymous* CSRF path. DRF's own
-`SessionAuthentication.enforce_csrf` separately enforces CSRF for any request
-that *does* carry a valid session — on every protected view, not just
-login/logout — but it raises the generic `rest_framework.exceptions.
-PermissionDenied`, which `core.exceptions.exception_handler` would report as
-`{"code": "permission_denied", ...}`: a different code than the anonymous case
-above for what is, from the client's point of view, the same failure.
-`core.authentication.SessionAuthentication.enforce_csrf` overrides this to
-raise `core.authentication.CsrfFailed` instead — a `PermissionDenied`
-subclass with `default_code = "csrf_failed"` — and
-`core.exceptions._CODES_BY_EXCEPTION` matches it *before* the generic
-`PermissionDenied` entry (subclass-before-superclass, since the lookup
-returns on the first `isinstance()` match). The net effect: **an authenticated
-CSRF failure gets the same `403 {"code": "csrf_failed"}` shape as an
-anonymous one, on any endpoint**, regardless of which of the two mechanisms
-above actually intercepts a given request. `LogoutView` (whose
-`csrf_protect` decorates `post`, not `dispatch`) is a concrete case where an
-authenticated caller's CSRF failure is caught by *this* path rather than the
-anonymous one; `core.tests.test_auth` has regression tests for both.
+`SessionAuthentication.enforce_csrf` separately enforces CSRF for any
+already-authenticated request on every protected view, not just
+login/logout. `core.authentication.SessionAuthentication.enforce_csrf`
+overrides it so that failure gets the same `403 {"code": "csrf_failed"}`
+shape as the anonymous case above, on any endpoint, instead of DRF's generic
+`permission_denied` — see `core.authentication.CsrfFailed` and
+`core.exceptions._CODES_BY_EXCEPTION` for the mechanism.
+`core.tests.test_auth` covers both paths, including `LogoutView`, the
+concrete case that exercises this one rather than the anonymous path above
+(its `csrf_protect` decorates `post`, not `dispatch`).
 
 ### Uniform API error shape
 
@@ -290,8 +282,9 @@ paths, leaving Django's ordinary behavior everywhere else (in particular,
 `/admin/` is unaffected). `handler500`'s `detail` is deliberately generic
 (matching Django's own default 500 page), since it is reached precisely when
 the error is unexpected. Both are only invoked when `DEBUG` is `False`
-(Django's debug pages take over otherwise), which is the case in every
-environment except a developer's own explicit opt-in.
+(Django's debug pages take over otherwise) — true in every environment
+except local development, where `config.settings.local` sets `DEBUG = True`
+unconditionally.
 
 ### Public vs. protected endpoints
 
@@ -344,16 +337,25 @@ living forever.
 This expiry is **rolling, not fixed**: `core.views.SessionView.get` marks an
 authenticated request's session modified (`request.session.modified = True`),
 which makes `SessionMiddleware.process_response` re-save it with a fresh
-`SESSION_COOKIE_AGE` from *now*. In practice this means "30 days since the
-app last confirmed the session with the server," not "30 days since login" —
-a daily user is never signed out mid-use just because their first login was
-a month ago. `SESSION_SAVE_EVERY_REQUEST` stays `False` so only this one
-endpoint (which the frontend already polls to confirm the session is alive;
-see [Data & synchronization](data-sync.md)) pays the extra session write,
-not every request. `core.tests.test_auth.
+`SESSION_COOKIE_AGE` from *now*. That only happens when this endpoint is
+actually called, though, and the frontend does not poll it while already
+authenticated — it calls this endpoint at startup to confirm the session is
+alive (see [Data & synchronization](data-sync.md)), and its `online`/focus/
+visibility recheck logic only re-calls it while the auth state is not yet
+decided either way, deliberately excluding the already-`authenticated` case.
+So in practice this means "30 days since the app was last (re)opened while
+the session was still valid," not "30 days since login" — a daily user who
+closes and reopens the app is never signed out mid-use just because their
+first login was a month ago — but a tab left open continuously for 30+ days,
+never re-triggering that startup check, can still cross expiry mid-session.
+`SESSION_SAVE_EVERY_REQUEST` stays `False` so only this one endpoint pays
+the extra session write, not every request. `core.tests.test_auth.
 test_session_check_refreshes_expiry_for_authenticated_caller` covers the
-refresh; the anonymous case is a no-op (there is no authenticated session to
-extend, and none is created just from checking).
+refresh, asserting on the persisted `Session` row's `expire_date` rather
+than the test client's own `SessionStore` (which is unusable for this: it
+recomputes to "now" on every access, whether or not the server re-saved
+anything); the anonymous case is a no-op (there is no authenticated session
+to extend, and none is created just from checking).
 
 `CSRF_COOKIE_HTTPONLY` is deliberately `False` (Django's own default): the
 SPA reads the `csrftoken` cookie from JavaScript and echoes it back as the
@@ -395,25 +397,31 @@ rewrite to reset its own bucket on every request. A request rejected for CSRF
 login attempt either. Regression tests for all of this live in
 `core.tests.test_throttling`.
 
-**`/admin/login/` shares the bucket.** The account `ensure_app_user`
-provisions is also the Django superuser (see below), so `/admin/login/` is an
-equally valuable credential-guessing target as the API login — but it is a
-plain Django view that never goes through DRF's throttle machinery, and was
-previously entirely unthrottled. `core.admin.ThrottledAdminSite` (wired in as
-`django.contrib.admin`'s `default_site` via the `core.admin.
-ThrottledAdminConfig` app config in `INSTALLED_APPS`) calls
-`core.throttling.check_login_rate_limit` before delegating to the real admin
-login view. That helper — rather than a second `CloudflareScopedRateThrottle`
-instance — reimplements just the cache-bucket algorithm against a plain
-`HttpRequest`, because `/admin/login/` has no DRF `Request`/`APIView` to give
-a real DRF throttle's `allow_request(request, view)`; fabricating one would
-be worse than a second entry point, since a bare `rest_framework.request.
-Request(request)` with no authenticators configured resolves `.user` to
-`AnonymousUser` unconditionally, unlike `SessionAuthentication`, which reads
-the underlying Django request's already-resolved `.user`. Both entry points
-read the same `ScopedRateThrottle.THROTTLE_RATES["login"]`, the same cache,
-and the same cache-key format, so a client is limited identically — and
-shares one budget — regardless of which login form it uses.
+**`/admin/login/` shares the bucket, in the common case.** The account
+`ensure_app_user` provisions is also the Django superuser (see below), so
+`/admin/login/` is an equally valuable credential-guessing target as the API
+login — but it is a plain Django view that never goes through DRF's throttle
+machinery, and was previously entirely unthrottled. `core.admin.
+ThrottledAdminSite` (wired in as `django.contrib.admin`'s `default_site`)
+calls `core.throttling.check_login_rate_limit` before delegating to the real
+admin login view; see that function's docstring for why it reimplements the
+cache-bucket algorithm against a plain `HttpRequest` rather than fabricating
+a DRF `Request`/`APIView`. It fails closed with a `503 {"code":
+"throttle_unavailable", ...}` if the cache backend itself raises (e.g. a
+Neon outage), instead of letting that propagate as an opaque, unhandled 500.
+
+Both entry points read the same `ScopedRateThrottle.THROTTLE_RATES["login"]`,
+the same cache, and the same cache-key format — but that is **not** always
+one shared budget. `check_login_rate_limit` always keys by IP
+(`get_client_ident`), while `CloudflareScopedRateThrottle` inherits DRF's
+`SimpleRateThrottle.get_cache_key`, which keys an *authenticated* caller by
+`request.user.pk` instead. In practice this only matters for an
+already-authenticated client re-posting valid-CSRF credentials to `POST
+/api/v1/auth/login/` (the ordinary anonymous case is keyed by IP on both
+entry points, so it is unaffected there): that request draws from a
+separate, per-user bucket that `/admin/login/` never touches, and vice
+versa. Verified: exhausting the authenticated API-login bucket does not
+throttle a subsequent `/admin/login/` attempt from the same IP.
 
 ### Cache backend
 

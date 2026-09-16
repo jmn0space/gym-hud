@@ -1,5 +1,5 @@
 import { IDBFactory } from "fake-indexeddb";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -123,6 +123,19 @@ function LogoutControls() {
       </button>
       <p data-testid="logout-outcome">{outcome === null ? "" : JSON.stringify(outcome)}</p>
     </div>
+  );
+}
+
+/** Calls `retry()` directly, the same way `LoginPage`'s "Retry" button does
+ * -- unlike the focus/visibility/online triggers, this (and the backoff
+ * timer) call `verify` without checking whether one is already in flight
+ * (see finding #3 below). */
+function RetryControls() {
+  const auth = useAuth();
+  return (
+    <button type="button" onClick={() => void auth.retry()}>
+      Retry now
+    </button>
   );
 }
 
@@ -331,7 +344,13 @@ describe("AuthProvider first-login and server-unreachable screens (finding #1)",
 
     expect(await screen.findByLabelText("Username")).toBeInTheDocument();
     expect(screen.queryByText("Network required")).not.toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalled();
+    // The form renders as soon as `online` flips, which is synchronous --
+    // but `verify()`'s own fetch call only happens after `await
+    // readMarkerWithRetry` completes a fake-indexeddb round trip, so this
+    // assertion must wait rather than race it (follow-up review finding #6).
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalled();
+    });
   });
 
   it("shows Server unreachable with the sign-in form still reachable, and Retry re-checks", async () => {
@@ -1125,5 +1144,361 @@ describe("AuthProvider account-mismatch (finding #2)", () => {
     // rightful owner's pending entries and ownership record are untouched.
     await expect(repository.listPendingOutbox()).resolves.toHaveLength(1);
     await expect(repository.getOutboxOwner()).resolves.toEqual({ username: "juan" });
+  });
+});
+
+// The tests below regression-cover the second code review of the session-auth
+// work (PR #36 / issue #16), numbered independently of the finding-#N
+// comments above (those are from the first review round). AuthProvider.tsx
+// cross-references these as "follow-up review finding #N".
+describe("AuthProvider follow-up review: finding #1 (background verify must not strand a login)", () => {
+  it("(a) keeps the login form usable after a focus-triggered background verify races a login that then fails", async () => {
+    let resolveLogin: ((response: Response) => void) | undefined;
+    stubFetch((url) => {
+      if (url.includes("/auth/login/")) {
+        return new Promise<Response>((resolve) => {
+          resolveLogin = resolve;
+        });
+      }
+      return anonymousSession();
+    });
+
+    render(
+      <AuthProvider repository={freshRepository()}>
+        <Probe />
+        <LoginForm />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("status")).toHaveTextContent("login-required");
+    });
+
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText("Username"), "juan");
+    await user.type(screen.getByLabelText("Password"), "wrong");
+    await user.click(screen.getByRole("button", { name: "Sign in" }));
+
+    await waitFor(() => {
+      expect(resolveLogin).toBeDefined();
+    });
+    expect(screen.getByRole("button", { name: "Signing in…" })).toBeInTheDocument();
+
+    // A focus event fires a background re-check while the login POST is
+    // still open -- it must not be able to strand the form.
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    act(() => {
+      resolveLogin?.(Response.json({ code: "invalid_credentials", detail: "bad" }, { status: 400 }));
+    });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Incorrect username or password.");
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Password")).toHaveValue("");
+  });
+
+  it("(b) ends authenticated when a login POST succeeds while the 5s backoff retry fires mid-flight", async () => {
+    vi.useFakeTimers();
+    const repository = instantRepository(undefined);
+    let resolveLogin: ((response: Response) => void) | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        if (url.includes("/auth/login/")) {
+          return new Promise<Response>((resolve) => {
+            resolveLogin = resolve;
+          });
+        }
+        // Every session check fails -- absent marker + connectivity failure
+        // -> "server-unreachable" with a 5s backoff retry.
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }),
+    );
+
+    render(
+      <AuthProvider repository={repository}>
+        <Probe />
+        <LoginForm />
+      </AuthProvider>,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByTestId("status")).toHaveTextContent("server-unreachable");
+
+    fireEvent.change(screen.getByLabelText("Username"), { target: { value: "juan" } });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "hunter2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(resolveLogin).toBeDefined();
+
+    // The backoff timer fires at t=5s while the login POST is still open.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+
+    // The login POST the server already accepted now succeeds.
+    await act(async () => {
+      resolveLogin?.(authenticatedSession("juan"));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    expect(screen.getByTestId("status")).toHaveTextContent("authenticated");
+  });
+});
+
+describe("AuthProvider follow-up review: finding #2 (unconfirmed sign-out must not cancel an in-flight check)", () => {
+  it("does not cancel an in-flight session check when a first, unconfirmed 'Sign out' tap arrives", async () => {
+    const repository = freshRepository();
+    await repository.setAuthMarker({ username: "juan", lastVerifiedAt: "2026-09-01T00:00:00.000Z" });
+    let resolveSession: ((response: Response) => void) | undefined;
+    stubFetch((url) => {
+      if (url.includes("/auth/session/")) {
+        return new Promise<Response>((resolve) => {
+          resolveSession = resolve;
+        });
+      }
+      return anonymousSession();
+    });
+
+    render(
+      <AuthProvider repository={repository}>
+        <Probe />
+        <LogoutControls />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("status")).toHaveTextContent("unverified");
+    });
+    await waitFor(() => {
+      expect(resolveSession).toBeDefined();
+    });
+
+    const user = userEvent.setup();
+    // An unconfirmed tap must not cancel the check already in flight.
+    await user.click(screen.getByRole("button", { name: "Sign out" }));
+    await waitFor(() => {
+      expect(screen.getByTestId("logout-outcome")).toHaveTextContent('"reason":"confirm"');
+    });
+
+    act(() => {
+      resolveSession?.(authenticatedSession("juan"));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("status")).toHaveTextContent("authenticated");
+    });
+  });
+});
+
+describe("AuthProvider follow-up review: finding #3 (a superseded verify must not clear verifyingRef)", () => {
+  it("stops a stale verify from clearing verifyingRef while a newer one is still running, so a third recheck queues instead of overlapping", async () => {
+    const repository = instantRepository({ username: "juan", lastVerifiedAt: "2026-09-01T00:00:00.000Z" });
+    let calls = 0;
+    let resolveFirst: ((response: Response) => void) | undefined;
+    let resolveSecond: ((response: Response) => void) | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => {
+        calls += 1;
+        if (calls === 1) {
+          return new Promise<Response>((resolve) => {
+            resolveFirst = resolve;
+          });
+        }
+        if (calls === 2) {
+          return new Promise<Response>((resolve) => {
+            resolveSecond = resolve;
+          });
+        }
+        return Promise.resolve(authenticatedSession("juan"));
+      }),
+    );
+
+    render(
+      <AuthProvider repository={repository}>
+        <Probe />
+        <RetryControls />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("status")).toHaveTextContent("unverified");
+    });
+    await waitFor(() => {
+      expect(resolveFirst).toBeDefined();
+    });
+
+    // Start V2 directly, bypassing the verifyingRef queueing path -- the
+    // same way the backoff timer and the Retry button already do -- while V1
+    // is still in flight.
+    fireEvent.click(screen.getByRole("button", { name: "Retry now" }));
+    await waitFor(() => {
+      expect(resolveSecond).toBeDefined();
+    });
+    expect(calls).toBe(2);
+
+    // V1 now resolves (inconclusively) and, being superseded by V2, must not
+    // clear verifyingRef -- only V2 (the current owner) may do that. V1's
+    // own bail-out is stale, so it never calls `setState`: there is nothing
+    // for `act()` to flush, so wait out a real macrotask boundary (which
+    // only runs after the whole microtask queue -- including every step of
+    // V1's now-resolved `checkSession`/`stale()`/`finally` chain -- has
+    // drained) before checking anything that depends on V1 having actually
+    // finished.
+    await act(async () => {
+      resolveFirst?.(new Response("x", { status: 502 }));
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+
+    // A third recheck trigger while V2 is genuinely still in flight must
+    // queue, not start an overlapping V3. A wrongly-started V3 would not
+    // reach its own `fetch` call synchronously either (it first awaits its
+    // own marker read), so flush out a real macrotask boundary again before
+    // checking for it -- otherwise this assertion would trivially "pass" by
+    // checking too early regardless of whether V3 was started.
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+    expect(calls).toBe(2);
+
+    act(() => {
+      resolveSecond?.(authenticatedSession("juan"));
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("status")).toHaveTextContent("authenticated");
+    });
+  });
+});
+
+describe("AuthProvider follow-up review: finding #4 (a stale verify must not resurrect a cleared marker)", () => {
+  it("does not leave the marker resurrected when a verify's write is still in flight when a logout clears it", async () => {
+    const repository = freshRepository();
+    await repository.setAuthMarker({ username: "juan", lastVerifiedAt: "2026-09-01T00:00:00.000Z" });
+    await repository.setOutboxOwner({ username: "juan" });
+    await repository.commitAction({
+      actionId: "pending-workout",
+      changes: [{ store: "exercise_registry", operation: "put", record: { id: "exercise-1", name: "Row" } }],
+    });
+    let logoutRequests = 0;
+    stubFetch((url) => {
+      if (url.includes("/auth/logout/")) {
+        logoutRequests += 1;
+        return new Response(null, { status: 204 });
+      }
+      return authenticatedSession("juan");
+    });
+
+    render(
+      <AuthProvider repository={repository}>
+        <Probe />
+        <LogoutControls />
+        <RetryControls />
+      </AuthProvider>,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("status")).toHaveTextContent("authenticated");
+    });
+
+    // From here on, hold every `setAuthMarker` write open until the test
+    // explicitly releases it, but still let it perform the real write (via
+    // the original implementation) once released -- this simulates a
+    // verify's write that was already issued/in-flight taking a while to
+    // actually land, without needing to fake the timing of any particular
+    // fetch or IndexedDB call.
+    const originalSetAuthMarker = repository.setAuthMarker.bind(repository);
+    let releaseWrite: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    const writeSpy = vi
+      .spyOn(repository, "setAuthMarker")
+      .mockImplementation(async (marker) => {
+        await gate;
+        return originalSetAuthMarker(marker);
+      });
+
+    // Trigger a fresh background verify (the same server-confirmed user, no
+    // conflict) -- it reaches its marker write and is now held open by the
+    // gate above, simulating a write that was already in flight.
+    fireEvent.click(screen.getByRole("button", { name: "Retry now" }));
+    await waitFor(() => {
+      expect(writeSpy).toHaveBeenCalled();
+    });
+
+    // Sign out while that write is still pending -- do not await its
+    // outcome yet (with the fix, `logout`'s own marker clear is queued
+    // behind the verify's write and will not resolve until it is released).
+    const user = userEvent.setup();
+    const signOut = user.click(screen.getByRole("button", { name: "Sign out anyway" }));
+
+    // Wait for `logout`'s own network round trip to complete -- i.e. for it
+    // to have reached its marker-clearing step -- before releasing the
+    // verify's write. Without this, releasing the write too early would let
+    // it land (and `logout` win by simply finishing later) regardless of
+    // whether the fix is present, proving nothing.
+    await waitFor(() => {
+      expect(logoutRequests).toBe(1);
+    });
+
+    // Now let the verify's write actually land.
+    releaseWrite?.();
+    await signOut;
+
+    await waitFor(() => {
+      expect(screen.getByTestId("logout-outcome")).toHaveTextContent('"ok":true');
+    });
+    expect(screen.getByTestId("status")).toHaveTextContent("login-required");
+
+    // The decided-later `logout` must win: the marker must end up absent,
+    // not resurrected by the earlier-decided (but slower) verify write.
+    await expect(repository.getAuthMarker()).resolves.toBeUndefined();
+  });
+});
+
+describe("AuthProvider follow-up review: finding #5 (account-mismatch must self-heal)", () => {
+  it("recovers from account-mismatch after a transient ownership-read failure, once retried and re-checked", async () => {
+    const repository = freshRepository();
+    await repository.setAuthMarker({ username: "juan", lastVerifiedAt: "2026-09-01T00:00:00.000Z" });
+    await repository.setOutboxOwner({ username: "juan" });
+    await repository.commitAction({
+      actionId: "pending-workout",
+      changes: [{ store: "exercise_registry", operation: "put", record: { id: "exercise-1", name: "Row" } }],
+    });
+    const spy = vi.spyOn(repository, "getOutboxOwner");
+    spy.mockRejectedValueOnce(new Error("IDB blocked"));
+    spy.mockRejectedValueOnce(new Error("IDB blocked"));
+    stubFetch(() => authenticatedSession("juan"));
+
+    render(
+      <AuthProvider repository={repository}>
+        <Probe />
+      </AuthProvider>,
+    );
+
+    // Both attempts inside the startup verify's readOwnership fail -- the
+    // retry-once is exhausted, landing on account-mismatch (failing closed).
+    await waitFor(() => {
+      expect(screen.getByTestId("status")).toHaveTextContent("account-mismatch");
+    });
+    expect(spy).toHaveBeenCalledTimes(2);
+
+    // A later recheck (e.g. the window regaining focus) must not be
+    // permanently excluded just because the status is account-mismatch.
+    act(() => {
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("status")).toHaveTextContent("authenticated");
+    });
   });
 });

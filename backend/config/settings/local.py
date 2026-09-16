@@ -29,4 +29,5 @@ audit_security(
     allowed_hosts=ALLOWED_HOSTS,
     csrf_trusted_origins=CSRF_TRUSTED_ORIGINS,
     database_url=DATABASE_URL,  # noqa: F405
+    login_throttle_rate=LOGIN_THROTTLE_RATE,  # noqa: F405
 )

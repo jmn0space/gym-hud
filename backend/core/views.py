@@ -89,14 +89,15 @@ class SessionView(APIView):
 
         For an authenticated caller, this also marks the session modified so
         Django re-saves it (``SessionMiddleware.process_response``), which
-        refreshes its expiry to a fresh ``SESSION_COOKIE_AGE`` from now. That
-        makes the effective session lifetime "30 days since the app last
-        confirmed the session with the server" rather than a hard 30 days
-        from login, so a daily user is never signed out mid-use; see
-        docs/architecture.md. ``SESSION_SAVE_EVERY_REQUEST`` stays ``False``
-        so only this endpoint -- which the frontend already calls to confirm
-        the session is alive (see docs/data-sync.md) -- does this, not every
-        request.
+        refreshes its expiry to a fresh ``SESSION_COOKIE_AGE`` from now. In
+        practice this only extends the expiry once per cold start: the
+        frontend calls this endpoint at startup to confirm the session is
+        alive (see docs/data-sync.md), but its `online`/focus/visibility
+        recheck logic deliberately does not re-call it while already
+        authenticated -- only while not yet decided either way (see
+        docs/architecture.md for the actual periodicity and its
+        consequence). ``SESSION_SAVE_EVERY_REQUEST`` stays ``False`` so only
+        this endpoint pays the extra session write, not every request.
         """
         if request.user.is_authenticated:
             request.session.modified = True
@@ -115,12 +116,12 @@ class LoginView(APIView):
     rather than just ``post``) because DRF's ``SessionAuthentication`` only
     checks CSRF for already-authenticated requests, and this endpoint must
     reject anonymous CSRF failures too. Wrapping ``dispatch`` -- instead of
-    just ``post``, as previously -- runs the CSRF check *before*
-    ``APIView.initial()`` (and therefore before ``check_throttles``), so an
-    anonymous request with no/an invalid CSRF token is rejected without
-    consuming a login attempt from the throttle below; it also still runs
-    inside the ``cache_control`` wrapper, so even a CSRF-failure response
-    carries the same no-store headers as everything else this view returns.
+    just ``post`` -- runs the CSRF check *before* ``APIView.initial()`` (and
+    therefore before ``check_throttles``), so an anonymous request with
+    no/an invalid CSRF token is rejected without consuming a login attempt
+    from the throttle below; it also still runs inside the ``cache_control``
+    wrapper, so even a CSRF-failure response carries the same no-store
+    headers as everything else this view returns.
     """
 
     permission_classes = [AllowAny]

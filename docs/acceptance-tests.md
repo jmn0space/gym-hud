@@ -300,7 +300,8 @@ state is resolved — sign-in success resumes synchronization; the user may
 also continue working locally.
 
 This case is why session expiry is rolling rather than fixed: see
-[Architecture: rolling session expiry](architecture.md#cookies-and-csrf-settings).
+[Architecture: cookies and CSRF settings](architecture.md#cookies-and-csrf-settings),
+which covers rolling session expiry.
 
 A backend guard test (`core.tests.test_url_auth_coverage`) walks every URL
 pattern actually registered under `/api/v1/` and asserts that each one

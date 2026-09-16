@@ -145,12 +145,17 @@ const MAX_BACKOFF_MS = 5 * 60 * 1000;
 
 /** Statuses that auto-recheck on `online`, focus, visibility, and backoff
  * timers (finding #4): everywhere we do not yet have a decisive answer that
- * only a fresh login could change. */
+ * only a fresh login could change. Includes "account-mismatch" (follow-up
+ * review finding #5): a transient failure reading the ownership record must
+ * not pin the device there forever -- the only way out would otherwise be
+ * the manual sign-out/back-in the banner offers, even though the underlying
+ * read might simply succeed on its own next time. */
 const RECHECK_STATUSES: ReadonlySet<AuthStatus> = new Set([
   "checking",
   "login-required",
   "server-unreachable",
   "unverified",
+  "account-mismatch",
 ]);
 
 function isOnline(): boolean {
@@ -305,18 +310,25 @@ interface OwnershipRead {
  * every different-user decision sees one consistent snapshot. Never throws: a
  * read failure reports `ok: false` so callers fail CLOSED (finding #2c)
  * instead of the previous `.catch(() => undefined)` / `.catch(() => [])`
- * fail-open pattern.
+ * fail-open pattern. Retries once on failure, the same as
+ * `readMarkerWithRetry` (follow-up review finding #5): a transient IndexedDB
+ * hiccup must not be indistinguishable from a genuine mismatch, since the
+ * only way out of the resulting "account-mismatch" is otherwise a manual
+ * sign-out/back-in.
  */
 async function readOwnership(repository: LocalRepository): Promise<OwnershipRead> {
-  try {
-    const [owner, pending] = await Promise.all([
-      repository.getOutboxOwner(),
-      repository.listPendingOutbox(),
-    ]);
-    return { ok: true, owner, pending };
-  } catch {
-    return { ok: false, owner: undefined, pending: [] };
+  async function attempt(): Promise<OwnershipRead | undefined> {
+    try {
+      const [owner, pending] = await Promise.all([
+        repository.getOutboxOwner(),
+        repository.listPendingOutbox(),
+      ]);
+      return { ok: true, owner, pending };
+    } catch {
+      return undefined;
+    }
   }
+  return (await attempt()) ?? (await attempt()) ?? { ok: false, owner: undefined, pending: [] };
 }
 
 function ownerConflicts(ownership: OwnershipRead, username: string): boolean {
@@ -342,13 +354,60 @@ export function AuthProvider({ children, repository: suppliedRepository }: AuthP
 
   const mountedRef = useRef(false);
   const lifecycleRef = useRef(0);
+  /**
+   * Bumped by `login` and `logout` only -- the "session operation" counter
+   * (follow-up review finding #1). These two must keep invalidating each
+   * other exactly as before (a `logout` must supersede an in-flight `login`
+   * and vice versa), and `verify` still watches this to know a session
+   * change happened out from under it. `verify` itself no longer bumps this:
+   * see `verifyOperationRef` below.
+   */
   const operationRef = useRef(0);
   const statusRef = useRef<AuthStatus>("checking");
+  /**
+   * Bumped by `verify` only, so overlapping background verifies can
+   * invalidate *each other* (finding #3) without a background verify ever
+   * invalidating an in-flight `login` (finding #1) -- that would strand the
+   * login form with no error and no way to recover. `login`/`logout` do not
+   * touch this counter.
+   */
+  const verifyOperationRef = useRef(0);
   const verifyingRef = useRef(false);
   const pendingRecheckRef = useRef(false);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const backoffRef = useRef(INITIAL_BACKOFF_MS);
+  /** True for the duration of a user-initiated `login` call (finding #1c):
+   * lets background recheck triggers stand down instead of racing a login
+   * that is already resolving on its own. */
+  const loginInFlightRef = useRef(false);
+  /**
+   * Serializes every write to the auth marker / outbox owner records --
+   * `verify`, `login`, and `logout` can each decide to issue one -- so they
+   * always apply in the order they were *decided*, never in whatever order
+   * their underlying IndexedDB transactions happen to settle (follow-up
+   * review finding #4). Without this, a `verify` whose marker write was
+   * already under way when a `logout` starts and finishes could still land
+   * afterwards and resurrect the marker `logout` just cleared: checking
+   * `stale()` again right before a write is issued (see `verify` below)
+   * only helps when nothing has superseded this operation *yet* -- it
+   * cannot un-issue a write already in flight. Queuing by issue order
+   * closes that gap instead: whichever of `verify`'s write or `logout`'s
+   * clear was decided second always applies second, and therefore wins.
+   */
+  const authWriteQueueRef = useRef<Promise<unknown>>(Promise.resolve());
   const verifyRef = useRef<() => Promise<void>>(() => Promise.resolve());
+
+  const enqueueAuthWrite = useCallback(<T,>(write: () => Promise<T>): Promise<T> => {
+    const ordered = authWriteQueueRef.current.then(write, write);
+    // Swallow the outcome for queueing purposes only -- a failed write must
+    // not jam every write after it; each caller still awaits/catches its
+    // own `ordered` promise for its own error handling.
+    authWriteQueueRef.current = ordered.then(
+      () => undefined,
+      () => undefined,
+    );
+    return ordered;
+  }, []);
 
   useEffect(() => {
     statusRef.current = state.status;
@@ -367,15 +426,35 @@ export function AuthProvider({ children, repository: suppliedRepository }: AuthP
     backoffRef.current = Math.min(backoffRef.current * 2, MAX_BACKOFF_MS);
     retryTimerRef.current = setTimeout(() => {
       retryTimerRef.current = undefined;
-      if (mountedRef.current && isOnline()) {
+      // Skip while a login is in flight (follow-up review finding #1c):
+      // `verify` itself would no-op anyway (see its own `loginInFlightRef`
+      // guard), but not even attempting avoids a pointless request and any
+      // resulting status flicker while the login form is mid-submit.
+      if (mountedRef.current && isOnline() && !loginInFlightRef.current) {
         void verifyRef.current();
       }
     }, delay);
   }, [clearRetryTimer]);
 
   const verify = useCallback(async () => {
-    const operation = ++operationRef.current;
-    const stale = () => !mountedRef.current || operation !== operationRef.current;
+    if (loginInFlightRef.current) {
+      // A user-initiated login is the authoritative operation in progress --
+      // let it resolve on its own rather than racing a background check
+      // against it (follow-up review finding #1). This is the single choke
+      // point every recheck trigger funnels through (focus/visibility/online
+      // via `maybeRecheck`, the backoff timer, the manual Retry button, and
+      // the queued-follow-up below), so gating here covers all of them.
+      return;
+    }
+    // `verify`'s own overlap counter (finding #3), separate from the
+    // session-operation counter `login`/`logout` share (finding #1) -- see
+    // the refs' own comments for why they must stay separate.
+    const verifyOperation = ++verifyOperationRef.current;
+    const sessionOperationAtStart = operationRef.current;
+    const stale = () =>
+      !mountedRef.current ||
+      verifyOperation !== verifyOperationRef.current ||
+      operationRef.current !== sessionOperationAtStart;
     verifyingRef.current = true;
     clearRetryTimer();
 
@@ -402,7 +481,12 @@ export function AuthProvider({ children, repository: suppliedRepository }: AuthP
 
       if (!isOnline()) {
         if (markerRead.kind === "absent" && !stale()) {
-          setState((current) => ({ ...current, status: "login-required", username: null, online: false }));
+          // `loginPending: false` on every decisive setState below is
+          // defense in depth (follow-up review finding #1a): the
+          // `loginInFlightRef` guard at the top of this function already
+          // keeps `verify` from running at all while a login is in flight,
+          // so this should never actually have anything to clear.
+          setState((current) => ({ ...current, status: "login-required", username: null, online: false, loginPending: false }));
         }
         backoffRef.current = INITIAL_BACKOFF_MS;
         return;
@@ -424,7 +508,13 @@ export function AuthProvider({ children, repository: suppliedRepository }: AuthP
 
       if (outcome.kind !== "authenticated") {
         const resolution = resolveStatus(markerRead, outcome);
-        setState((current) => ({ ...current, status: resolution.status, username: resolution.username, online: true }));
+        setState((current) => ({
+          ...current,
+          status: resolution.status,
+          username: resolution.username,
+          online: true,
+          loginPending: false,
+        }));
         if (outcome.kind === "connectivity") {
           scheduleRetry();
         } else {
@@ -448,6 +538,7 @@ export function AuthProvider({ children, repository: suppliedRepository }: AuthP
           username: knownUsername,
           online: true,
           mismatchMessage: OWNERSHIP_READ_FAILURE_MISMATCH_MESSAGE,
+          loginPending: false,
         }));
         backoffRef.current = INITIAL_BACKOFF_MS;
         return;
@@ -461,17 +552,29 @@ export function AuthProvider({ children, repository: suppliedRepository }: AuthP
           username: ownerUsername,
           online: true,
           mismatchMessage: accountMismatchMessage(ownerUsername),
+          loginPending: false,
         }));
         backoffRef.current = INITIAL_BACKOFF_MS;
         return;
       }
 
+      // Re-checked immediately before issuing the writes below (follow-up
+      // review finding #4), right after the last point that could have
+      // changed it: a cheap early exit that skips enqueueing a write we
+      // already know is stale. It is not sufficient on its own -- a
+      // `logout` landing *after* this check but before the write below
+      // actually applies still needs to win, which is what
+      // `enqueueAuthWrite` (see its own comment) guarantees.
+      if (stale()) {
+        return;
+      }
+
       const nowIsoValue = nowIso();
       const writes: Promise<void>[] = [
-        repository.setAuthMarker({ username: outcome.username, lastVerifiedAt: nowIsoValue }),
+        enqueueAuthWrite(() => repository.setAuthMarker({ username: outcome.username, lastVerifiedAt: nowIsoValue })),
       ];
       if (ownership.owner === undefined || ownership.pending.length === 0) {
-        writes.push(repository.setOutboxOwner({ username: outcome.username }));
+        writes.push(enqueueAuthWrite(() => repository.setOutboxOwner({ username: outcome.username })));
       }
       let storageWarning: string | null = null;
       try {
@@ -491,16 +594,25 @@ export function AuthProvider({ children, repository: suppliedRepository }: AuthP
         storageWarning,
         mismatchMessage: null,
         lastVerifiedAt: storageWarning === null ? nowIsoValue : current.lastVerifiedAt,
+        loginPending: false,
       }));
       backoffRef.current = INITIAL_BACKOFF_MS;
     } finally {
-      verifyingRef.current = false;
-      if (pendingRecheckRef.current && mountedRef.current) {
-        pendingRecheckRef.current = false;
-        void verifyRef.current();
+      // Only the current owner of `verifyOperationRef` may clear
+      // `verifyingRef` or launch a queued follow-up (follow-up review
+      // finding #3): otherwise an earlier, now-superseded verify finishing
+      // after a newer one has already started would wrongly report "no
+      // check in flight" (breaking the overlap guard in `maybeRecheck`) and
+      // could launch a redundant follow-up on the newer verify's behalf.
+      if (verifyOperation === verifyOperationRef.current) {
+        verifyingRef.current = false;
+        if (pendingRecheckRef.current && mountedRef.current) {
+          pendingRecheckRef.current = false;
+          void verifyRef.current();
+        }
       }
     }
-  }, [repository, clearRetryTimer, scheduleRetry]);
+  }, [repository, clearRetryTimer, scheduleRetry, enqueueAuthWrite]);
 
   verifyRef.current = verify;
 
@@ -528,7 +640,11 @@ export function AuthProvider({ children, repository: suppliedRepository }: AuthP
     void verifyRef.current();
 
     function maybeRecheck() {
-      if (!isOnline() || !RECHECK_STATUSES.has(statusRef.current)) {
+      // Skip while a login is in flight (follow-up review finding #1c): see
+      // the matching guard/comment inside `verify` itself, which this
+      // mirrors so a focus/visibility/online trigger does not even attempt
+      // the redundant call.
+      if (!isOnline() || !RECHECK_STATUSES.has(statusRef.current) || loginInFlightRef.current) {
         return;
       }
       if (verifyingRef.current) {
@@ -590,124 +706,173 @@ export function AuthProvider({ children, repository: suppliedRepository }: AuthP
   }, [cancelPendingOperations, closeAfterUnmount, clearRetryTimer]);
 
   const login = useCallback(
-    async (username: string, password: string): Promise<boolean> => {
-      const operation = ++operationRef.current;
-      const stale = () => !mountedRef.current || operation !== operationRef.current;
-      const trimmedUsername = username.trim();
-      if (mountedRef.current) {
-        setState((current) => ({ ...current, loginPending: true, loginError: null }));
-      }
+    (username: string, password: string): Promise<boolean> => {
+      async function attemptLogin(): Promise<boolean> {
+        const operation = ++operationRef.current;
+        const stale = () => !mountedRef.current || operation !== operationRef.current;
+        // Clears `loginPending` on a stale exit (follow-up review finding
+        // #1a). Only a newer `login` or a `logout` can make this operation
+        // stale (background verifies have their own counter -- see
+        // `verifyOperationRef` -- and never reach here at all, since
+        // `verify` stands down whenever `loginInFlightRef` is set). A
+        // `logout`'s own success path never touches `loginPending`, and a
+        // genuinely overlapping second `login` is not reachable in practice
+        // -- `LoginForm` already refuses to call `login` again while
+        // `loginPending` is true, and React flushes that state before a
+        // *second* real user click could land -- so unconditionally
+        // clearing it here on every stale exit is safe: nothing else will.
+        const clearPendingIfStale = (): boolean => {
+          if (!stale()) {
+            return false;
+          }
+          if (mountedRef.current) {
+            setState((current) => ({ ...current, loginPending: false }));
+          }
+          return true;
+        };
 
-      const ownership = await readOwnership(repository);
-      if (stale()) {
-        return false;
-      }
-      if (!ownership.ok) {
-        setState((current) => ({
-          ...current,
-          loginPending: false,
-          loginError: { kind: "storage", message: OWNERSHIP_READ_FAILURE_LOGIN_MESSAGE },
-        }));
-        return false;
-      }
-      // Cheap pre-check against the *typed* username, before spending a
-      // request: the authoritative check below uses the server's answer
-      // instead (finding #9).
-      if (ownerConflicts(ownership, trimmedUsername)) {
-        const ownerUsername = ownership.owner?.username ?? trimmedUsername;
-        setState((current) => ({
-          ...current,
-          loginPending: false,
-          loginError: { kind: "different_user", message: differentUserLoginMessage(ownerUsername) },
-        }));
-        return false;
-      }
-
-      let result;
-      try {
-        result = await requestLogin(trimmedUsername, password);
-      } catch (error) {
-        if (!stale()) {
-          setState((current) => ({ ...current, loginPending: false, loginError: classifyLoginError(error) }));
+        const trimmedUsername = username.trim();
+        if (mountedRef.current) {
+          setState((current) => ({ ...current, loginPending: true, loginError: null }));
         }
-        return false;
-      }
-      if (stale()) {
-        return false;
-      }
-      if (!result.authenticated || result.username === null) {
-        setState((current) => ({
-          ...current,
-          loginPending: false,
-          loginError: { kind: "unknown", message: "Sign-in did not complete. Try again." },
-        }));
-        return false;
-      }
 
-      // Authoritative recheck against the server-returned username: the
-      // typed one was only good enough for the pre-check above (finding #9).
-      if (ownerConflicts(ownership, result.username)) {
-        // The server has already created a session for the wrong account --
-        // simplest correct behavior is to log it back out immediately rather
-        // than leave the device holding a server session it will never
-        // adopt (best-effort: a failure here just means that session lingers
-        // until its own expiry, since nothing local ever treats it as ours).
-        await requestLogout().catch(() => undefined);
-        const ownerUsername = ownership.owner?.username ?? result.username;
-        if (!stale()) {
+        const ownership = await readOwnership(repository);
+        if (clearPendingIfStale()) {
+          return false;
+        }
+        if (!ownership.ok) {
+          setState((current) => ({
+            ...current,
+            loginPending: false,
+            loginError: { kind: "storage", message: OWNERSHIP_READ_FAILURE_LOGIN_MESSAGE },
+          }));
+          return false;
+        }
+        // Cheap pre-check against the *typed* username, before spending a
+        // request: the authoritative check below uses the server's answer
+        // instead (finding #9). This snapshot of `ownership` is taken before
+        // the login request below and only re-validated (not re-read) after
+        // it -- a narrow TOCTOU against a concurrent change to this device's
+        // outbox owner between now and then (finding #7 of the follow-up
+        // review). Accepted: the outbox owner only ever changes via a
+        // sign-in/sign-out on this same device, and a pre-feature outbox
+        // with no owner record is deliberately claimed by whoever signs in
+        // first -- intentional for a single-user app.
+        if (ownerConflicts(ownership, trimmedUsername)) {
+          const ownerUsername = ownership.owner?.username ?? trimmedUsername;
           setState((current) => ({
             ...current,
             loginPending: false,
             loginError: { kind: "different_user", message: differentUserLoginMessage(ownerUsername) },
           }));
+          return false;
         }
-        return false;
+
+        let result;
+        try {
+          result = await requestLogin(trimmedUsername, password);
+        } catch (error) {
+          if (clearPendingIfStale()) {
+            return false;
+          }
+          setState((current) => ({ ...current, loginPending: false, loginError: classifyLoginError(error) }));
+          return false;
+        }
+        if (clearPendingIfStale()) {
+          return false;
+        }
+        if (!result.authenticated || result.username === null) {
+          setState((current) => ({
+            ...current,
+            loginPending: false,
+            loginError: { kind: "unknown", message: "Sign-in did not complete. Try again." },
+          }));
+          return false;
+        }
+        // Captured into its own `const` (rather than using `result.username`
+        // directly below): `result` is a `let`, so TypeScript cannot narrow
+        // its `.username` past `null` inside the `enqueueAuthWrite` closures
+        // further down.
+        const resultUsername = result.username;
+
+        // Authoritative recheck against the server-returned username: the
+        // typed one was only good enough for the pre-check above (finding
+        // #9).
+        if (ownerConflicts(ownership, resultUsername)) {
+          // The server has already created a session for the wrong account
+          // -- simplest correct behavior is to log it back out immediately
+          // rather than leave the device holding a server session it will
+          // never adopt (best-effort: a failure here just means that
+          // session lingers until its own expiry, since nothing local ever
+          // treats it as ours).
+          await requestLogout().catch(() => undefined);
+          const ownerUsername = ownership.owner?.username ?? resultUsername;
+          if (clearPendingIfStale()) {
+            return false;
+          }
+          setState((current) => ({
+            ...current,
+            loginPending: false,
+            loginError: { kind: "different_user", message: differentUserLoginMessage(ownerUsername) },
+          }));
+          return false;
+        }
+
+        const nowIsoValue = nowIso();
+        // Queued through `enqueueAuthWrite` (finding #4) the same as
+        // `verify`'s writes: whichever of a background `verify` or this
+        // `login` decided to write last must be the one that lands last.
+        const writes: Promise<void>[] = [
+          enqueueAuthWrite(() => repository.setAuthMarker({ username: resultUsername, lastVerifiedAt: nowIsoValue })),
+        ];
+        // Writes the owner record after the login POST above has already
+        // succeeded, mirroring the read snapshot's TOCTOU noted above
+        // (finding #7): both are accepted for the same reason.
+        if (ownership.owner === undefined || ownership.pending.length === 0) {
+          writes.push(enqueueAuthWrite(() => repository.setOutboxOwner({ username: resultUsername })));
+        }
+        let storageWarning: string | null = null;
+        try {
+          await Promise.all(writes);
+        } catch {
+          // The server session is valid -- proceed as authenticated for this
+          // app run rather than claiming a network problem (finding #5).
+          storageWarning = MARKER_WRITE_WARNING;
+        }
+        if (clearPendingIfStale()) {
+          return false;
+        }
+
+        bumpSessionGeneration();
+        setState((current) => ({
+          ...current,
+          status: "authenticated",
+          username: resultUsername,
+          online: true,
+          loginPending: false,
+          loginError: null,
+          storageWarning,
+          mismatchMessage: null,
+          lastVerifiedAt: storageWarning === null ? nowIsoValue : current.lastVerifiedAt,
+        }));
+        return true;
       }
 
-      const nowIsoValue = nowIso();
-      const writes: Promise<void>[] = [
-        repository.setAuthMarker({ username: result.username, lastVerifiedAt: nowIsoValue }),
-      ];
-      if (ownership.owner === undefined || ownership.pending.length === 0) {
-        writes.push(repository.setOutboxOwner({ username: result.username }));
-      }
-      let storageWarning: string | null = null;
-      try {
-        await Promise.all(writes);
-      } catch {
-        // The server session is valid -- proceed as authenticated for this
-        // app run rather than claiming a network problem (finding #5).
-        storageWarning = MARKER_WRITE_WARNING;
-      }
-      if (stale()) {
-        return false;
-      }
-
-      bumpSessionGeneration();
-      setState((current) => ({
-        ...current,
-        status: "authenticated",
-        username: result.username,
-        online: true,
-        loginPending: false,
-        loginError: null,
-        storageWarning,
-        mismatchMessage: null,
-        lastVerifiedAt: storageWarning === null ? nowIsoValue : current.lastVerifiedAt,
-      }));
-      return true;
+      // `loginInFlightRef` brackets the whole call -- including the
+      // "pending" setState inside `attemptLogin` and every exit path in it
+      // -- via `.finally()` on the returned promise rather than a `try`
+      // wrapping `attemptLogin`'s own body, so the sign-in form always ends
+      // up un-stuck no matter which path `attemptLogin` returns through.
+      loginInFlightRef.current = true;
+      return attemptLogin().finally(() => {
+        loginInFlightRef.current = false;
+      });
     },
-    [repository],
+    [repository, enqueueAuthWrite],
   );
 
   const logout = useCallback(
     async (confirmed = false): Promise<LogoutOutcome> => {
-      // Bumped up front, like `login` (finding #6): a `logout` that overlaps
-      // an in-flight `verify` invalidates it, and a `logout` itself may be
-      // superseded (e.g. a fresh login lands while a slow logout is still
-      // resolving) -- `stale()` below stops it from clobbering newer state.
-      const operation = ++operationRef.current;
-      const stale = () => !mountedRef.current || operation !== operationRef.current;
       if (!isOnline()) {
         return { ok: false, reason: "offline" };
       }
@@ -722,6 +887,16 @@ export function AuthProvider({ children, repository: suppliedRepository }: AuthP
       if (!confirmed) {
         return { ok: false, reason: "confirm", pendingCount: ownership.pending.length };
       }
+      // Bumped only once sign-out is actually going ahead (follow-up review
+      // finding #2), like `login` (finding #6): a `logout` that overlaps an
+      // in-flight `verify` invalidates it, and a `logout` itself may be
+      // superseded (e.g. a fresh login lands while a slow logout is still
+      // resolving) -- `stale()` below stops it from clobbering newer state.
+      // Bumping any earlier -- e.g. before the `confirmed` gate above --
+      // would let a first, unconfirmed tap silently cancel an in-flight
+      // `verify` for nothing, with no confirmed sign-out to show for it.
+      const operation = ++operationRef.current;
+      const stale = () => !mountedRef.current || operation !== operationRef.current;
       try {
         await requestLogout();
       } catch (error) {
@@ -737,7 +912,11 @@ export function AuthProvider({ children, repository: suppliedRepository }: AuthP
       // see the `OutboxOwner` JSDoc.
       let storageWarning: string | null = null;
       try {
-        await repository.clearAuthMarker();
+        // Queued through `enqueueAuthWrite` (finding #4), same as `verify`'s
+        // and `login`'s writes: this clear must win over an earlier-decided
+        // `verify` write that is still in flight, by applying strictly
+        // after it rather than racing its underlying IndexedDB transaction.
+        await enqueueAuthWrite(() => repository.clearAuthMarker());
       } catch {
         storageWarning = MARKER_CLEAR_WARNING;
       }
@@ -753,7 +932,7 @@ export function AuthProvider({ children, repository: suppliedRepository }: AuthP
       }
       return { ok: true };
     },
-    [repository],
+    [repository, enqueueAuthWrite],
   );
 
   const dismissLoginError = useCallback(() => {

@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 from django.conf import settings
 from django.contrib.auth.models import User
+from django.contrib.sessions.models import Session
 from rest_framework.test import APIClient
 from rest_framework.throttling import ScopedRateThrottle
 
@@ -41,12 +42,28 @@ def test_session_endpoint_authenticated(client: APIClient, user: User) -> None:
 def test_session_check_refreshes_expiry_for_authenticated_caller(
     csrf_client: APIClient, user: User
 ) -> None:
-    """GET /auth/session/ while authenticated pushes the session's expiry further out.
+    """GET /auth/session/ while authenticated pushes the *persisted* session's expiry further out.
 
     This is what makes SESSION_COOKIE_AGE "30 days since the app last
     confirmed the session with the server" rather than a hard 30 days from
     login (see docs/architecture.md), so a daily user is never signed out
     mid-use.
+
+    Asserts on the actual `django_session` row via
+    `django.contrib.sessions.models.Session`, not
+    `csrf_client.session.get_expiry_date()`: Django's test client builds a
+    *fresh* `SessionStore` on every `.session` access, and
+    `SessionBase.get_expiry_date()` computes `timezone.now() +
+    SESSION_COOKIE_AGE` at call time whenever `_session_expiry` was never
+    explicitly set (true here -- nothing in this flow calls `set_expiry()`).
+    That means two back-to-back `.session.get_expiry_date()` calls are
+    already strictly increasing with no request in between, so that
+    assertion would still pass even with `SessionView.get`'s
+    `request.session.modified = True` removed -- proving nothing about
+    whether the server actually re-saved the session. The persisted
+    `expire_date` only moves when `SessionMiddleware.process_response`
+    actually calls `request.session.save()`, which happens precisely when
+    `request.session.modified` (or `SESSION_SAVE_EVERY_REQUEST`) is true.
     """
     token = csrf_token(csrf_client)
     login_response = csrf_client.post(
@@ -56,12 +73,14 @@ def test_session_check_refreshes_expiry_for_authenticated_caller(
         HTTP_X_CSRFTOKEN=token,
     )
     assert login_response.status_code == 200
-    expiry_at_login = csrf_client.session.get_expiry_date()
+    session_key = csrf_client.session.session_key
+    assert session_key is not None
+    expiry_at_login = Session.objects.get(session_key=session_key).expire_date
 
     response = csrf_client.get("/api/v1/auth/session/")
 
     assert response.status_code == 200
-    expiry_after_check = csrf_client.session.get_expiry_date()
+    expiry_after_check = Session.objects.get(session_key=session_key).expire_date
     assert expiry_after_check > expiry_at_login
 
 
@@ -75,13 +94,19 @@ def test_session_check_does_not_create_a_session_for_anonymous_caller(
     `.session` property: merely accessing that property creates and saves a
     blank session as a side effect (Django's own test Client does this so
     it can always hand back a usable SessionStore), which would make this
-    assertion pass regardless of what the server did.
+    assertion pass regardless of what the server did. Also checks the
+    `django_session` table directly (the negative control for the
+    authenticated-refresh test above): with no authenticated session to
+    extend, none should be created or persisted just from checking.
     """
+    assert Session.objects.count() == 0
+
     response = csrf_client.get("/api/v1/auth/session/")
 
     assert response.status_code == 200
     assert response.json() == {"authenticated": False, "username": None}
     assert settings.SESSION_COOKIE_NAME not in response.cookies
+    assert Session.objects.count() == 0
 
 
 # --- POST /api/v1/auth/login/ ------------------------------------------------

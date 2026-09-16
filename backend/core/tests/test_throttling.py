@@ -8,14 +8,18 @@ the two share one bucket per client identity.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import pytest
 from django.contrib.auth.models import User
+from django.core.cache import cache as default_cache
+from django.http import HttpRequest
 from rest_framework.test import APIClient
 from rest_framework.throttling import ScopedRateThrottle
 
 from core.tests.conftest import PASSWORD, USERNAME, csrf_token
+from core.throttling import LOGIN_THROTTLE_SCOPE, check_login_rate_limit
 
 
 @pytest.fixture(autouse=True)
@@ -213,3 +217,98 @@ def test_admin_login_csrf_rejection_does_not_consume_the_bucket(user: User) -> N
         assert response.status_code == 403
 
     assert _attempt_admin_login(APIClient()) == 200
+
+
+# --- A bucket wider than a newly lowered cap must still deny -----------------
+
+
+def test_check_login_rate_limit_denies_when_history_exceeds_a_lowered_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bucket seeded under a looser rate must still deny once the rate is lowered.
+
+    Simulates an operator tightening DJANGO_LOGIN_THROTTLE_RATE (e.g.
+    10/min -> 3/min) while a client's bucket, recorded under the old rate,
+    is still live in the cache (up to a full hour for a "/hour" rate): once
+    that happens, len(history) exceeds the new num_requests. That used to
+    make `available_requests = num_requests - len(history) + 1` negative,
+    which fell into the `... if available_requests > 0 else None` branch --
+    `None` is this function's "allowed" sentinel (see its docstring), so the
+    caller was let through completely unthrottled, and the early return
+    meant the attempt was not even recorded, leaving the client unlimited
+    for the rest of the window.
+    """
+    monkeypatch.setattr(ScopedRateThrottle, "THROTTLE_RATES", {"login": "3/min"})
+    ident = "203.0.113.55"
+    key = ScopedRateThrottle.cache_format % {"scope": LOGIN_THROTTLE_SCOPE, "ident": ident}
+    now = time.time()
+    default_cache.set(key, [now - i for i in range(10)], 60)  # 10 already exceeds the cap of 3.
+
+    request = HttpRequest()
+    request.META["REMOTE_ADDR"] = ident
+
+    for _ in range(5):
+        wait = check_login_rate_limit(request)
+        assert wait is not None, "an over-cap bucket must deny, not return the 'allowed' sentinel"
+        assert wait > 0
+
+
+@pytest.mark.django_db
+def test_admin_and_api_login_agree_when_a_bucket_predates_a_lowered_rate(
+    monkeypatch: pytest.MonkeyPatch, user: User
+) -> None:
+    """The DRF path and the admin path must agree even when a bucket predates a rate change.
+
+    Seeds a bucket, via ScopedRateThrottle's own cache-key format, with more
+    history than a newly lowered cap allows -- the state an old, looser rate
+    would leave behind -- then confirms both POST /api/v1/auth/login/ (a
+    real DRF ScopedRateThrottle, whose throttle_failure() denies
+    unconditionally regardless of the analogous wait() computation) and
+    POST /admin/login/ (check_login_rate_limit) deny, rather than the two
+    "shared bucket" entry points disagreeing.
+    """
+    monkeypatch.setattr(ScopedRateThrottle, "THROTTLE_RATES", {"login": "3/min"})
+    ident = "127.0.0.1"  # Django's test client's default REMOTE_ADDR.
+    key = ScopedRateThrottle.cache_format % {"scope": LOGIN_THROTTLE_SCOPE, "ident": ident}
+    now = time.time()
+    default_cache.set(key, [now - i for i in range(10)], 60)
+
+    api_client = APIClient()
+    token = csrf_token(api_client)
+
+    assert _attempt_api_login(api_client, token) == 429
+    assert _attempt_admin_login(APIClient()) == 429
+
+
+# --- A raising cache must fail closed cleanly, not as an opaque 500 ----------
+
+
+@pytest.mark.django_db
+def test_admin_login_fails_closed_with_a_clean_503_when_the_cache_backend_raises(
+    monkeypatch: pytest.MonkeyPatch, user: User
+) -> None:
+    """A cache backend failure (e.g. a Neon outage) must not surface as an opaque 500.
+
+    core.throttling.check_login_rate_limit's cache reads/writes are wrapped
+    to raise RateLimitBackendUnavailable instead of letting a raw backend
+    exception escape; core.admin.ThrottledAdminSite.login turns that into a
+    deliberate, uniformly-shaped 503 rather than the generic HTML error page
+    Django would otherwise render (/admin/login/ is outside
+    core.csrf.API_PATH_PREFIX, so config.urls.handler500's JSON shape does
+    not apply to it either).
+    """
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise ConnectionError("cache backend unreachable")
+
+    monkeypatch.setattr(default_cache, "get", boom)
+
+    response = APIClient().post(
+        "/admin/login/", {"username": USERNAME, "password": "wrong", "next": "/admin/"}
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "code": "throttle_unavailable",
+        "detail": "Login is temporarily unavailable. Try again shortly.",
+    }

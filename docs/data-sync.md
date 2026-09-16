@@ -385,13 +385,22 @@ Behavior by scenario:
   username rather than locking the user out of their own local data --
   `canSync` stays false until a successful verify or login.
 - **Re-checking while not yet confirmed.** `checking`, `login-required`,
-  `server-unreachable`, and `unverified` all re-check automatically: when the
-  `online` event fires, when the page becomes visible again, and on window
-  focus (a check already in flight queues one follow-up instead of starting a
-  second, overlapping one). While online and getting inconclusive answers, a
-  background retry also runs on its own with exponential backoff (~5s, 10s,
-  ... capped at 5 minutes), reset by any decisive answer or explicit
-  re-check trigger.
+  `server-unreachable`, `unverified`, and `account-mismatch` all re-check
+  automatically: when the `online` event fires, when the page becomes visible
+  again, and on window focus -- unless a sign-in is currently submitting, in
+  which case these all stand down rather than race it (a submitted sign-in
+  always resolves to its own outcome regardless of what a background check
+  finds meanwhile). Triggered this way, a check already in flight queues one
+  follow-up instead of starting a second, overlapping one; the background
+  backoff retry below and the manual Retry action instead call the check
+  directly and can still overlap an existing one, but only the most recently
+  started check may report "no longer checking" or launch a queued follow-up
+  once it finishes, so a superseded check finishing first can never be
+  mistaken for "nothing in flight" or launch a redundant follow-up on a newer
+  check's behalf. While online and getting inconclusive answers, a background
+  retry also runs on its own with exponential backoff (~5s, 10s, ... capped at
+  5 minutes, likewise skipped while a sign-in is submitting), reset by any
+  decisive answer or explicit re-check trigger.
 - **Different-user protection.** A device's outbox owner is compared against
   the *server-confirmed* username (not merely the typed one) both before
   attempting sign-in (a cheap pre-check against the typed username) and after

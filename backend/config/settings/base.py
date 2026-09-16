@@ -146,6 +146,18 @@ STORAGES = {
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+# Only the login endpoint (and, via core.admin.ThrottledAdminSite,
+# /admin/login/) declares the "login" throttle scope; every other view is
+# unaffected. Overridable per deployment to tune brute-force resistance
+# without a code change. Pulled out to its own (plainly `str`-typed) name,
+# rather than indexed back out of REST_FRAMEWORK below, so both
+# config.settings.local and config.settings.production can pass it to
+# audit_security() -- which validates it at startup, so a malformed value
+# fails loudly there instead of the first time a login request needs it --
+# without mypy widening the lookup through REST_FRAMEWORK's heterogeneous
+# (str | list[str] | dict[str, str]) value type.
+LOGIN_THROTTLE_RATE = _env_str("DJANGO_LOGIN_THROTTLE_RATE", "10/min")
+
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "core.authentication.SessionAuthentication",
@@ -154,12 +166,8 @@ REST_FRAMEWORK = {
         "rest_framework.permissions.IsAuthenticated",
     ],
     "EXCEPTION_HANDLER": "core.exceptions.exception_handler",
-    # Only the login endpoint (and, via core.admin.ThrottledAdminSite,
-    # /admin/login/) declares the "login" throttle scope; every other view
-    # is unaffected. Overridable per deployment to tune brute-force
-    # resistance without a code change.
     "DEFAULT_THROTTLE_RATES": {
-        "login": _env_str("DJANGO_LOGIN_THROTTLE_RATE", "10/min"),
+        "login": LOGIN_THROTTLE_RATE,
     },
 }
 
@@ -219,6 +227,57 @@ _YELLOW = "\033[33m"
 _RESET = "\033[0m"
 
 
+def _validate_login_throttle_rate(rate: str) -> None:
+    """Raise ``ImproperlyConfigured`` if ``rate`` is not a usable DRF throttle rate.
+
+    ``core.throttling.check_login_rate_limit`` and DRF's own
+    ``ScopedRateThrottle`` both parse ``DJANGO_LOGIN_THROTTLE_RATE`` lazily,
+    per request, via ``rest_framework.throttling.SimpleRateThrottle.
+    parse_rate`` -- never at startup or during ``manage.py check``. A
+    malformed value raises there: ``ValueError`` for ``""``, ``"abc"``, or a
+    bare ``"10"`` with no ``"/period"``; ``IndexError`` for ``"10/"`` (an
+    empty period); ``KeyError`` for an unrecognised period such as
+    ``"10/fortnight"``. A syntactically valid but non-positive count (e.g.
+    ``"0/min"`` or ``"-5/min"``) parses without error but is equally fatal:
+    ``check_login_rate_limit`` treats an already "full" (or over-full)
+    bucket as a denial and indexes into its (possibly empty) history to
+    compute a wait time. Either way, a typo reaches production, passes the
+    health probe, and turns every login -- ``POST /api/v1/auth/login/``
+    *and* ``POST /admin/login/`` -- into a 500 the first time a request
+    needs it. Calling this from :func:`audit_security` turns all of that
+    into a startup-time ``ImproperlyConfigured`` instead.
+
+    Deliberately reimplements DRF's tiny ``parse_rate`` algorithm below
+    rather than importing ``rest_framework.throttling`` into this module:
+    this file *is* the Django settings module, still being assembled when
+    it runs (this function is called from here, and from
+    ``config.settings.local``/``production``, while each is still
+    executing). ``rest_framework.throttling.SimpleRateThrottle`` snapshots
+    ``REST_FRAMEWORK`` out of ``django.conf.settings`` into a class
+    attribute the first time *anything* imports it, process-wide; importing
+    it from here, before this module finishes defining ``REST_FRAMEWORK``
+    below, would freeze that snapshot to an incomplete (or entirely
+    missing) ``settings.REST_FRAMEWORK``, silently breaking the real
+    throttle for the rest of the process -- not a hypothetical: this is
+    exactly what happened during development of this function, caught by
+    ``core.tests.test_auth.test_login_is_throttled_after_repeated_failures``
+    failing only when the whole suite ran together.
+    """
+    try:
+        num, period = rate.split("/")
+        num_requests = int(num)
+        _duration = {"s": 1, "m": 60, "h": 3600, "d": 86400}[period[0]]
+    except (ValueError, IndexError, KeyError) as exc:
+        raise ImproperlyConfigured(
+            f"🚨 SECURITY: DJANGO_LOGIN_THROTTLE_RATE={rate!r} is not a valid DRF rate "
+            '("<count>/<second|minute|hour|day>", e.g. "10/min").'
+        ) from exc
+    if num_requests < 1:
+        raise ImproperlyConfigured(
+            f"🚨 SECURITY: DJANGO_LOGIN_THROTTLE_RATE={rate!r} must allow at least 1 request."
+        )
+
+
 def audit_security(
     *,
     environment: str,
@@ -227,8 +286,10 @@ def audit_security(
     allowed_hosts: Sequence[str],
     csrf_trusted_origins: Sequence[str],
     database_url: str,
+    login_throttle_rate: str,
 ) -> None:
     """Validate settings after environment-specific overrides are applied."""
+    _validate_login_throttle_rate(login_throttle_rate)
     insecure_hosts = {"*", "localhost", "127.0.0.1", "0.0.0.0", "[::1]"}  # noqa: S104
 
     if environment == "production":

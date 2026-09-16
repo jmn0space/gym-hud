@@ -31,9 +31,9 @@ from typing import Any
 
 from django.contrib import admin
 from django.contrib.admin.apps import AdminConfig
-from django.http import HttpRequest, HttpResponse
+from django.http import HttpRequest, HttpResponse, JsonResponse
 
-from core.throttling import check_login_rate_limit
+from core.throttling import RateLimitBackendUnavailable, check_login_rate_limit
 
 
 class ThrottledAdminSite(admin.AdminSite):
@@ -46,7 +46,20 @@ class ThrottledAdminSite(admin.AdminSite):
     ) -> HttpResponse:
         """Throttle credential submissions before delegating to the real login view."""
         if request.method == "POST":
-            retry_after = check_login_rate_limit(request)
+            try:
+                retry_after = check_login_rate_limit(request)
+            except RateLimitBackendUnavailable:
+                # Fail closed, but cleanly: a broken cache backend must not
+                # surface as Django's generic, opaque HTML 500 page.
+                response: HttpResponse = JsonResponse(
+                    {
+                        "code": "throttle_unavailable",
+                        "detail": "Login is temporarily unavailable. Try again shortly.",
+                    },
+                    status=503,
+                )
+                response["Cache-Control"] = "no-cache, no-store, must-revalidate"
+                return response
             if retry_after is not None:
                 response = HttpResponse(
                     "Too many login attempts. Try again later.",
