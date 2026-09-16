@@ -20,6 +20,7 @@ import {
   type CommitReceipt,
   type LocalAction,
   type LocalRepository,
+  type OutboxEntry,
   type RecoverySnapshot,
 } from "../storage";
 
@@ -50,6 +51,13 @@ interface LocalDataState {
 
 export interface LocalDataContextValue extends LocalDataState {
   commitAction: (action: LocalAction) => Promise<CommitReceipt>;
+  /**
+   * The pending queue read straight from this provider's repository, i.e. the same
+   * IndexedDB connection every other read here uses. Callers that must decide on
+   * live data rather than on the last snapshot -- the service-worker update gate in
+   * particular -- use this instead of opening a second connection.
+   */
+  listPendingOutbox: () => Promise<OutboxEntry[]>;
   retry: () => Promise<void>;
   /** Clears a non-retryable error (conflict/invalid/corruption) once the user has seen it. */
   dismissError: () => void;
@@ -278,6 +286,8 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
     [enqueue, runCommit],
   );
 
+  const listPendingOutbox = useCallback(() => repository.listPendingOutbox(), [repository]);
+
   const retry = useCallback(async () => {
     const failedAction = failedActionRef.current;
     if (failedAction !== null) {
@@ -351,8 +361,8 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
   }, [cancelPendingOperations, closeAfterUnmount, enqueue, readSnapshot, refreshPreservingStickyError]);
 
   const value = useMemo<LocalDataContextValue>(
-    () => ({ ...state, commitAction, retry, dismissError }),
-    [commitAction, dismissError, retry, state],
+    () => ({ ...state, commitAction, listPendingOutbox, retry, dismissError }),
+    [commitAction, dismissError, listPendingOutbox, retry, state],
   );
 
   return <LocalDataContext value={value}>{children}</LocalDataContext>;

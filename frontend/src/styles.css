@@ -139,6 +139,19 @@ p {
   gap: 0.35rem;
 }
 
+/* "Update ready" affordance: informative, never modal, and never in the way of a
+   session in progress -- it sits with the other banners above the page content. */
+.app-update {
+  display: grid;
+  gap: 0.75rem;
+  padding: 1rem;
+  margin-bottom: 1rem;
+  border: 2px solid var(--color-accent);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+
 .button {
   display: flex;
   align-items: center;

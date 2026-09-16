@@ -8,6 +8,7 @@
   },
   "scripts": {
     "dev": "vite",
+    "icons": "node scripts/generate-icons.mjs",
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b",
