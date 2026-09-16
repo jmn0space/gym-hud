@@ -71,21 +71,56 @@ database.
 
 These checks depend on PAD controls, installation/service-worker work, and the
 backend synchronization contract outside the local persistence foundation. They
-remain release checks for the complete features and have not been performed as
-part of issue #15:
+remain release checks for the complete features and had not been performed as
+part of issue #15. Issue #17 delivered the installation/service-worker work,
+which turns the installation and offline-reopen items below into a fully
+specified, runnable device procedure — see
+[`docs/device-smoke-tests.md`](device-smoke-tests.md) for the exact numbered
+steps and its results table for whether it has actually been run. The other
+items still depend on PAD controls or the backend synchronization contract
+(issue #13), neither of which issue #17 implements, and remain out of scope
+here; each is annotated below with exactly what it is still waiting on.
 
 - [ ] Start a PAD bout while offline and confirm the saved state is visible.
+  **Blocked on PAD controls** (a separate, not-yet-implemented issue): there
+  is currently no UI action that starts a walking bout at all —
+  `frontend/src/pages/PadPage.tsx` is an explicit "Not available yet" stub —
+  so this cannot be exercised on any build, offline or not, regardless of
+  installation/service-worker state.
 - [ ] Lock the phone long enough for the timer display to become stale, then unlock
   and confirm elapsed time is recomputed from stored UTC timestamps.
+  **Blocked on PAD controls**, for the same reason as above: this is PAD-01's
+  scenario, and PAD-01 needs a bout already in progress to lock the phone
+  during.
 - [ ] Force-stop the installed PWA/browser process, reopen it, and confirm Home shows
   `Resume PAD Walking` with the correct WALKING, PAUSED, or RESTING state.
+  **Partially specified by issue #17, partially still blocked.** The
+  "installed," "force-stop," and "cold-start reopen while offline" mechanics
+  this item needs are now a concrete procedure in
+  [`docs/device-smoke-tests.md`](device-smoke-tests.md) (steps covering
+  installation over the HTTPS preview through a cold offline reopen).
+  Confirming the specific claim in this item — that `Resume PAD Walking`
+  then appears with the correct WALKING/PAUSED/RESTING state — is PAD-02
+  below, and still requires an actual active walking bout to exist on the
+  device, which needs PAD controls; `docs/device-smoke-tests.md` records
+  that half as blocked, not as run.
 - [ ] Complete a multi-record transition offline, reload, and confirm its pending
   synchronization action is still present exactly once.
+  **Blocked on PAD controls**: a "multi-record transition" (e.g. finishing a
+  bout and starting its rest in one action, per LOCAL-03) is itself a PAD
+  control action that does not exist in the UI yet.
 - [ ] Restore connectivity and confirm a failed synchronization attempt remains
   pending for retry.
+  **Blocked on the backend synchronization contract (issue #13)**: there is
+  no sync engine yet (see [Data & synchronization: sync
+  gate](data-sync.md#sync-gate)), so there is currently no synchronization
+  attempt to fail or retry — restoring connectivity today has nothing queued
+  to send.
 
 These boxes record manual device work only. Automated browser and repository tests
-do not mark them complete.
+do not mark them complete. See the Overall v1 continuity criterion at the end of
+this document for the acceptance-level statement these checks, PAD-02, and
+`docs/device-smoke-tests.md` all serve.
 
 ## PAD
 

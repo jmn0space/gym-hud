@@ -19,6 +19,10 @@ PRODUCTION_ENV = {
     "GUNICORN_WORKERS": "3",
 }
 
+# A fixture LAN address, standing in for whatever a real device test types into
+# the phone's browser (see docs/device-smoke-tests.md).
+PREVIEW_ENV = {"PREVIEW_HOST": "192.168.1.9"}
+
 
 def clean_environment():
     return {
@@ -98,6 +102,116 @@ def test_local_compose_keeps_local_database_and_health_dependency():
     assert "@db:5432/" in web["environment"]["DATABASE_URL"]
     assert web["depends_on"]["db"]["condition"] == "service_healthy"
     assert not web.get("ports")
+
+
+def test_preview_compose_defines_expected_services():
+    """The Android/Chrome secure-context preview (issue #17) adds a Caddy front
+    door in its own file (hard rule R3), never as a service on docker-compose.yml.
+    """
+    result = compose_config("docker-compose.preview.yml", {})
+    assert result.returncode == 0, result.stderr
+    services = json.loads(result.stdout)["services"]
+    assert set(services) == {"caddy", "web", "db"}
+
+
+def test_preview_compose_routes_api_to_backend():
+    result = compose_config("docker-compose.preview.yml", {})
+    assert result.returncode == 0, result.stderr
+    services = json.loads(result.stdout)["services"]
+
+    web = services["web"]
+    assert "8000" in web["expose"]
+    assert not web.get("ports")
+
+    caddy = services["caddy"]
+    caddyfile_mount = next(
+        volume for volume in caddy["volumes"] if volume["target"] == "/etc/caddy/Caddyfile"
+    )
+    assert caddyfile_mount["source"].endswith("deploy/preview/Caddyfile")
+    assert caddyfile_mount["read_only"] is True
+
+    # The reverse proxy target itself lives in the Caddyfile, not the Compose
+    # file; confirm the two agree on the service name and API prefix instead of
+    # asserting on Caddy's own runtime routing, which no test here starts.
+    caddyfile_text = (ROOT / "deploy" / "preview" / "Caddyfile").read_text()
+    assert "handle /api/*" in caddyfile_text
+    assert "reverse_proxy web:8000" in caddyfile_text
+
+
+def test_preview_compose_bind_mounts_built_frontend_readonly():
+    result = compose_config("docker-compose.preview.yml", {})
+    assert result.returncode == 0, result.stderr
+    caddy = json.loads(result.stdout)["services"]["caddy"]
+    dist_mount = next(volume for volume in caddy["volumes"] if volume["target"] == "/srv/dist")
+    assert dist_mount["source"].endswith("frontend/dist")
+    assert dist_mount["read_only"] is True
+
+
+def test_preview_compose_derives_csrf_origin_from_preview_host():
+    result = compose_config("docker-compose.preview.yml", PREVIEW_ENV)
+    assert result.returncode == 0, result.stderr
+    services = json.loads(result.stdout)["services"]
+    assert services["caddy"]["environment"]["PREVIEW_HOST"] == "192.168.1.9"
+    # Same variable feeds both the certificate Caddy mints and the origin
+    # Django trusts, so they cannot drift apart; see the Compose file comment
+    # and deploy/preview/Caddyfile.
+    assert services["web"]["environment"]["DJANGO_CSRF_TRUSTED_ORIGINS"] == "https://192.168.1.9"
+
+
+def test_preview_compose_has_a_sane_default_preview_host():
+    result = compose_config("docker-compose.preview.yml", {})
+    assert result.returncode == 0, result.stderr
+    services = json.loads(result.stdout)["services"]
+    default_host = services["caddy"]["environment"]["PREVIEW_HOST"]
+    assert default_host
+    assert (
+        services["web"]["environment"]["DJANGO_CSRF_TRUSTED_ORIGINS"] == f"https://{default_host}"
+    )
+
+
+def test_preview_compose_keeps_django_host_check_satisfied_by_the_proxy():
+    result = compose_config("docker-compose.preview.yml", {})
+    assert result.returncode == 0, result.stderr
+    web = json.loads(result.stdout)["services"]["web"]
+    # backend/config/settings/local.py hardcodes ALLOWED_HOSTS in code, so
+    # DJANGO_ALLOWED_HOSTS cannot widen it: the Caddyfile compensates by always
+    # presenting Host: localhost to this container (see its header_up comment).
+    assert web["environment"]["DJANGO_ALLOWED_HOSTS"] == "localhost,127.0.0.1"
+
+
+def test_preview_compose_persists_caddy_data_across_restarts():
+    result = compose_config("docker-compose.preview.yml", {})
+    assert result.returncode == 0, result.stderr
+    rendered = json.loads(result.stdout)
+    data_mount = next(
+        volume for volume in rendered["services"]["caddy"]["volumes"] if volume["target"] == "/data"
+    )
+    assert data_mount["type"] == "volume"
+    assert data_mount["source"] == "caddy_data"
+    # A top-level named volume survives `down` (only `down -v` removes it).
+    # Without it, "tls internal" mints a new root CA on every `up`, and the
+    # phone would have to re-trust it every time.
+    assert "caddy_data" in rendered["volumes"]
+
+
+def test_preview_compose_uses_dedicated_database_volume():
+    result = compose_config("docker-compose.preview.yml", {})
+    assert result.returncode == 0, result.stderr
+    rendered = json.loads(result.stdout)
+    # Distinct from docker-compose.yml's "postgres_data" so the preview stack
+    # can never share state with local dev's database, even though both files
+    # name their Django/Postgres services "web"/"db".
+    assert "postgres_data" not in rendered["volumes"]
+    db_volumes = rendered["services"]["db"]["volumes"]
+    assert any(volume["source"] == "preview_postgres_data" for volume in db_volumes)
+
+
+def test_preview_compose_publishes_https_and_http_ports():
+    result = compose_config("docker-compose.preview.yml", {})
+    assert result.returncode == 0, result.stderr
+    caddy = json.loads(result.stdout)["services"]["caddy"]
+    published = {port["published"] for port in caddy["ports"]}
+    assert {"443", "80"} <= published
 
 
 def test_production_proxy_scheme_and_transaction_pooling():

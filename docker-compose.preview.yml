@@ -1,0 +1,111 @@
+# Android/Chrome secure-context preview for issue #17 (installable, offline-capable
+# PWA). Serves the built SPA and the Django API from ONE HTTPS origin through Caddy
+# (deploy/preview/Caddyfile), so a phone on the LAN gets a real secure context:
+# "Install app" appears, the service worker registers, and session/CSRF cookies work
+# same-origin with no CORS. See README.md ("PWA and offline") for the full walkthrough
+# and docs/device-smoke-tests.md for the device procedure this stack exists to support.
+#
+# This is a LAN development aid, not the production deployment. Production stays
+# Cloudflare Tunnel in front of Django with no built-in TLS termination of its own
+# (docker-compose.production.yml, docs/architecture.md); this file is never combined
+# with that one or with the plain docker-compose.yml.
+#
+# Quick start:
+#   1. Build the frontend bundle first -- Caddy only serves what already exists on
+#      disk at ./frontend/dist, it does not build it:
+#        cd frontend && npm ci && npm run build
+#      (Node 24 -- see frontend/.nvmrc; README.md has an equivalent one-off
+#      Docker command for a machine without Node installed.)
+#   2. Start the stack, pointing PREVIEW_HOST at the address typed on the PHONE
+#      (its LAN IP, e.g. 192.168.1.5 -- "localhost" only proves the stack itself
+#      boots, since a phone cannot reach the host machine's loopback address):
+#        PREVIEW_HOST=192.168.1.5 docker compose -f docker-compose.preview.yml up --build
+#   3. Trust Caddy's local CA on the phone once (README.md has the export/install
+#      steps) and open https://<PREVIEW_HOST>/.
+#
+# Rebuilding the frontend (step 1) again after changing frontend/ source and
+# restarting Caddy (or just reloading the page, since /index.html is served
+# no-cache) is enough to see the change; the "web" and "db" containers do not need
+# to restart for a frontend-only change.
+#
+# Both "web" and "db" are named to match deploy/preview/Caddyfile's fixed
+# `reverse_proxy web:8000`, the same names docker-compose.yml uses. Compose scopes
+# containers by project name (default: the directory name), so running this file and
+# the plain docker-compose.yml from the same checkout AT THE SAME TIME would collide
+# on those container names -- stop one before starting the other, or give this stack
+# its own project name: `docker compose -p gym-hud-preview -f docker-compose.preview.yml up`.
+# Per hard rule R3, new Compose services never get added to docker-compose.yml itself;
+# this preview stack is deliberately a separate file with its own Postgres volume
+# (below) so it never shares state with local dev's database.
+services:
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      # The address typed on the phone. Must be reachable from the phone's Wi-Fi
+      # (a LAN IP, not "localhost") for a real device test; see README.md.
+      PREVIEW_HOST: ${PREVIEW_HOST:-localhost}
+    ports:
+      - "443:443"
+      # Caddy issues an automatic HTTP->HTTPS redirect for an https:// site address;
+      # publishing 80 means a phone that forgets the "https://" prefix still lands
+      # somewhere useful instead of a connection failure. Port 443 is what matters.
+      - "80:80"
+    volumes:
+      - ./deploy/preview/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Read-only: Caddy only ever serves this build, never writes to it.
+      - ./frontend/dist:/srv/dist:ro
+      # Without this, "tls internal" mints a brand-new local root CA on every
+      # `up`, and the phone would have to re-trust it every time. Named volumes
+      # survive `down` (only `down -v` removes them), so the CA -- and the
+      # certificate issued from it -- persists across restarts.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.local
+      DJANGO_ENV: local
+      DATABASE_URL: postgresql://${POSTGRES_USER:-gymhud}:${POSTGRES_PASSWORD:-gymhud}@db:5432/${POSTGRES_DB:-gymhud}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-insecure-local-development-key-do-not-use-in-production}
+      DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1
+      # config.settings.local hardcodes ALLOWED_HOSTS to localhost/127.0.0.1/[::1]
+      # in code (DJANGO_ALLOWED_HOSTS above cannot widen it), and the Caddyfile
+      # presents Host: localhost to this container for exactly that reason -- see
+      # its header_up comment. What must actually track PREVIEW_HOST is the
+      # origin the *browser* sends and Django's CSRF check verifies, so it is
+      # derived from the same variable Caddy's site address uses: the certificate
+      # and the trusted origin can never drift apart.
+      DJANGO_CSRF_TRUSTED_ORIGINS: https://${PREVIEW_HOST:-localhost}
+    depends_on:
+      db:
+        condition: service_healthy
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-gymhud}
+      POSTGRES_USER: ${POSTGRES_USER:-gymhud}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gymhud}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gymhud} -d ${POSTGRES_DB:-gymhud}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      # Deliberately its own volume, distinct from docker-compose.yml's
+      # "postgres_data" -- see the file-level comment above.
+      - preview_postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:
+  preview_postgres_data:

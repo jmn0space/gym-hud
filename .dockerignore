@@ -14,3 +14,8 @@ backend/staticfiles
 docs
 frontend/node_modules
 frontend/dist
+
+# Caddy's preview config is bind-mounted into the caddy service straight from
+# the repo (see docker-compose.preview.yml); the Django image built from this
+# context has no use for it.
+deploy/preview

@@ -20,3 +20,10 @@ build/
 
 # Frontend
 node_modules/
+
+# Docker preview stack (docker-compose.preview.yml): the locally-trusted CA
+# certificate a developer extracts from Caddy's persisted volume to install
+# on a test phone, per README.md's "PWA and offline" quick start and
+# docs/device-smoke-tests.md. Not a secret (it never leaves the local
+# machine/phone pair), but it's a generated artifact, not source.
+gym-hud-preview-ca.crt
