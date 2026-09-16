@@ -1,0 +1,100 @@
+# Gym HUD Android preview proxy. Used only by docker-compose.preview.yml.
+#
+# Android Chrome will not register a service worker, and will not offer
+# "Install app", on http://<LAN-IP>: that is not a secure context. This site
+# serves the built SPA and the Django API from ONE https:// origin, using a
+# certificate issued by Caddy's own locally-trusted CA, so the phone gets a
+# secure context, same-origin session cookies, and no CORS.
+#
+# This is a LAN development aid. It is not the production ingress, which is
+# Cloudflare Tunnel in front of Django (see docs/architecture.md).
+
+{
+	# This container is reachable from the LAN; do not expose the admin API.
+	admin off
+	log {
+		level ERROR
+	}
+}
+
+# PREVIEW_HOST is the address typed on the PHONE, e.g. 192.168.1.5.
+# docker-compose.preview.yml derives DJANGO_CSRF_TRUSTED_ORIGINS from the same
+# variable, so the certificate and the origin Django trusts cannot drift apart.
+https://{$PREVIEW_HOST} {
+	# Locally-trusted certificate, including for a bare IP address. The phone
+	# trusts this CA's root once; docs/device-smoke-tests.md has the export
+	# and install steps.
+	tls internal
+
+	encode zstd gzip
+
+	# A wrong Content-Type on /sw.js or /manifest.webmanifest is the usual
+	# silent failure in this setup, so never let a browser sniff past one.
+	header X-Content-Type-Options nosniff
+
+	root * /srv/dist
+
+	# --- API: straight through to Django. Never cached, never rewritten. ---
+	handle /api/* {
+		reverse_proxy web:8000 {
+			# config.settings.local pins ALLOWED_HOSTS to
+			# localhost/127.0.0.1/[::1] in code, so DJANGO_ALLOWED_HOSTS
+			# cannot widen it and a proxied Host: 192.168.1.5 would be
+			# rejected as DisallowedHost. Presenting a Host that Django
+			# already accepts costs nothing here: CSRF is checked against
+			# the browser's Origin header, which still carries the real
+			# https://<PREVIEW_HOST> value and is matched against
+			# CSRF_TRUSTED_ORIGINS. Session and csrftoken cookies are
+			# scoped by the browser to the URL it requested, not to this
+			# header, so they are unaffected too.
+			header_up Host localhost
+		}
+	}
+
+	# --- PWA surface: real files only, deliberately outside the SPA fallback ---
+	# Each of these is matched before the catch-all below, so a file the build
+	# did not emit returns a plain 404 instead of index.html served under the
+	# wrong name. An HTML body returned for /sw.js or /manifest.webmanifest
+	# fails registration with a confusing MIME-type error rather than an
+	# obvious missing file, and that is the single most common way this setup
+	# breaks silently.
+
+	# The HTTP cache must never pin an old worker: that is how a service-worker
+	# update stops landing even though a new one was deployed.
+	handle /sw.js {
+		header Cache-Control "no-cache, no-store, must-revalidate"
+		file_server
+	}
+
+	handle /manifest.webmanifest {
+		# Neither Go's built-in MIME table nor this image maps .webmanifest.
+		header Content-Type "application/manifest+json; charset=utf-8"
+		header Cache-Control "no-cache"
+		file_server
+	}
+
+	handle /offline.html {
+		header Cache-Control "no-cache"
+		file_server
+	}
+
+	handle /icons/* {
+		header Cache-Control "public, max-age=604800"
+		file_server
+	}
+
+	# Vite emits content-hashed filenames here, so these really are immutable.
+	handle /assets/* {
+		header Cache-Control "public, max-age=31536000, immutable"
+		file_server
+	}
+
+	# --- Everything else: the SPA shell, so client-side routes resolve ---
+	handle {
+		# index.html names the current hashed assets; a stale copy would pin
+		# the app to a build whose assets may already be gone.
+		header Cache-Control "no-cache"
+		try_files {path} /index.html
+		file_server
+	}
+}
