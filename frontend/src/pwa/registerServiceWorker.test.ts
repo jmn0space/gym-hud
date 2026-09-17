@@ -73,9 +73,10 @@ function createFakeContainer(
 interface Harness {
   controller?: FakeWorker | null;
   register?: () => Promise<unknown>;
+  canReload?: () => boolean;
 }
 
-function harness({ controller = createFakeWorker("activated"), register }: Harness = {}) {
+function harness({ controller = createFakeWorker("activated"), register, canReload }: Harness = {}) {
   const registration = createFakeRegistration();
   const container = createFakeContainer(registration, controller);
   if (register !== undefined) {
@@ -85,6 +86,7 @@ function harness({ controller = createFakeWorker("activated"), register }: Harne
   const updates = createServiceWorkerUpdates({
     container: container as unknown as ServiceWorkerContainer,
     reload,
+    canReload,
   });
   return { container, registration, reload, updates };
 }
@@ -169,13 +171,74 @@ describe("createServiceWorkerUpdates", () => {
     expect(container.register).toHaveBeenCalledTimes(1);
   });
 
-  it("stops listening to a worker once it has installed", async () => {
+  it("surfaces an update that was already installing when registration resolved", async () => {
+    // A navigation to a controlled page makes the browser start its own soft update
+    // of /sw.js before `load` fires, so `updatefound` can be long gone by the time
+    // `register()` resolves and nothing is waiting yet.
+    const { registration, updates } = harness();
+    const worker = createFakeWorker("installing");
+    registration.installing = worker;
+
+    await updates.register();
+    expect(updates.isUpdateReady()).toBe(false);
+
+    worker.transitionTo("installed");
+
+    expect(updates.isUpdateReady()).toBe(true);
+  });
+
+  it("keeps following a worker after it installs, so the offer can still be retracted", async () => {
     const { registration, updates } = harness();
     await updates.register();
 
     const worker = installNewWorker(registration);
 
+    expect(updates.isUpdateReady()).toBe(true);
+    // A worker that has installed can still go redundant or activate, and both end
+    // the offer -- so the listener must survive the install.
+    expect(worker.listenerCount("statechange")).toBe(1);
+  });
+
+  it("retracts the offer when the waiting worker activates under another tab", async () => {
+    const { container, registration, updates } = harness();
+    const notified = vi.fn();
+    updates.subscribe(notified);
+    await updates.register();
+    const worker = installNewWorker(registration);
+    expect(updates.isUpdateReady()).toBe(true);
+
+    // Another tab pressed "Update now": the worker skips waiting and claims clients.
+    container.controller = worker;
+    worker.transitionTo("activated");
+
+    expect(updates.isUpdateReady()).toBe(false);
     expect(worker.listenerCount("statechange")).toBe(0);
+    expect(notified).toHaveBeenCalledTimes(2);
+  });
+
+  it("retracts the offer when the waiting worker goes redundant", async () => {
+    const { registration, updates } = harness();
+    await updates.register();
+    const worker = installNewWorker(registration);
+    expect(updates.isUpdateReady()).toBe(true);
+
+    // A rollback replaced the deployed worker before anyone applied this one.
+    worker.transitionTo("redundant");
+
+    expect(updates.isUpdateReady()).toBe(false);
+    expect(worker.listenerCount("statechange")).toBe(0);
+  });
+
+  it("retracts the offer when a worker adopted at registration goes redundant", async () => {
+    const { registration, updates } = harness();
+    const worker = createFakeWorker("installed");
+    registration.waiting = worker;
+    await updates.register();
+    expect(updates.isUpdateReady()).toBe(true);
+
+    worker.transitionTo("redundant");
+
+    expect(updates.isUpdateReady()).toBe(false);
   });
 
   it("stops listening to a worker that goes redundant instead", async () => {
@@ -214,6 +277,82 @@ describe("createServiceWorkerUpdates", () => {
     container.emit("controllerchange");
 
     expect(reload).not.toHaveBeenCalled();
+  });
+
+  it("leaves no dead Update button in a second tab when the first tab applies", async () => {
+    // Both tabs are controlled and both show the banner. The shared worker object
+    // stands in for the one worker both registrations are looking at.
+    const worker = createFakeWorker("installed");
+    const tabA = harness();
+    const tabB = harness();
+    tabA.registration.waiting = worker;
+    tabB.registration.waiting = worker;
+    await tabA.updates.register();
+    await tabB.updates.register();
+    expect(tabA.updates.isUpdateReady()).toBe(true);
+    expect(tabB.updates.isUpdateReady()).toBe(true);
+
+    tabA.updates.applyUpdate();
+    expect(worker.postMessage).toHaveBeenCalledTimes(1);
+
+    // `skipWaiting()` lands: the worker activates and claims both pages.
+    tabA.container.controller = worker;
+    tabB.container.controller = worker;
+    worker.transitionTo("activated");
+    tabA.container.emit("controllerchange");
+    tabB.container.emit("controllerchange");
+
+    expect(tabA.reload).toHaveBeenCalledTimes(1);
+    // Tab B must not be reloaded out from under whatever it is doing...
+    expect(tabB.reload).not.toHaveBeenCalled();
+    // ...and its banner must not survive as a button that can no longer do anything.
+    expect(tabB.updates.isUpdateReady()).toBe(false);
+
+    // If tab B does ask anyway, it reloads instead of posting SKIP_WAITING into the
+    // void and waiting for a `controllerchange` that can never fire again.
+    tabB.updates.applyUpdate();
+
+    expect(worker.postMessage).toHaveBeenCalledTimes(1);
+    expect(tabB.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("stands down instead of reloading when the guard reports live work", async () => {
+    let live = false;
+    const { container, registration, reload, updates } = harness({ canReload: () => !live });
+    await updates.register();
+    const worker = installNewWorker(registration);
+
+    updates.applyUpdate();
+    // The user starts a session while the worker is still waking up and activating.
+    live = true;
+    container.controller = worker;
+    worker.transitionTo("activated");
+    container.emit("controllerchange");
+
+    expect(reload).not.toHaveBeenCalled();
+    // The update is still applicable -- by reload -- once the user asks again.
+    expect(updates.isUpdateReady()).toBe(true);
+
+    live = false;
+    updates.applyUpdate();
+
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the guard installed with setReloadGuard", async () => {
+    const { container, registration, reload, updates } = harness();
+    await updates.register();
+    installNewWorker(registration);
+    updates.setReloadGuard(() => false);
+
+    updates.applyUpdate();
+    container.emit("controllerchange");
+    expect(reload).not.toHaveBeenCalled();
+
+    updates.setReloadGuard(null);
+    updates.applyUpdate();
+
+    expect(reload).toHaveBeenCalledTimes(1);
   });
 
   it("notifies and un-notifies subscribers", async () => {

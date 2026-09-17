@@ -24,6 +24,9 @@ createRoot(rootElement).render(
 // out of `vite dev` (which serves no `/sw.js`) and out of the jsdom test run.
 if (import.meta.env.PROD) {
   window.addEventListener("load", () => {
-    void registerServiceWorker();
+    // `register()` already resolves to `null` rather than rejecting, but the catch
+    // keeps a future change from turning a registration failure into an unhandled
+    // rejection at start-up.
+    void registerServiceWorker().catch(() => undefined);
   });
 }

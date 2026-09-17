@@ -4,7 +4,11 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { LocalDataProvider } from "../local/LocalDataProvider";
-import type { ServiceWorkerUpdates } from "../pwa/registerServiceWorker";
+import {
+  createServiceWorkerUpdates,
+  SKIP_WAITING_MESSAGE,
+  type ServiceWorkerUpdates,
+} from "../pwa/registerServiceWorker";
 import { createLocalRepository, type LocalAction, type LocalRepository } from "../storage";
 import { AppUpdateBanner } from "./AppUpdateBanner";
 
@@ -34,7 +38,52 @@ function fakeUpdates(updateReady: boolean): ServiceWorkerUpdates & { applyUpdate
     subscribe: () => () => undefined,
     isUpdateReady: () => updateReady,
     applyUpdate,
+    setReloadGuard: () => undefined,
     register: () => Promise.resolve(null),
+  };
+}
+
+const DEFERRED_MESSAGE =
+  "Gym HUD will be ready to update as soon as your current session is finished and your changes are saved.";
+
+/**
+ * A controlled page with one worker already waiting, for the single test that drives
+ * the real `createServiceWorkerUpdates` end to end. jsdom has no
+ * `navigator.serviceWorker`, so everything here is hand-built.
+ */
+function fakeContainer() {
+  const worker = {
+    state: "installed" as ServiceWorkerState,
+    postMessage: vi.fn(),
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+  };
+  const controllerChange: (() => void)[] = [];
+  const registration = {
+    installing: null,
+    waiting: worker,
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+  };
+  const container = {
+    controller: { state: "activated" },
+    register: () => Promise.resolve(registration),
+    addEventListener: (type: string, listener: () => void) => {
+      if (type === "controllerchange") {
+        controllerChange.push(listener);
+      }
+    },
+    removeEventListener: () => undefined,
+  };
+  return {
+    container: container as unknown as ServiceWorkerContainer,
+    reload: vi.fn(),
+    worker,
+    emitControllerChange: () => {
+      for (const listener of [...controllerChange]) {
+        listener();
+      }
+    },
   };
 }
 
@@ -97,9 +146,7 @@ describe("AppUpdateBanner", () => {
     await user.click(await screen.findByRole("button", { name: "Update now" }));
 
     expect(
-      await screen.findByText(
-        "Gym HUD will update as soon as your current session is finished and your changes are saved.",
-      ),
+      await screen.findByText(DEFERRED_MESSAGE),
     ).toBeInTheDocument();
     expect(updates.applyUpdate).not.toHaveBeenCalled();
   });
@@ -125,9 +172,7 @@ describe("AppUpdateBanner", () => {
     await user.click(await screen.findByRole("button", { name: "Update now" }));
 
     expect(
-      await screen.findByText(
-        "Gym HUD will update as soon as your current session is finished and your changes are saved.",
-      ),
+      await screen.findByText(DEFERRED_MESSAGE),
     ).toBeInTheDocument();
     expect(updates.applyUpdate).not.toHaveBeenCalled();
   });
@@ -150,9 +195,7 @@ describe("AppUpdateBanner", () => {
     await user.click(await screen.findByRole("button", { name: "Update now" }));
 
     expect(
-      await screen.findByText(
-        "Gym HUD will update as soon as your current session is finished and your changes are saved.",
-      ),
+      await screen.findByText(DEFERRED_MESSAGE),
     ).toBeInTheDocument();
     expect(updates.applyUpdate).not.toHaveBeenCalled();
   });
@@ -195,14 +238,12 @@ describe("AppUpdateBanner", () => {
     await user.click(await screen.findByRole("button", { name: "Update now" }));
 
     expect(
-      await screen.findByText(
-        "Gym HUD will update as soon as your current session is finished and your changes are saved.",
-      ),
+      await screen.findByText(DEFERRED_MESSAGE),
     ).toBeInTheDocument();
     expect(updates.applyUpdate).not.toHaveBeenCalled();
   });
 
-  it("keeps its promise and applies the deferred update once the session is finished", async () => {
+  it("re-offers the deferred update once the session is finished, without reloading on its own", async () => {
     const repository = freshRepository();
     await repository.commitAction(START_PAD);
     await repository.acknowledgeOutbox(START_PAD.actionId);
@@ -211,6 +252,7 @@ describe("AppUpdateBanner", () => {
     const user = userEvent.setup();
     await renderBanner(repository, updates);
     await user.click(await screen.findByRole("button", { name: "Update now" }));
+    expect(await screen.findByText(DEFERRED_MESSAGE)).toBeInTheDocument();
     expect(updates.applyUpdate).not.toHaveBeenCalled();
 
     await repository.commitAction({
@@ -227,8 +269,78 @@ describe("AppUpdateBanner", () => {
     // The provider re-reads its snapshot when the window regains focus.
     fireEvent(window, new Event("focus"));
 
+    // The offer comes back by itself, but applying it -- which reloads the page --
+    // still waits for the user, who may well have moved on to something this gate
+    // cannot see.
+    expect(await screen.findByText("A new version of Gym HUD is ready.")).toBeInTheDocument();
+    expect(updates.applyUpdate).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Update now" }));
+
     await waitFor(() => {
       expect(updates.applyUpdate).toHaveBeenCalledTimes(1);
     });
+  });
+
+  it("treats a failed outbox read as live work rather than letting the click throw", async () => {
+    const repository = freshRepository();
+    const broken: LocalRepository = {
+      ...repository,
+      // A transient IndexedDB failure: a reconnect window, quota, corruption.
+      listPendingOutbox: () => Promise.reject(new Error("InvalidStateError")),
+    };
+
+    const updates = fakeUpdates(true);
+    const user = userEvent.setup();
+    await renderBanner(broken, updates);
+
+    await user.click(await screen.findByRole("button", { name: "Update now" }));
+
+    // Not silence: the same "later" answer a failed snapshot read already produced.
+    expect(await screen.findByText(DEFERRED_MESSAGE)).toBeInTheDocument();
+    expect(updates.applyUpdate).not.toHaveBeenCalled();
+  });
+
+  it("does not reload when live work starts between applying and the activation", async () => {
+    // The one test that joins the two halves: the real registration store, so the
+    // postMessage -> skipWaiting -> controllerchange -> reload chain actually runs,
+    // against the real live-work gate rather than a stubbed `applyUpdate`.
+    const repository = freshRepository();
+    const { container, emitControllerChange, reload, worker } = fakeContainer();
+    const updates = createServiceWorkerUpdates({ container, reload });
+    await updates.register();
+
+    // The banner hands its live-work predicate to the store as a reload guard; this
+    // keeps hold of it so the test can tell when the snapshot has caught up.
+    const guard: { current: (() => boolean) | null } = { current: null };
+    const observed: ServiceWorkerUpdates = {
+      ...updates,
+      setReloadGuard: (next) => {
+        guard.current = next;
+        updates.setReloadGuard(next);
+      },
+    };
+
+    const user = userEvent.setup();
+    await renderBanner(repository, observed);
+    await user.click(await screen.findByRole("button", { name: "Update now" }));
+    await waitFor(() => {
+      expect(worker.postMessage).toHaveBeenCalledWith({ type: SKIP_WAITING_MESSAGE });
+    });
+    expect(guard.current?.()).toBe(true);
+
+    // The worker is still waking up, pruning superseded caches and claiming clients.
+    // In that window the user taps "Start PAD walk".
+    await repository.commitAction(START_PAD);
+    fireEvent(window, new Event("focus"));
+    await waitFor(() => {
+      expect(guard.current?.()).toBe(false);
+    });
+
+    emitControllerChange();
+
+    expect(reload).not.toHaveBeenCalled();
+    // The update is not lost, only postponed: the banner stays up.
+    expect(updates.isUpdateReady()).toBe(true);
   });
 });

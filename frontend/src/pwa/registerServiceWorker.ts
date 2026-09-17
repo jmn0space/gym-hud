@@ -17,8 +17,23 @@ export interface ServiceWorkerUpdates {
   readonly subscribe: (listener: () => void) => () => void;
   /** True once a newer worker is waiting *and* an older one is already in control. */
   readonly isUpdateReady: () => boolean;
-  /** Asks the waiting worker to take over. A no-op when nothing is waiting. */
+  /**
+   * Applies the staged update: asks the waiting worker to take over, or -- when the
+   * new worker has already activated and no further `controllerchange` can fire --
+   * reloads straight away. A no-op when there is nothing staged.
+   *
+   * The caller is responsible for deciding that applying is safe *before* calling
+   * this; see `AppUpdateBanner.isSafeToApply`.
+   */
   readonly applyUpdate: () => void;
+  /**
+   * Installs the last-moment guard consulted immediately before the page is
+   * reloaded, after the new worker has activated. It exists because everything
+   * between `applyUpdate()` and `controllerchange` is asynchronous (worker wake-up,
+   * `skipWaiting`, cache pruning, `clients.claim`), and the user can start live work
+   * inside that window. Passing `null` removes the guard.
+   */
+  readonly setReloadGuard: (guard: (() => boolean) | null) => void;
   /** Resolves to `null` when registration is impossible or rejected. */
   readonly register: () => Promise<ServiceWorkerRegistration | null>;
 }
@@ -28,6 +43,8 @@ export interface ServiceWorkerUpdatesOptions {
   /** Injected by tests; production resolves `navigator.serviceWorker` lazily. */
   container?: ServiceWorkerContainer | undefined;
   reload?: (() => void) | undefined;
+  /** Initial value of the reload guard; `setReloadGuard` replaces it. */
+  canReload?: (() => boolean) | undefined;
 }
 
 export function createServiceWorkerUpdates(
@@ -41,8 +58,25 @@ export function createServiceWorkerUpdates(
   let updateReady = false;
   /** Set only by `applyUpdate`, so this tab never reloads over work it did not stage. */
   let applyRequested = false;
+  /**
+   * True once the worker this tab was offering has taken control -- because another
+   * tab applied the update, or because our own `SKIP_WAITING` landed. Tracked apart
+   * from `applyRequested` because it changes what "apply" *means*: `skipWaiting()` on
+   * a worker that is already the controller is a no-op and no second
+   * `controllerchange` can ever fire, so the only way left to apply is to reload.
+   */
+  let controllerMoved = false;
   let reloaded = false;
+  let canReload: (() => boolean) | null = options.canReload ?? null;
   let registration: Promise<ServiceWorkerRegistration | null> | null = null;
+  /** Workers already carrying a `statechange` listener, so none is attached twice. */
+  const tracked = new WeakSet<ServiceWorker>();
+
+  function notify(): void {
+    for (const listener of [...listeners]) {
+      listener();
+    }
+  }
 
   function resolveContainer(): ServiceWorkerContainer | null {
     if (options.container !== undefined) {
@@ -57,45 +91,132 @@ export function createServiceWorkerUpdates(
     return container ?? null;
   }
 
+  function isReloadAllowed(): boolean {
+    if (canReload === null) {
+      return true;
+    }
+    try {
+      return canReload();
+    } catch {
+      // A guard that cannot answer is treated as "not safe", the same way the
+      // asynchronous gate in the banner treats a failed read.
+      return false;
+    }
+  }
+
   function markUpdateReady(worker: ServiceWorker): void {
+    // A freshly waiting worker means `SKIP_WAITING` is the right move again, whatever
+    // an earlier controller change left behind.
+    controllerMoved = false;
     if (updateReady && waiting === worker) {
       return;
     }
     waiting = worker;
     updateReady = true;
-    for (const listener of [...listeners]) {
-      listener();
-    }
+    notify();
   }
 
-  function watchInstallingWorker(
-    container: ServiceWorkerContainer,
-    active: ServiceWorkerRegistration,
-  ): void {
-    const installing = active.installing;
-    if (installing === null) {
+  /**
+   * Called when the worker this tab was offering leaves the `installed` state, which
+   * always means the offer is over: it either activated (only a reload applies it
+   * now) or went redundant (a rollback or a newer worker superseded it). Either way
+   * `waiting` must stop pointing at it, or "Update now" becomes a button that posts
+   * `SKIP_WAITING` into the void forever.
+   */
+  function retireWaitingWorker(worker: ServiceWorker): void {
+    if (waiting !== worker) {
       return;
     }
-    const onStateChange = () => {
-      if (installing.state === "installed") {
-        installing.removeEventListener("statechange", onStateChange);
-        // No controller means this is a first install: the page is already running
-        // exactly the version that just finished caching, so there is nothing to
-        // offer the user and nothing to reload for.
-        if (container.controller !== null) {
-          markUpdateReady(installing);
-        }
-      } else if (installing.state === "redundant") {
-        installing.removeEventListener("statechange", onStateChange);
+    waiting = null;
+    if (worker.state !== "redundant") {
+      controllerMoved = true;
+      if (applyRequested) {
+        // This tab staged the update and it has now taken over. The banner stays up
+        // until `handleControllerChange` has decided whether reloading is safe.
+        return;
       }
+    }
+    if (!updateReady) {
+      return;
+    }
+    updateReady = false;
+    notify();
+  }
+
+  function evaluateWorkerState(
+    container: ServiceWorkerContainer,
+    worker: ServiceWorker,
+    onStateChange: () => void,
+  ): void {
+    if (worker.state === "installing") {
+      return;
+    }
+    if (worker.state === "installed") {
+      // No controller means this is a first install: the page is already running
+      // exactly the version that just finished caching, so there is nothing to offer
+      // the user and nothing to reload for. The listener stays attached either way --
+      // a worker can still go redundant (rollback) or activate (another tab applied
+      // the update) from here, and both have to retract the offer.
+      if (container.controller !== null) {
+        markUpdateReady(worker);
+      }
+      return;
+    }
+    worker.removeEventListener("statechange", onStateChange);
+    tracked.delete(worker);
+    retireWaitingWorker(worker);
+  }
+
+  /**
+   * Follows one worker for its whole life, from `installing` (or wherever it already
+   * is) to `activated`/`redundant`. Every worker this store may offer goes through
+   * here -- the one found `installing` or `waiting` at registration time just as much
+   * as the one announced by `updatefound`.
+   */
+  function watchWorker(container: ServiceWorkerContainer, worker: ServiceWorker): void {
+    if (tracked.has(worker)) {
+      return;
+    }
+    tracked.add(worker);
+    const onStateChange = () => {
+      evaluateWorkerState(container, worker, onStateChange);
     };
-    installing.addEventListener("statechange", onStateChange);
+    worker.addEventListener("statechange", onStateChange);
+    // The worker may already be past `installing` by the time we get here.
+    evaluateWorkerState(container, worker, onStateChange);
   }
 
   function handleControllerChange(): void {
-    // Exactly one reload, and only for an update this tab asked for. Another tab
-    // activating a worker must never yank the page out from under live work.
-    if (!applyRequested || reloaded) {
+    // Whoever triggered it, a controller change means the worker we were offering is
+    // no longer waiting, so `SKIP_WAITING` would land on a worker that is already in
+    // charge. A first install claiming this page had nothing to offer in the first
+    // place, so it must not arm the "apply by reload" path.
+    const hadOffer = updateReady || applyRequested;
+    waiting = null;
+    if (hadOffer) {
+      controllerMoved = true;
+    }
+
+    if (!applyRequested) {
+      // Another tab activated the update, or a first install claimed this page.
+      // Reloading here would yank the page out from under live work this tab knows
+      // nothing about -- but leaving the banner up would leave a button whose message
+      // can no longer do anything, so retract the offer instead.
+      if (updateReady) {
+        updateReady = false;
+        notify();
+      }
+      return;
+    }
+    if (reloaded) {
+      return;
+    }
+    if (!isReloadAllowed()) {
+      // Live work appeared between `applyUpdate()` and the activation. Stand down and
+      // leave the banner up: the update is still applicable, by reload, whenever the
+      // user next asks and the gate agrees.
+      applyRequested = false;
+      notify();
       return;
     }
     reloaded = true;
@@ -123,13 +244,23 @@ export function createServiceWorkerUpdates(
     }
 
     container.addEventListener("controllerchange", handleControllerChange);
-    if (active.waiting !== null && container.controller !== null) {
-      // A previous visit already staged an update that was never applied.
-      markUpdateReady(active.waiting);
-    }
     active.addEventListener("updatefound", () => {
-      watchInstallingWorker(container, active);
+      const installing = active.installing;
+      if (installing !== null) {
+        watchWorker(container, installing);
+      }
     });
+    if (active.waiting !== null) {
+      // A previous visit already staged an update that was never applied.
+      watchWorker(container, active.waiting);
+    }
+    if (active.installing !== null) {
+      // The browser started its own soft update at navigation time, before this
+      // registration resolved, so `updatefound` has already fired and nothing is
+      // waiting yet. Without this the update would go unannounced for the whole
+      // session.
+      watchWorker(container, active.installing);
+    }
     return active;
   }
 
@@ -141,7 +272,22 @@ export function createServiceWorkerUpdates(
       };
     },
     isUpdateReady: () => updateReady,
+    setReloadGuard: (guard) => {
+      canReload = guard;
+    },
     applyUpdate: () => {
+      if (reloaded) {
+        return;
+      }
+      if (controllerMoved) {
+        // The new worker already controls the page: `skipWaiting()` is a no-op and no
+        // further `controllerchange` will ever arrive, so reload directly rather than
+        // waiting for an event that cannot recur. The caller has already decided this
+        // is safe.
+        reloaded = true;
+        reload();
+        return;
+      }
       const worker = waiting;
       if (worker === null) {
         return;
