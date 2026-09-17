@@ -16,6 +16,14 @@ const CLOCK_INDEPENDENT = 0;
  * cards) or an unsynchronised mutation still sitting in the outbox. A snapshot that
  * has not loaded yet counts as live: until the local database has answered, the only
  * safe assumption is that there is something to protect.
+ *
+ * Both arguments must be freshly read from the repository immediately before this
+ * is called, never a cached React-state snapshot: a value another tab has already
+ * moved past (it started or finished a session, or drained the outbox) looks
+ * identical to a `snapshot`/`pendingOutbox` pair this tab simply has not refreshed
+ * yet, and this function has no way to tell the two apart. A caller that gates a
+ * reload on this result is responsible for re-reading live data at decision time --
+ * see `AppUpdateBanner.isSafeToApply`.
  */
 export function hasLiveWork(
   snapshot: RecoverySnapshot | null,

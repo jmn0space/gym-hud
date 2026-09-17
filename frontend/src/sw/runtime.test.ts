@@ -19,15 +19,33 @@ const BUILD: ServiceWorkerBuild = {
 };
 const CACHE_NAME = `${CACHE_PREFIX}${BUILD.version}`;
 
+/**
+ * Lets a test flip Cache Storage from working to throwing partway through a
+ * scenario -- e.g. a healthy install followed by eviction, a Safari private-mode
+ * SecurityError, or a corrupted store, all of which surface on `open` or `match`.
+ */
+interface CacheStorageFailures {
+  open?: Error;
+  match?: Error;
+}
+
 /** A Cache API stand-in: `open`/`keys`/`delete`, and `match`/`put` keyed by path. */
-function createCacheStorage() {
+function createCacheStorage(failures: CacheStorageFailures = {}) {
   const stores = new Map<string, Map<string, Response>>();
   const storage = {
     open: (name: string) => {
+      if (failures.open !== undefined) {
+        return Promise.reject(failures.open);
+      }
       const entries = stores.get(name) ?? new Map<string, Response>();
       stores.set(name, entries);
       return Promise.resolve({
-        match: (key: string) => Promise.resolve(entries.get(key)),
+        match: (key: string) => {
+          if (failures.match !== undefined) {
+            return Promise.reject(failures.match);
+          }
+          return Promise.resolve(entries.get(key));
+        },
         put: (key: string, response: Response) => {
           entries.set(key, response);
           return Promise.resolve();
@@ -42,8 +60,8 @@ function createCacheStorage() {
 
 type Handler = (event: unknown) => void;
 
-function createScope(fetchImplementation: typeof fetch) {
-  const { storage, stores } = createCacheStorage();
+function createScope(fetchImplementation: typeof fetch, cacheFailures: CacheStorageFailures = {}) {
+  const { storage, stores } = createCacheStorage(cacheFailures);
   const handlers = new Map<string, Handler>();
   const claim = vi.fn(() => Promise.resolve());
   const skipWaiting = vi.fn(() => Promise.resolve());
@@ -107,6 +125,18 @@ function dispatchFetch(handlers: Map<string, Handler>, target: Request): Promise
     },
   });
   return responded[0] ?? null;
+}
+
+/** Dispatches a message event and returns whatever it passed to `waitUntil`, if any. */
+function dispatchMessage(handlers: Map<string, Handler>, data: unknown): Promise<unknown> | undefined {
+  let pending: Promise<unknown> | undefined;
+  handlers.get("message")?.({
+    data,
+    waitUntil: (value: Promise<unknown>) => {
+      pending = value;
+    },
+  });
+  return pending;
 }
 
 function okResponse(body: string) {
@@ -193,11 +223,48 @@ describe("service worker install and activate", () => {
     const { scope, handlers, skipWaiting } = createScope(servingFetch);
     createServiceWorkerRuntime(scope, BUILD);
 
-    handlers.get("message")?.({ data: { type: "SOMETHING_ELSE" } });
+    void dispatchMessage(handlers, { type: "SOMETHING_ELSE" });
     expect(skipWaiting).not.toHaveBeenCalled();
 
-    handlers.get("message")?.({ data: { type: SKIP_WAITING_MESSAGE } });
+    void dispatchMessage(handlers, { type: SKIP_WAITING_MESSAGE });
     expect(skipWaiting).toHaveBeenCalledTimes(1);
+  });
+
+  it("extends the message event's lifetime with waitUntil while skipWaiting settles", () => {
+    const { scope, handlers, skipWaiting } = createScope(servingFetch);
+    createServiceWorkerRuntime(scope, BUILD);
+
+    const pending = dispatchMessage(handlers, { type: SKIP_WAITING_MESSAGE });
+
+    // Without `waitUntil`, the worker could be torn down before `skipWaiting()`
+    // completes; wiring the call through it is what keeps the event alive.
+    expect(pending).not.toBeUndefined();
+    expect(skipWaiting).toHaveBeenCalledTimes(1);
+  });
+
+  it("deletes the partially populated cache when the install fails", async () => {
+    const { scope, handlers, stores } = createScope((input) => {
+      const url = typeof input === "string" ? input : (input as Request).url;
+      if (url.endsWith("/manifest.webmanifest")) {
+        return Promise.resolve(new Response("nope", { status: 404 }));
+      }
+      return Promise.resolve(okResponse(`served:${url}`));
+    });
+    createServiceWorkerRuntime(scope, BUILD);
+
+    let pending: Promise<unknown> = Promise.resolve();
+    handlers.get("install")?.({
+      waitUntil: (value: Promise<unknown>) => {
+        pending = value;
+      },
+    });
+    await expect(pending).rejects.toThrow(/Precaching/);
+
+    // The other assets in the same `Promise.all` still landed in this
+    // version-named cache before the manifest fetch rejected; a failed install
+    // must not leave them (or the cache itself) behind to accumulate across
+    // repeated failed deploys.
+    expect(stores.has(CACHE_NAME)).toBe(false);
   });
 });
 
@@ -345,4 +412,85 @@ describe("service worker fetch handling", () => {
 
     expect(response?.status).toBe(503);
   });
+});
+
+describe("service worker resilience to Cache Storage and network failures", () => {
+  it("still answers with the inline fallback instead of rejecting when Cache Storage throws on open", async () => {
+    const cacheFailures: CacheStorageFailures = {};
+    const { scope, handlers, setFetch } = createScope(servingFetch, cacheFailures);
+    createServiceWorkerRuntime(scope, BUILD);
+    await runLifecycle(handlers, "install");
+
+    // Cache Storage failing after a healthy install -- eviction, a Safari
+    // private-mode SecurityError, or a corrupted store -- must not turn into a
+    // rejected `respondWith` promise (the browser's own network-error page)
+    // instead of the documented fallback chain.
+    cacheFailures.open = new DOMException("The operation is not allowed.", "SecurityError");
+    setFetch(failingFetch);
+
+    const response = await dispatchFetch(handlers, request("/pad", { mode: "navigate" }));
+
+    expect(response?.status).toBe(503);
+  });
+
+  it("still answers with the inline fallback when cache.match itself throws", async () => {
+    const cacheFailures: CacheStorageFailures = {};
+    const { scope, handlers, setFetch } = createScope(servingFetch, cacheFailures);
+    createServiceWorkerRuntime(scope, BUILD);
+    await runLifecycle(handlers, "install");
+
+    cacheFailures.match = new DOMException("The database is corrupted.", "InvalidStateError");
+    setFetch(failingFetch);
+
+    const response = await dispatchFetch(handlers, request("/pad", { mode: "navigate" }));
+
+    expect(response?.status).toBe(503);
+  });
+
+  it("still falls through to the network for a precached asset when Cache Storage throws on open", async () => {
+    const cacheFailures: CacheStorageFailures = {};
+    const { scope, handlers, fetchMock } = createScope(servingFetch, cacheFailures);
+    createServiceWorkerRuntime(scope, BUILD);
+    await runLifecycle(handlers, "install");
+    fetchMock.mockClear();
+
+    // The network is fine; only Cache Storage is broken -- the common case of an
+    // evicted or corrupted cache on an otherwise-online device. This path is hit
+    // on every JS/CSS request, not just when the network is also down.
+    cacheFailures.open = new DOMException("The operation is not allowed.", "SecurityError");
+
+    const response = await dispatchFetch(handlers, request("/assets/index-abc.js"));
+
+    expect(await response?.text()).toBe(`served:${ORIGIN}/assets/index-abc.js`);
+  });
+
+  it(
+    "aborts a hanging precached-asset fetch instead of waiting forever",
+    async () => {
+      const { scope, handlers, setFetch } = createScope(servingFetch);
+      createServiceWorkerRuntime(scope, BUILD);
+      // No install: the asset is not yet cached, so this exercises the network
+      // fallback -- realistic after Cache Storage eviction under storage pressure.
+
+      vi.useFakeTimers();
+      const aborted = vi.fn();
+      setFetch(
+        (_input: RequestInfo | URL, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => {
+              aborted();
+              reject(new DOMException("The operation was aborted.", "AbortError"));
+            });
+          }),
+      );
+
+      const pending = dispatchFetch(handlers, request("/assets/index-abc.js"));
+      await vi.advanceTimersByTimeAsync(NAVIGATION_TIMEOUT_MS);
+      const response = await pending;
+
+      expect(aborted).toHaveBeenCalledTimes(1);
+      expect(response?.status).toBe(504);
+    },
+    1_000,
+  );
 });

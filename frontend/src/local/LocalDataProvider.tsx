@@ -58,6 +58,16 @@ export interface LocalDataContextValue extends LocalDataState {
    * particular -- use this instead of opening a second connection.
    */
   listPendingOutbox: () => Promise<OutboxEntry[]>;
+  /**
+   * The full recovery snapshot read straight from this provider's repository, the
+   * same way `listPendingOutbox` is: this calls `repository.readSnapshot()`
+   * directly, not the provider's `enqueue`/React-state path, so it never goes stale
+   * the way the `snapshot` field above can in a tab that has not regained focus
+   * since another tab changed the data. The service-worker update gate needs this
+   * to decide on the *live* active-session state, not on a snapshot another tab may
+   * have already moved past.
+   */
+  readLiveSnapshot: () => Promise<RecoverySnapshot>;
   retry: () => Promise<void>;
   /** Clears a non-retryable error (conflict/invalid/corruption) once the user has seen it. */
   dismissError: () => void;
@@ -287,6 +297,7 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
   );
 
   const listPendingOutbox = useCallback(() => repository.listPendingOutbox(), [repository]);
+  const readLiveSnapshot = useCallback(() => repository.readSnapshot(), [repository]);
 
   const retry = useCallback(async () => {
     const failedAction = failedActionRef.current;
@@ -361,8 +372,8 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
   }, [cancelPendingOperations, closeAfterUnmount, enqueue, readSnapshot, refreshPreservingStickyError]);
 
   const value = useMemo<LocalDataContextValue>(
-    () => ({ ...state, commitAction, listPendingOutbox, retry, dismissError }),
-    [commitAction, dismissError, listPendingOutbox, retry, state],
+    () => ({ ...state, commitAction, listPendingOutbox, readLiveSnapshot, retry, dismissError }),
+    [commitAction, dismissError, listPendingOutbox, readLiveSnapshot, retry, state],
   );
 
   return <LocalDataContext value={value}>{children}</LocalDataContext>;

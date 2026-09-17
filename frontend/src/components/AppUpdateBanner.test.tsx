@@ -157,6 +157,51 @@ describe("AppUpdateBanner", () => {
     expect(updates.applyUpdate).not.toHaveBeenCalled();
   });
 
+  it("refuses to apply the update when another tab's live session is invisible to this tab's cached snapshot", async () => {
+    // Two independent `createLocalRepository` connections to the *same* database,
+    // simulating two open tabs the way `upgradeContinuity.test.ts` does for schema
+    // upgrades.
+    const sharedIndexedDB = new IDBFactory();
+    const databaseName = `app-update-banner-shared-${(databaseNumber++).toString()}`;
+    const tabA = createLocalRepository({
+      databaseName,
+      indexedDB: sharedIndexedDB,
+      uuid: () => "tab-a",
+    });
+    const tabB = createLocalRepository({
+      databaseName,
+      indexedDB: sharedIndexedDB,
+      uuid: () => "tab-b",
+    });
+    openRepositories.push(tabA, tabB);
+
+    const updates = fakeUpdates(true);
+    const user = userEvent.setup();
+    // Tab A renders first, against an empty database: its cached snapshot has no
+    // active session and an empty outbox.
+    await renderBanner(tabA, updates);
+
+    // Tab B starts a session on its own connection and the mutation is immediately
+    // acknowledged, exactly as if sync had already drained it -- so the outbox is
+    // empty by the time Tab A looks, and only the active session distinguishes this
+    // from "nothing is happening".
+    await tabB.commitAction(START_PAD);
+    await tabB.acknowledgeOutbox(START_PAD.actionId);
+
+    // Tab A never received a `focus`/`visibilitychange` event, so its cached
+    // `snapshot` still shows no active session. Clicking "Update now" must still
+    // see Tab B's live session by re-reading the database at decision time, not by
+    // trusting that stale cache.
+    await user.click(await screen.findByRole("button", { name: "Update now" }));
+
+    expect(
+      await screen.findByText(
+        "Gym HUD will update as soon as your current session is finished and your changes are saved.",
+      ),
+    ).toBeInTheDocument();
+    expect(updates.applyUpdate).not.toHaveBeenCalled();
+  });
+
   it("keeps its promise and applies the deferred update once the session is finished", async () => {
     const repository = freshRepository();
     await repository.commitAction(START_PAD);

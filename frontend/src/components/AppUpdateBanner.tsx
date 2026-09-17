@@ -24,21 +24,31 @@ interface AppUpdateBannerProps {
  * without anyone having to come back and press the button again.
  */
 export function AppUpdateBanner({ updates = serviceWorkerUpdates }: AppUpdateBannerProps) {
-  const { listPendingOutbox, snapshot } = useLocalData();
+  const { listPendingOutbox, readLiveSnapshot, snapshot } = useLocalData();
   const updateReady = useSyncExternalStore(updates.subscribe, updates.isUpdateReady);
   const [deferred, setDeferred] = useState(false);
 
   // Derived from the last snapshot, which is refreshed after every commit and on
-  // focus. It only decides when to re-try below; the decision itself re-reads the
-  // outbox, so a snapshot another view has moved past can never wave a reload through.
+  // focus. This is only a heuristic for when to retry the deferred update below --
+  // it decides nothing on its own. The actual gate, `isSafeToApply` below, re-reads
+  // both the outbox and the active-session snapshot live, so a tab that has not
+  // received a focus/visibilitychange event since another tab changed the data can
+  // never wave a reload through on this stale value.
   const liveWorkInSnapshot = hasLiveWork(snapshot, snapshot?.pendingOutbox ?? []);
 
   const isSafeToApply = useCallback(async () => {
-    // Straight from the provider's repository -- the same IndexedDB connection every
-    // other read uses, not a second one.
-    const pendingOutbox = await listPendingOutbox();
-    return !hasLiveWork(snapshot, pendingOutbox);
-  }, [listPendingOutbox, snapshot]);
+    // Both halves are read straight from the provider's repository at decision time
+    // -- the same IndexedDB connection every other read uses, not a second one, and
+    // never the React-state `snapshot` above, which another tab can move past (start
+    // a session, finish one, drain the outbox) without this tab ever finding out. A
+    // failed live read of the active-session half counts as live work, the same as
+    // a snapshot that has never loaded: fail safe, never wave the update through.
+    const [pendingOutbox, liveSnapshot] = await Promise.all([
+      listPendingOutbox(),
+      readLiveSnapshot().catch(() => null),
+    ]);
+    return !hasLiveWork(liveSnapshot, pendingOutbox);
+  }, [listPendingOutbox, readLiveSnapshot]);
 
   const requestUpdate = useCallback(async () => {
     const safe = await isSafeToApply();

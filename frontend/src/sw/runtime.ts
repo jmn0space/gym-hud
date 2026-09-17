@@ -82,6 +82,41 @@ function isApiRequest(pathname: string): boolean {
   return pathname === API_PREFIX || pathname.startsWith(`${API_PREFIX}/`);
 }
 
+/**
+ * Cache Storage is allowed to throw on a read, not only on a write --
+ * QuotaExceededError, a Safari private-mode SecurityError, or storage
+ * eviction/corruption can all surface on `caches.open` or `cache.match`.
+ * `cachedShell()` is the documented last resort that must always resolve to
+ * *something*, and `handlePrecachedAsset()` hits this on every JS/CSS request, so
+ * both go through these two wrappers instead of touching `caches`/`Cache`
+ * directly: a Cache Storage failure resolves to `undefined` here, never a
+ * rejection, keeping the fallback chain genuinely unconditional.
+ */
+async function openCacheSafely(
+  cacheStorage: CacheStorage,
+  name: string,
+): Promise<Cache | undefined> {
+  try {
+    return await cacheStorage.open(name);
+  } catch {
+    return undefined;
+  }
+}
+
+async function matchCacheSafely(
+  cache: Cache | undefined,
+  path: string,
+): Promise<Response | undefined> {
+  if (cache === undefined) {
+    return undefined;
+  }
+  try {
+    return await cache.match(path);
+  } catch {
+    return undefined;
+  }
+}
+
 /** Wires every lifecycle listener onto `scope`. Called once, by the worker entry. */
 export function createServiceWorkerRuntime(
   scope: ServiceWorkerGlobalScope,
@@ -93,17 +128,31 @@ export function createServiceWorkerRuntime(
 
   async function precacheShell(): Promise<void> {
     const cache = await scope.caches.open(cacheName);
-    await Promise.all(
-      precachePaths.map(async (path) => {
-        // `reload` bypasses the HTTP cache so an install can never adopt a stale copy
-        // of an asset whose hashed name it is about to treat as immutable.
-        const response = await scope.fetch(path, { cache: "reload", credentials: "same-origin" });
-        if (!isStorable(response)) {
-          throw new Error(`Precaching ${path} failed with status ${response.status.toString()}`);
-        }
-        await cache.put(path, response);
-      }),
-    );
+    try {
+      await Promise.all(
+        precachePaths.map(async (path) => {
+          // `reload` bypasses the HTTP cache so an install can never adopt a stale
+          // copy of an asset whose hashed name it is about to treat as immutable.
+          const response = await scope.fetch(path, {
+            cache: "reload",
+            credentials: "same-origin",
+          });
+          if (!isStorable(response)) {
+            throw new Error(`Precaching ${path} failed with status ${response.status.toString()}`);
+          }
+          await cache.put(path, response);
+        }),
+      );
+    } catch (error: unknown) {
+      // `Promise.all` does not cancel the other in-flight puts just because one
+      // asset failed, so this doomed, version-named cache can still hold a partial
+      // copy of the shell. A failed install never activates (D3), so this is not a
+      // serving hazard, but leaving it behind accumulates garbage across repeated
+      // failed deploys. Best-effort: the original precaching failure is what must
+      // propagate, even if this cleanup itself fails.
+      await scope.caches.delete(cacheName).catch(() => undefined);
+      throw error;
+    }
   }
 
   async function dropSupersededCaches(): Promise<void> {
@@ -118,12 +167,12 @@ export function createServiceWorkerRuntime(
   }
 
   async function cachedShell(): Promise<Response> {
-    const cache = await scope.caches.open(cacheName);
-    const shell = await cache.match(APP_SHELL_PATH);
+    const cache = await openCacheSafely(scope.caches, cacheName);
+    const shell = await matchCacheSafely(cache, APP_SHELL_PATH);
     if (shell !== undefined) {
       return shell;
     }
-    const offline = await cache.match(OFFLINE_FALLBACK_PATH);
+    const offline = await matchCacheSafely(cache, OFFLINE_FALLBACK_PATH);
     if (offline !== undefined) {
       return offline;
     }
@@ -160,14 +209,23 @@ export function createServiceWorkerRuntime(
   }
 
   async function handlePrecachedAsset(request: Request, path: string): Promise<Response> {
-    const cache = await scope.caches.open(cacheName);
-    const cached = await cache.match(path);
+    const cache = await openCacheSafely(scope.caches, cacheName);
+    const cached = await matchCacheSafely(cache, path);
     if (cached !== undefined) {
       return cached;
     }
+    // Same timeout discipline as `handleNavigation`: a cache miss here is realistic
+    // after Cache Storage eviction under storage pressure, not just when offline, so
+    // a dead socket on the network fallback must not leave this fetch event hanging
+    // forever -- the 504 below has to be reachable even when the network never
+    // answers at all.
+    const controller = new AbortController();
+    const timeout = scope.setTimeout(() => {
+      controller.abort();
+    }, NAVIGATION_TIMEOUT_MS);
     try {
-      const response = await scope.fetch(request);
-      if (isStorable(response)) {
+      const response = await scope.fetch(request, { signal: controller.signal });
+      if (isStorable(response) && cache !== undefined) {
         // Clone before returning: the caller consumes the original body.
         const copy = response.clone();
         void cache.put(path, copy).catch(() => undefined);
@@ -179,6 +237,8 @@ export function createServiceWorkerRuntime(
         statusText: "Offline",
         headers: { "Cache-Control": "no-store" },
       });
+    } finally {
+      scope.clearTimeout(timeout);
     }
   }
 
@@ -201,7 +261,10 @@ export function createServiceWorkerRuntime(
     const type =
       typeof data === "object" && data !== null ? (data as { type?: unknown }).type : data;
     if (type === SKIP_WAITING_MESSAGE) {
-      void scope.skipWaiting();
+      // Without `waitUntil` the worker could be terminated before `skipWaiting()`
+      // completes, since nothing else tells the browser this message event is
+      // still doing work.
+      event.waitUntil(scope.skipWaiting());
     }
   });
 
