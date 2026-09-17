@@ -32,6 +32,19 @@ https://{$PREVIEW_HOST} {
 	# silent failure in this setup, so never let a browser sniff past one.
 	header X-Content-Type-Options nosniff
 
+	# Django's SecurityMiddleware only ever sees the proxied /api/* traffic,
+	# so everything Caddy itself serves -- the login page included -- would
+	# otherwise ship with none of these. Applied at the site level so both
+	# the static SPA and the reverse-proxied API get them.
+	header Referrer-Policy "same-origin"
+	header X-Frame-Options "DENY"
+	header Strict-Transport-Security "max-age=31536000"
+	# The built SPA (frontend/dist, verified at time of writing) has no
+	# inline <script>/<style> and no CSS-in-JS runtime, so 'self' is enough
+	# for script-src/style-src without a nonce. worker-src 'self' still lets
+	# /sw.js register at scope "/".
+	header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; worker-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+
 	root * /srv/dist
 
 	# --- API: straight through to Django. Never cached, never rewritten. ---
@@ -48,6 +61,14 @@ https://{$PREVIEW_HOST} {
 			# scoped by the browser to the URL it requested, not to this
 			# header, so they are unaffected too.
 			header_up Host localhost
+			# This origin is reachable by anything on the LAN, unlike the
+			# trusted cloudflared connector get_client_ident() is written
+			# for (see backend/core/throttling.py). Without this, any
+			# device on the same Wi-Fi can set its own CF-Connecting-IP
+			# and get a fresh login-throttle bucket per request, defeating
+			# the brute-force limit entirely. Strip whatever the client
+			# sent before Django ever sees it.
+			header_up -CF-Connecting-IP
 		}
 	}
 

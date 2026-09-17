@@ -82,11 +82,36 @@ This procedure has two parts.
    certificate" if these do not match exactly) → Encryption & credentials →
    Install a certificate → CA certificate → select `gym-hud-preview-ca.crt`
    from Downloads → confirm the warning that this certificate can monitor
-   network traffic (expected: it is your own preview stack's CA, and it only
-   ever issues a certificate for the `PREVIEW_HOST` you choose). This step
-   only needs repeating if the `caddy_data` volume is ever deleted
-   (`docker compose down -v`); a plain restart or a changed `PREVIEW_HOST`
-   reuses the same trusted CA.
+   network traffic.
+
+   **That warning is accurate, not boilerplate.** Trusting this CA is
+   **not** scoped to the `PREVIEW_HOST` this stack happens to issue
+   certificates for — "only issues a certificate for `PREVIEW_HOST`"
+   describes what Caddy chooses to issue, not what the phone will accept.
+   Once installed, the root is **trusted for every HTTPS site on this phone,
+   until you remove it** — indefinitely, across reboots, unrelated to this
+   test. The CA's private key sits unencrypted in the `caddy_data` volume
+   (`/data/caddy/pki/authorities/local/root.key`); anyone who later obtains
+   it (stolen device, backup, a machine shared with someone else) can mint a
+   certificate for any domain and transparently MITM this phone's HTTPS
+   traffic on any network. Use a dedicated test device, not a personal
+   phone, if at all possible.
+
+   This trust step only needs repeating if the `caddy_data` volume is ever
+   deleted (`docker compose down -v`); a plain restart or a changed
+   `PREVIEW_HOST` reuses the same trusted CA — which is exactly why the
+   mandatory teardown below matters once testing is actually done.
+
+   **Teardown (do this when you are finished testing, not just when you stop
+   the containers):**
+
+   ```bash
+   docker compose -f docker-compose.preview.yml down -v   # destroys root.key
+   ```
+
+   On the phone: Settings → Security → Encryption & credentials → User
+   credentials → remove `gym-hud-preview-ca.crt` (or whatever name it
+   installed under).
 
 3. On the phone, open Chrome and navigate to `https://<PREVIEW_HOST>/`.
    Confirm:
@@ -128,6 +153,12 @@ This procedure has two parts.
 11. Disable Airplane Mode. Confirm the app reconciles back to its normal
     `authenticated` state on its own within a few seconds, without a manual
     reload (data-sync.md's online/focus re-check triggers).
+12. Once this run is genuinely finished (not just this sitting — only once
+    you have no more preview testing planned on this device for a while):
+    perform the teardown in step 2 above (remove the CA from the phone's
+    user credentials, and `docker compose -f docker-compose.preview.yml
+    down -v`). Leaving the CA trusted and the key on disk is the whole risk
+    step 2 describes; do not skip this because the app worked.
 
 ### Part B — blocked; do not attempt yet
 
