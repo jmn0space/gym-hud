@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, posix, resolve } from "node:path";
 
 import react from "@vitejs/plugin-react";
 import { loadEnv, type Plugin } from "vite";
@@ -13,10 +13,17 @@ const DEFAULT_API_PROXY_TARGET = "http://127.0.0.1:8000";
 /** Rollup input name for the service worker, and the unhashed file it must emit to. */
 const SERVICE_WORKER_INPUT = "service-worker";
 const SERVICE_WORKER_FILE = "sw.js";
+/** The global the plugin injects and `src/sw/service-worker.ts` reads back. */
+const BUILD_GLOBAL = "__GYM_HUD_BUILD__";
 
 /**
  * Files copied verbatim out of `public/`. Vite never puts them in the bundle, so the
  * precache plugin reads them from disk to hash them.
+ *
+ * The list is declared rather than derived so that precaching something large stays a
+ * deliberate act -- but `assertPublicPrecacheFilesMatchDisk` fails the build when it
+ * and `public/` disagree in *either* direction, so a new file cannot be silently
+ * omitted from the offline precache.
  */
 const PUBLIC_PRECACHE_FILES = [
   "manifest.webmanifest",
@@ -30,8 +37,47 @@ const PUBLIC_PRECACHE_FILES = [
 /** Bundle outputs that make up the app shell. Everything else is fetched on demand. */
 const PRECACHED_BUNDLE_EXTENSIONS = [".js", ".css", ".html"];
 
+/** Precaching these two is what makes an offline navigation answerable at all. */
+const REQUIRED_PRECACHE_PATHS = ["/index.html", "/offline.html"];
+
 function sha256(content: string | Uint8Array): string {
   return createHash("sha256").update(content).digest("hex");
+}
+
+/** Every file under `public/`, as `/`-separated paths relative to it. */
+function listPublicFiles(directory: string, prefix = ""): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const relativePath = prefix === "" ? entry.name : posix.join(prefix, entry.name);
+    if (entry.isDirectory()) {
+      return listPublicFiles(join(directory, entry.name), relativePath);
+    }
+    return entry.isFile() ? [relativePath] : [];
+  });
+}
+
+/**
+ * Bundle outputs are precached from the real Rollup bundle, but `public/` is copied
+ * verbatim and has to be listed by hand. Dropping a file in there without updating
+ * the list used to build fine and ship a PWA missing that file offline, so a
+ * mismatch in either direction fails the build.
+ */
+function assertPublicPrecacheFilesMatchDisk(root: string): void {
+  const onDisk = new Set(listPublicFiles(join(root, "public")));
+  const declared = new Set(PUBLIC_PRECACHE_FILES);
+  const missingFromList = [...onDisk].filter((file) => !declared.has(file)).sort();
+  const missingFromDisk = [...declared].filter((file) => !onDisk.has(file)).sort();
+  if (missingFromList.length === 0 && missingFromDisk.length === 0) {
+    return;
+  }
+  throw new Error(
+    "PUBLIC_PRECACHE_FILES in vite.config.ts does not match the contents of public/." +
+      (missingFromList.length > 0
+        ? `\n  In public/ but not precached: ${missingFromList.join(", ")}`
+        : "") +
+      (missingFromDisk.length > 0
+        ? `\n  Precached but not in public/: ${missingFromDisk.join(", ")} (run \`npm run icons\`?)`
+        : ""),
+  );
 }
 
 /**
@@ -39,9 +85,13 @@ function sha256(content: string | Uint8Array): string {
  * told what to precache. This plugin collects the emitted shell assets plus the
  * copied `public/` files and prepends `self.__GYM_HUD_BUILD__` to the `sw.js` chunk.
  *
- * The version is a hash of every precached entry's name and content, never a
- * timestamp: rebuilding identical sources must yield an identical `sw.js`, or the
- * browser would see a "new" worker on every deploy and churn the shell cache.
+ * The version is a hash of every precached entry's name and content *plus the
+ * worker's own code*, never a timestamp: rebuilding identical sources must yield an
+ * identical `sw.js`, or the browser would see a "new" worker on every deploy and
+ * churn the shell cache. Including the worker chunk is what keeps `gym-hud-shell-
+ * <version>` unique per *worker* build -- a change confined to the worker's source
+ * would otherwise ship a new `sw.js` under the live cache's name, letting an install
+ * that then fails delete the cache the active worker is still serving from.
  */
 function serviceWorkerPrecachePlugin(root: string): Plugin {
   return {
@@ -72,19 +122,39 @@ function serviceWorkerPrecachePlugin(root: string): Plugin {
         entries.set(`/${fileName}`, sha256(source));
       }
 
+      // Missing icons or manifest must fail the build rather than ship a PWA that
+      // silently cannot be installed. Run `npm run icons` to regenerate them.
+      assertPublicPrecacheFilesMatchDisk(root);
       for (const relativePath of PUBLIC_PRECACHE_FILES) {
-        // Missing icons or manifest must fail the build rather than ship a PWA that
-        // silently cannot be installed. Run `npm run icons` to regenerate them.
         entries.set(`/${relativePath}`, sha256(readFileSync(join(root, "public", relativePath))));
       }
 
       const assets = [...entries.keys()].sort((left, right) => (left < right ? -1 : 1));
+      const missingRequired = REQUIRED_PRECACHE_PATHS.filter((path) => !entries.has(path));
+      if (missingRequired.length > 0) {
+        // The worker treats an absent manifest as a "development" build that
+        // precaches nothing; shipping one would install a PWA with no offline shell.
+        throw new Error(
+          `The precache manifest is missing ${missingRequired.join(", ")}; the worker would ship without an offline shell.`,
+        );
+      }
       // JSON keeps the name/content pairs unambiguous, so no separator can collide.
       const version = sha256(
-        JSON.stringify(assets.map((asset) => [asset, entries.get(asset) ?? ""])),
+        JSON.stringify({
+          worker: sha256(worker.code),
+          assets: assets.map((asset) => [asset, entries.get(asset) ?? ""]),
+        }),
       ).slice(0, 16);
 
-      worker.code = `self.__GYM_HUD_BUILD__=${JSON.stringify({ version, assets })};\n${worker.code}`;
+      if (!worker.code.includes(BUILD_GLOBAL)) {
+        // The worker would fall back to its "development" build -- an empty precache
+        // list -- and the mistake would only show up as a PWA that does not work
+        // offline, long after the deploy.
+        throw new Error(
+          `The emitted "${SERVICE_WORKER_FILE}" chunk never reads \`self.${BUILD_GLOBAL}\`, so injecting the precache manifest would have no effect.`,
+        );
+      }
+      worker.code = `self.${BUILD_GLOBAL}=${JSON.stringify({ version, assets })};\n${worker.code}`;
     },
   };
 }
