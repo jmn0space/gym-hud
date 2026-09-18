@@ -15,6 +15,14 @@
 	log {
 		level ERROR
 	}
+	# TLS's SNI extension excludes literal IP addresses (RFC 6066), so Chrome
+	# (and most clients) send no SNI at all when connecting to https://<IP>/.
+	# Caddy's automatic HTTPS otherwise picks a certificate by SNI alone, so
+	# without this it has nothing to serve on an SNI-less ClientHello and
+	# fails the handshake with a bare "internal error" alert before Django or
+	# the SPA are ever reached -- this is the actual site, so treat that case
+	# as if PREVIEW_HOST had been requested.
+	default_sni {$PREVIEW_HOST}
 }
 
 # PREVIEW_HOST is the address typed on the PHONE, e.g. 192.168.1.5.
