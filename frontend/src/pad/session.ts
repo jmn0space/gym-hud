@@ -1,9 +1,11 @@
 import type { LocalRecord, RecoverySnapshot } from "../storage";
 import {
+  isOpenRow,
   parseWalkingBouts,
   parseWalkingPauses,
   parseWalkingRests,
   parseWalkingSession,
+  recordText,
 } from "./records";
 import type {
   WalkingBout,
@@ -27,6 +29,12 @@ export interface PadSessionView {
   /** The bout the current state belongs to: the open bout, or the one being rested after. */
   currentBout: WalkingBout | null;
   currentPause: WalkingBoutPause | null;
+  /**
+   * The open rest, if any. Not narrowed to "only while no bout is open": data can
+   * hold both (another view left a rest open, or a bout was started during one),
+   * and a field that is structurally `null` in that case hides a live record from
+   * every caller that reads it.
+   */
   currentRest: WalkingRest | null;
   /** The number the next bout gets; the open bout's own number while one is open. */
   currentBoutNumber: number;
@@ -82,13 +90,16 @@ export function buildPadSessionView(
   const openBout = latest(bouts.filter(isOpen));
   const openPause =
     openBout === null ? null : latest(pausesOf(pauses, openBout).filter(isOpen));
-  const openRest = openBout !== null ? null : latest(rests.filter(isOpen));
+  const openRest = latest(rests.filter(isOpen));
   const restedBout =
     openRest === null
       ? null
       : (bouts.find((bout) => bout.id === openRest.walking_bout_id) ?? null);
+  // RESTING only when nothing is walking: an open bout always wins the state,
+  // whatever an open rest alongside it says.
+  const restingBout = openBout === null ? restedBout : null;
 
-  const currentBout = openBout ?? restedBout;
+  const currentBout = openBout ?? restingBout;
   const lastNumber = bouts.reduce((highest, bout) => Math.max(highest, bout.bout_number), 0);
 
   let state: WalkingState;
@@ -98,7 +109,7 @@ export function buildPadSessionView(
     state = "PAUSED";
   } else if (openBout !== null) {
     state = "WALKING";
-  } else if (openRest !== null) {
+  } else if (restingBout !== null) {
     state = "RESTING";
   } else {
     state = "READY";
@@ -118,27 +129,67 @@ export function buildPadSessionView(
 }
 
 /**
- * The active PAD session in a recovery snapshot, or `null` when none is active.
- * The snapshot holds at most one ACTIVE session per type (docs/data-sync.md,
- * "Recovery snapshot scope"), so this reconstructs the whole PAD screen after a
- * reload or process termination from stored records alone.
+ * The ACTIVE walking session's row in a snapshot, parseable or not.
+ *
+ * Deliberately separate from `readPadSession`: a row the tolerant parser drops
+ * still holds the repository's active marker, so the screen cannot render a HUD
+ * for it but must still be able to act on it by raw id. Without that, a session
+ * nobody can parse wedges PAD for the life of the install -- every start is
+ * refused by the marker, and the control that would finish it never renders.
+ */
+export function findActiveWalkingSessionRecord(snapshot: RecoverySnapshot): LocalRecord | null {
+  return snapshot.records.walking_sessions.find((record) => record.status === "ACTIVE") ?? null;
+}
+
+/**
+ * The active PAD session in a recovery snapshot, or `null` when none is active
+ * (or the active row cannot be parsed). The snapshot holds at most one ACTIVE
+ * session per type (docs/data-sync.md, "Recovery snapshot scope"), so this
+ * reconstructs the whole PAD screen after a reload or process termination from
+ * stored records alone.
  */
 export function readPadSession(snapshot: RecoverySnapshot): PadSessionView | null {
-  for (const record of snapshot.records.walking_sessions) {
-    if (record.status !== "ACTIVE") {
-      continue;
-    }
-    const view = buildPadSessionView(
-      record,
-      snapshot.records.walking_bouts,
-      snapshot.records.walking_pauses,
-      snapshot.records.walking_rests,
-    );
-    if (view !== null) {
-      return view;
-    }
-  }
-  return null;
+  const record = findActiveWalkingSessionRecord(snapshot);
+  return record === null
+    ? null
+    : buildPadSessionView(
+        record,
+        snapshot.records.walking_bouts,
+        snapshot.records.walking_pauses,
+        snapshot.records.walking_rests,
+      );
+}
+
+/**
+ * Whether the snapshot holds open rows of this session that parsing dropped.
+ *
+ * Such a row is invisible to the HUD but not to the repository: its active marker
+ * keeps the scope taken, so `Start walking` can only fail with a conflict whose
+ * message explains nothing. Callers say so on screen and point at FINISH SESSION,
+ * which closes raw rows rather than parsed ones.
+ */
+export function hasUnreadableOpenRecords(
+  snapshot: RecoverySnapshot,
+  view: PadSessionView,
+): boolean {
+  const boutRows = snapshot.records.walking_bouts.filter(
+    (record) => recordText(record, "walking_session_id") === view.session.id,
+  );
+  const boutIds = new Set(boutRows.map((record) => record.id));
+  const intervalRows = [...snapshot.records.walking_pauses, ...snapshot.records.walking_rests].filter(
+    (record) => {
+      const parent = recordText(record, "walking_bout_id");
+      return parent !== undefined && boutIds.has(parent);
+    },
+  );
+  const parsed = new Set<string>([
+    ...view.bouts.map((bout) => bout.id),
+    ...view.pauses.map((pause) => pause.id),
+    ...view.rests.map((rest) => rest.id),
+  ]);
+  return [...boutRows, ...intervalRows].some(
+    (record) => isOpenRow(record) && !parsed.has(record.id),
+  );
 }
 
 /**
@@ -147,7 +198,7 @@ export function readPadSession(snapshot: RecoverySnapshot): PadSessionView | nul
  * timer ticks drive re-rendering, never accumulation (docs/pad-walking.md,
  * "Starting and timing a bout").
  */
-export function intervalElapsedMs(
+function intervalElapsedMs(
   interval: { started_at: string; ended_at: string | null },
   now: number,
 ): number {
@@ -160,7 +211,7 @@ export function intervalElapsedMs(
 }
 
 /** Total paused time of a bout, counting a still-open pause up to `now`. */
-export function pausedMs(
+function pausedMs(
   bout: WalkingBout,
   pauses: readonly WalkingBoutPause[],
   now: number,

@@ -24,9 +24,20 @@ import {
  * or the row is dropped.
  */
 
-function text(record: LocalRecord, field: string): string | undefined {
+/** A non-empty string field of a raw row, exported for callers that work on rows. */
+export function recordText(record: LocalRecord, field: string): string | undefined {
   const value = record[field];
   return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+/**
+ * The repository's own reading of "this interval is still open" (see `isOpen` in
+ * storage/repository.ts): an absent `ended_at` counts as open, exactly like an
+ * explicit null. Callers that close raw rows must agree with the store about what
+ * is open, or they leave behind a row the active markers still count.
+ */
+export function isOpenRow(record: LocalRecord): boolean {
+  return record.ended_at === null || record.ended_at === undefined;
 }
 
 function isTimestamp(value: string): boolean {
@@ -40,11 +51,11 @@ function isTimestamp(value: string): boolean {
  * instead of invisible.
  */
 function startTimestamp(record: LocalRecord): string | undefined {
-  const started = text(record, "started_at");
+  const started = recordText(record, "started_at");
   if (started !== undefined && isTimestamp(started)) {
     return started;
   }
-  const created = text(record, "created_at");
+  const created = recordText(record, "created_at");
   return created !== undefined && isTimestamp(created) ? created : undefined;
 }
 
@@ -78,7 +89,7 @@ function painValue(record: LocalRecord, field: string): number | null {
 }
 
 function optionalText(record: LocalRecord, field: string): string | null {
-  return text(record, field) ?? null;
+  return recordText(record, field) ?? null;
 }
 
 function sessionStatus(record: LocalRecord): WalkingSessionStatus | undefined {
@@ -94,13 +105,13 @@ function stopReason(record: LocalRecord): WalkingStopReason | null {
 }
 
 export function parseWalkingSession(record: LocalRecord): WalkingSession | undefined {
-  const id = text(record, "id");
+  const id = recordText(record, "id");
   const status = sessionStatus(record);
   const startedAt = startTimestamp(record);
   if (id === undefined || status === undefined || startedAt === undefined) {
     return undefined;
   }
-  const completedAt = text(record, "completed_at");
+  const completedAt = recordText(record, "completed_at");
   return {
     id,
     status,
@@ -127,14 +138,14 @@ export function parseWalkingBouts(
   sessionId: string,
 ): WalkingBout[] {
   const parsed = records.flatMap((record) => {
-    const id = text(record, "id");
+    const id = recordText(record, "id");
     const startedAt = startTimestamp(record);
     const endedAt = endTimestamp(record);
     if (
       id === undefined ||
       startedAt === undefined ||
       endedAt === undefined ||
-      text(record, "walking_session_id") !== sessionId
+      recordText(record, "walking_session_id") !== sessionId
     ) {
       return [];
     }
@@ -169,8 +180,8 @@ function parseInterval(
   record: LocalRecord,
   boutIds: ReadonlySet<string>,
 ): { id: string; walking_bout_id: string; started_at: string; ended_at: string | null } | undefined {
-  const id = text(record, "id");
-  const boutId = text(record, "walking_bout_id");
+  const id = recordText(record, "id");
+  const boutId = recordText(record, "walking_bout_id");
   const startedAt = startTimestamp(record);
   const endedAt = endTimestamp(record);
   if (
@@ -235,23 +246,5 @@ export function walkingBoutRecord(bout: WalkingBout): LocalRecord {
     pain_max: bout.pain_max,
     stop_reason: bout.stop_reason,
     notes: bout.notes,
-  };
-}
-
-export function walkingPauseRecord(pause: WalkingBoutPause): LocalRecord {
-  return {
-    id: pause.id,
-    walking_bout_id: pause.walking_bout_id,
-    started_at: pause.started_at,
-    ended_at: pause.ended_at,
-  };
-}
-
-export function walkingRestRecord(rest: WalkingRest): LocalRecord {
-  return {
-    id: rest.id,
-    walking_bout_id: rest.walking_bout_id,
-    started_at: rest.started_at,
-    ended_at: rest.ended_at,
   };
 }

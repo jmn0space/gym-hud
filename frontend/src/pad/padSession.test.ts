@@ -1,20 +1,30 @@
 import { describe, expect, it } from "vitest";
 
-import type { DomainStore, LocalRecord, RecoverySnapshot } from "../storage";
+import { InvalidActionError } from "../storage";
+import type { DomainStore, JsonValue, LocalRecord, RecoverySnapshot } from "../storage";
 import {
+  discardWalkingSessionAction,
   finishWalkingSessionAction,
-  findPreviousWalkingSession,
-  hasReachedMaximum,
-  inheritedWalkingSettings,
-  readPadSession,
   startWalkingBoutAction,
   startWalkingSessionAction,
+} from "./actions";
+import { parseWalkingSession } from "./records";
+import {
+  hasReachedMaximum,
+  hasUnreadableOpenRecords,
+  readPadSession,
   totalWalkingMs,
   walkingElapsedMs,
-  DEFAULT_WALKING_SETTINGS,
   type PadSessionView,
-} from "./index";
-import { parseWalkingSession } from "./records";
+} from "./session";
+import {
+  findPreviousWalkingSession,
+  inheritedWalkingSettings,
+  parseWalkingSessionSummary,
+  summarizeWalkingSession,
+  walkingSessionSummaryValue,
+} from "./settings";
+import { DEFAULT_WALKING_SETTINGS } from "./types";
 
 const STORES: DomainStore[] = [
   "walking_sessions",
@@ -76,8 +86,12 @@ function elapsedOfFirstBout(padSession: PadSessionView): number {
   return walkingElapsedMs(first, padSession.pauses, NOW);
 }
 
+function padSnapshot(records: Partial<Record<DomainStore, LocalRecord[]>>): RecoverySnapshot {
+  return snapshot({ walking_sessions: [SESSION], ...records });
+}
+
 function view(records: Partial<Record<DomainStore, LocalRecord[]>>): PadSessionView {
-  const result = readPadSession(snapshot({ walking_sessions: [SESSION], ...records }));
+  const result = readPadSession(padSnapshot(records));
   if (result === null) {
     throw new Error("Expected an active PAD session");
   }
@@ -399,7 +413,7 @@ describe("PAD actions", () => {
   it("finishes a session by closing every open interval in one action", () => {
     const action = finishWalkingSessionAction({
       actionId: "action-3",
-      view: view({
+      snapshot: padSnapshot({
         walking_bouts: [bout({ id: "bout-1" })],
         walking_pauses: [
           {
@@ -410,6 +424,7 @@ describe("PAD actions", () => {
           },
         ],
       }),
+      sessionId: "session-1",
       now,
     });
 
@@ -433,11 +448,15 @@ describe("PAD actions", () => {
     ]);
   });
 
-  it("closes an open rest when the session is finished from RESTING", () => {
+  it("closes an open rest even while a bout is open, which no 'current' record reaches", () => {
     const action = finishWalkingSessionAction({
       actionId: "action-4",
-      view: view({
-        walking_bouts: [bout({ id: "bout-1", ended_at: "2026-09-18T10:05:00.000Z" })],
+      snapshot: padSnapshot({
+        walking_bouts: [
+          bout({ id: "bout-1", ended_at: "2026-09-18T10:05:00.000Z" }),
+          bout({ id: "bout-2", bout_number: 2, started_at: "2026-09-18T10:08:00.000Z" }),
+        ],
+        // Left open when bout 2 was started from RESTING in another view.
         walking_rests: [
           {
             id: "rest-1",
@@ -446,13 +465,225 @@ describe("PAD actions", () => {
             ended_at: null,
           },
         ],
+        // The open pause of a bout that was finished while paused.
+        walking_pauses: [
+          {
+            id: "pause-1",
+            walking_bout_id: "bout-1",
+            started_at: "2026-09-18T10:04:00.000Z",
+            ended_at: null,
+          },
+        ],
       }),
+      sessionId: "session-1",
       now,
     });
 
-    expect(action.changes.map((change) => change.store)).toEqual([
-      "walking_rests",
-      "walking_sessions",
+    expect(
+      action.changes.map((change) => [change.store, change.operation === "put" ? change.record.id : change.id]),
+    ).toEqual([
+      ["walking_pauses", "pause-1"],
+      ["walking_rests", "rest-1"],
+      ["walking_bouts", "bout-2"],
+      ["walking_sessions", "session-1"],
     ]);
+    // Every close is guarded, so a record another view closed first is not
+    // silently reopened-and-reclosed at the wrong time.
+    expect(action.preconditions).toEqual([
+      { store: "walking_sessions", id: "session-1", expected: { status: "ACTIVE" } },
+      { store: "walking_pauses", id: "pause-1", expected: { ended_at: null } },
+      { store: "walking_rests", id: "rest-1", expected: { ended_at: null } },
+      { store: "walking_bouts", id: "bout-2", expected: { ended_at: null } },
+    ]);
+  });
+
+  it("closes what the live snapshot holds, including a row the parser dropped", () => {
+    const action = finishWalkingSessionAction({
+      actionId: "action-5",
+      snapshot: padSnapshot({
+        walking_bouts: [
+          // Neither timestamp is usable, so parsing drops it -- but the repository
+          // still counts it as this session's open bout.
+          {
+            id: "bout-unreadable",
+            walking_session_id: "session-1",
+            started_at: "not a date",
+            created_at: "not a date either",
+            ended_at: null,
+          },
+        ],
+      }),
+      sessionId: "session-1",
+      now,
+    });
+
+    expect(action.changes[0]).toEqual({
+      store: "walking_bouts",
+      operation: "put",
+      record: expect.objectContaining({
+        id: "bout-unreadable",
+        started_at: "not a date",
+        ended_at: now.toISOString(),
+      }) as unknown,
+    });
+  });
+
+  it("carries over fields it does not author instead of replacing the record", () => {
+    const action = finishWalkingSessionAction({
+      actionId: "action-6",
+      snapshot: padSnapshot({
+        walking_bouts: [
+          bout({
+            id: "bout-1",
+            pain_min: 2,
+            pain_max: 4,
+            stop_reason: "CLAUDICATION",
+            notes: "left calf",
+            created_at: "2026-09-18T10:01:00.000Z",
+            updated_at: "2026-09-18T10:02:00.000Z",
+            deleted_at: null,
+          }),
+        ],
+      }),
+      sessionId: "session-1",
+      now,
+    });
+
+    const [change] = action.changes;
+    expect(change?.operation === "put" ? change.record : undefined).toEqual({
+      id: "bout-1",
+      walking_session_id: "session-1",
+      bout_number: 1,
+      started_at: "2026-09-18T10:01:00.000Z",
+      ended_at: now.toISOString(),
+      pain_min: 2,
+      pain_max: 4,
+      stop_reason: "CLAUDICATION",
+      notes: "left calf",
+    });
+  });
+
+  it("refuses to finish a session that is no longer the active one", () => {
+    expect(() =>
+      finishWalkingSessionAction({
+        actionId: "action-7",
+        snapshot: snapshot({ walking_sessions: [{ ...SESSION, status: "COMPLETED" }] }),
+        sessionId: "session-1",
+        now,
+      }),
+    ).toThrow(InvalidActionError);
+  });
+
+  it("discards an active session by raw id, without parsing its row", () => {
+    const unreadable: LocalRecord = {
+      id: "session-broken",
+      status: "ACTIVE",
+      started_at: "not a date",
+      created_at: "not a date either",
+    };
+    const padSnapshotOf = snapshot({ walking_sessions: [unreadable] });
+    expect(readPadSession(padSnapshotOf)).toBeNull();
+
+    const action = discardWalkingSessionAction({
+      actionId: "action-8",
+      snapshot: padSnapshotOf,
+      sessionId: "session-broken",
+      now,
+    });
+
+    expect(action.changes).toEqual([
+      {
+        store: "walking_sessions",
+        operation: "put",
+        record: {
+          id: "session-broken",
+          status: "DISCARDED",
+          started_at: "not a date",
+          completed_at: now.toISOString(),
+        },
+      },
+    ]);
+    expect(action.preconditions).toEqual([
+      { store: "walking_sessions", id: "session-broken", expected: { status: "ACTIVE" } },
+    ]);
+  });
+});
+
+describe("PAD unreadable rows", () => {
+  it("reports an open row the parser dropped, so the HUD can explain it", () => {
+    const withUnreadableBout = padSnapshot({
+      walking_bouts: [
+        {
+          id: "bout-unreadable",
+          walking_session_id: "session-1",
+          started_at: "not a date",
+          created_at: "not a date either",
+          ended_at: null,
+        },
+      ],
+    });
+    const readable = padSnapshot({ walking_bouts: [bout({ id: "bout-1" })] });
+
+    const dropped = readPadSession(withUnreadableBout);
+    expect(dropped?.state).toBe("READY");
+    expect(dropped === null ? null : hasUnreadableOpenRecords(withUnreadableBout, dropped)).toBe(
+      true,
+    );
+
+    const parsed = readPadSession(readable);
+    expect(parsed === null ? null : hasUnreadableOpenRecords(readable, parsed)).toBe(false);
+  });
+
+  it("keeps an open rest visible on the view while a bout is open", () => {
+    const padSession = view({
+      walking_bouts: [
+        bout({ id: "bout-1", ended_at: "2026-09-18T10:05:00.000Z" }),
+        bout({ id: "bout-2", bout_number: 2, started_at: "2026-09-18T10:08:00.000Z" }),
+      ],
+      walking_rests: [
+        {
+          id: "rest-1",
+          walking_bout_id: "bout-1",
+          started_at: "2026-09-18T10:05:00.000Z",
+          ended_at: null,
+        },
+      ],
+    });
+
+    // The open bout still decides the state; the open rest is no longer hidden.
+    expect(padSession.state).toBe("WALKING");
+    expect(padSession.currentBout?.id).toBe("bout-2");
+    expect(padSession.currentRest?.id).toBe("rest-1");
+  });
+});
+
+describe("PAD previous-session summary", () => {
+  it("counts a bout still open at the closing time up to that moment, and no further", () => {
+    const summary = summarizeWalkingSession(
+      view({ walking_bouts: [bout({ id: "bout-1" })] }),
+      Date.parse("2026-09-18T10:09:00.000Z"),
+    );
+
+    expect(summary).toEqual({
+      settings: DEFAULT_WALKING_SETTINGS,
+      boutCount: 1,
+      walkingMs: 8 * 60_000,
+    });
+  });
+
+  it("round-trips through the stored value and ignores an unusable one", () => {
+    const summary = {
+      settings: { speed_kmh: 5.65, incline_pct: 3, max_bout_seconds: 445 },
+      boutCount: 2,
+      walkingMs: 930_000,
+    };
+
+    const stored = walkingSessionSummaryValue(summary) as Record<string, JsonValue>;
+
+    expect(parseWalkingSessionSummary(stored)).toEqual(summary);
+    expect(parseWalkingSessionSummary(undefined)).toBeNull();
+    expect(parseWalkingSessionSummary("5.0")).toBeNull();
+    expect(parseWalkingSessionSummary({ ...stored, speed_kmh: "fast" })).toBeNull();
+    expect(parseWalkingSessionSummary({ ...stored, max_bout_seconds: 0 })).toBeNull();
   });
 });

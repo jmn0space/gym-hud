@@ -1,45 +1,34 @@
+/**
+ * What the rest of the application consumes from the PAD domain. Modules inside
+ * `pad/` import each other directly, and so do the tests, so this barrel stays
+ * narrowed to the surface screens actually use.
+ */
 export {
+  discardWalkingSessionAction,
   finishWalkingSessionAction,
   startWalkingBoutAction,
   startWalkingSessionAction,
 } from "./actions";
 export {
-  parseWalkingBouts,
-  parseWalkingPauses,
-  parseWalkingRests,
-  parseWalkingSession,
-  walkingBoutRecord,
-  walkingPauseRecord,
-  walkingRestRecord,
-  walkingSessionRecord,
-} from "./records";
-export {
   buildPadSessionView,
   derivePadElapsedMs,
+  findActiveWalkingSessionRecord,
   hasReachedMaximum,
-  intervalElapsedMs,
-  pausedMs,
+  hasUnreadableOpenRecords,
   readPadSession,
-  totalWalkingMs,
   walkingElapsedMs,
 } from "./session";
-export { findPreviousWalkingSession, inheritedWalkingSettings } from "./settings";
+export {
+  findPreviousWalkingSession,
+  inheritedWalkingSettings,
+  parseWalkingSessionSummary,
+  summarizeWalkingSession,
+  walkingSessionSummaryValue,
+  PREVIOUS_WALKING_SESSION_KEY,
+} from "./settings";
 export { useNow } from "./useNow";
-export { DEFAULT_WALKING_SETTINGS, WALKING_STOP_REASONS } from "./types";
-export type {
-  FinishWalkingSessionInput,
-  StartWalkingBoutInput,
-  StartWalkingSessionInput,
-} from "./actions";
+export { DEFAULT_WALKING_SETTINGS } from "./types";
+export type { CloseWalkingSessionInput } from "./actions";
 export type { PadSessionView } from "./session";
-export type { PreviousWalkingSession, WalkingHistoryRecords } from "./settings";
-export type {
-  WalkingBout,
-  WalkingBoutPause,
-  WalkingRest,
-  WalkingSession,
-  WalkingSessionSettings,
-  WalkingSessionStatus,
-  WalkingState,
-  WalkingStopReason,
-} from "./types";
+export type { PreviousWalkingSession } from "./settings";
+export type { WalkingSessionSettings, WalkingState } from "./types";

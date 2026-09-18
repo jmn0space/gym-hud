@@ -1,11 +1,13 @@
-import type { LocalAction, RecordPrecondition } from "../storage";
-import {
-  walkingBoutRecord,
-  walkingPauseRecord,
-  walkingRestRecord,
-  walkingSessionRecord,
-} from "./records";
-import type { PadSessionView } from "./session";
+import { InvalidActionError } from "../storage";
+import type {
+  DomainStore,
+  LocalAction,
+  LocalRecord,
+  RecordPrecondition,
+  RecoverySnapshot,
+} from "../storage";
+import { isOpenRow, recordText, walkingBoutRecord, walkingSessionRecord } from "./records";
+import { findActiveWalkingSessionRecord, type PadSessionView } from "./session";
 import type { WalkingSessionSettings } from "./types";
 
 /**
@@ -108,10 +110,113 @@ export function startWalkingBoutAction({
   };
 }
 
-export interface FinishWalkingSessionInput {
+export interface CloseWalkingSessionInput {
   actionId: string;
-  view: PadSessionView;
+  /**
+   * A snapshot read at commit time, not the screen's React snapshot: whatever is
+   * open *now* is what has to be closed. A snapshot that is one async refresh
+   * behind -- a second tab started a bout moments ago -- would leave that bout
+   * open inside a finished session, where `readSnapshot` can never reach it again
+   * because it only walks the descendants of an ACTIVE session.
+   */
+  snapshot: RecoverySnapshot;
+  /** The session the user acted on; a different active session means the tap is stale. */
+  sessionId: string;
   now: Date;
+}
+
+/**
+ * Fields carried over verbatim when a row is closed. A put is a full record
+ * replacement, so a close rebuilt from the parsed view would silently overwrite
+ * every field the view does not author (`pain_min`, `stop_reason`, `notes`, and
+ * anything a later story adds) with whatever that view happened to hold. The
+ * repository's own metadata is dropped: it stamps `created_at`/`updated_at`/
+ * `deleted_at` inside the transaction.
+ */
+function carriedFields(record: LocalRecord): LocalRecord {
+  const carried: LocalRecord = { id: record.id };
+  for (const [field, value] of Object.entries(record)) {
+    if (
+      value !== undefined &&
+      field !== "created_at" &&
+      field !== "updated_at" &&
+      field !== "deleted_at"
+    ) {
+      carried[field] = value;
+    }
+  }
+  return carried;
+}
+
+/**
+ * Guards a close against a record another view closed in the meantime. A row whose
+ * `ended_at` is absent altogether cannot be expressed as one -- the check requires
+ * the field to be present -- so such a row is closed unguarded rather than made
+ * permanently unclosable; the repository's open-interval markers still hold the
+ * cardinality invariant either way.
+ */
+function stillOpenPreconditions(store: DomainStore, record: LocalRecord): RecordPrecondition[] {
+  return record.ended_at === null ? [{ store, id: record.id, expected: { ended_at: null } }] : [];
+}
+
+function closeWalkingSessionAction(
+  { actionId, snapshot, sessionId, now }: CloseWalkingSessionInput,
+  status: "COMPLETED" | "DISCARDED",
+): LocalAction {
+  const sessionRecord = findActiveWalkingSessionRecord(snapshot);
+  if (sessionRecord?.id !== sessionId) {
+    throw new InvalidActionError(
+      `Walking session ${sessionId} is no longer the active session on this device`,
+    );
+  }
+
+  const endedAt = now.toISOString();
+  const changes: LocalAction["changes"] = [];
+  const preconditions: RecordPrecondition[] = [activeSessionPrecondition(sessionId)];
+  const close = (store: DomainStore, record: LocalRecord) => {
+    changes.push({
+      store,
+      operation: "put",
+      record: { ...carriedFields(record), ended_at: endedAt },
+    });
+    preconditions.push(...stillOpenPreconditions(store, record));
+  };
+
+  // Raw rows, not parsed ones: a row the parser dropped is still open as far as
+  // the repository's markers are concerned, and leaving it behind is exactly what
+  // makes a session unfinishable later.
+  const boutRows = snapshot.records.walking_bouts.filter(
+    (record) => recordText(record, "walking_session_id") === sessionId,
+  );
+  const boutIds = new Set(boutRows.map((record) => record.id));
+  const intervalRows: readonly (readonly [DomainStore, readonly LocalRecord[]])[] = [
+    ["walking_pauses", snapshot.records.walking_pauses],
+    ["walking_rests", snapshot.records.walking_rests],
+  ];
+
+  // Children first, then their bouts, then the session: closing every open
+  // interval, not only the "current" one, is what keeps the open-interval markers
+  // from outliving the session that owns them.
+  for (const [store, records] of intervalRows) {
+    for (const record of records) {
+      const parent = recordText(record, "walking_bout_id");
+      if (parent !== undefined && boutIds.has(parent) && isOpenRow(record)) {
+        close(store, record);
+      }
+    }
+  }
+  for (const record of boutRows) {
+    if (isOpenRow(record)) {
+      close("walking_bouts", record);
+    }
+  }
+  changes.push({
+    store: "walking_sessions",
+    operation: "put",
+    record: { ...carriedFields(sessionRecord), status, completed_at: endedAt },
+  });
+
+  return { actionId, changes, preconditions };
 }
 
 /**
@@ -123,45 +228,19 @@ export interface FinishWalkingSessionInput {
  * The closed bout gets no `stop_reason`: inferring one belongs with the stop-reason
  * picker, which this slice deliberately does not build. It stays editable later.
  */
-export function finishWalkingSessionAction({
-  actionId,
-  view,
-  now,
-}: FinishWalkingSessionInput): LocalAction {
-  const endedAt = now.toISOString();
-  const changes: LocalAction["changes"] = [];
+export function finishWalkingSessionAction(input: CloseWalkingSessionInput): LocalAction {
+  return closeWalkingSessionAction(input, "COMPLETED");
+}
 
-  if (view.currentPause !== null) {
-    changes.push({
-      store: "walking_pauses",
-      operation: "put",
-      record: walkingPauseRecord({ ...view.currentPause, ended_at: endedAt }),
-    });
-  }
-  const openBout = view.bouts.find((bout) => bout.ended_at === null);
-  if (openBout !== undefined) {
-    changes.push({
-      store: "walking_bouts",
-      operation: "put",
-      record: walkingBoutRecord({ ...openBout, ended_at: endedAt }),
-    });
-  }
-  if (view.currentRest !== null) {
-    changes.push({
-      store: "walking_rests",
-      operation: "put",
-      record: walkingRestRecord({ ...view.currentRest, ended_at: endedAt }),
-    });
-  }
-  changes.push({
-    store: "walking_sessions",
-    operation: "put",
-    record: walkingSessionRecord({
-      ...view.session,
-      status: "COMPLETED",
-      completed_at: endedAt,
-    }),
-  });
-
-  return { actionId, changes, preconditions: [activeSessionPrecondition(view.session.id)] };
+/**
+ * Discard the active session, closing its open intervals the same way.
+ *
+ * This is the recovery escape for a session whose row the parser cannot read: it
+ * needs nothing from the row but its id, so it stays available exactly when the
+ * HUD -- and with it FINISH SESSION -- cannot render. `completed_at` records when
+ * the session stopped; `DISCARDED` is skipped by settings inheritance, so a
+ * discarded session never becomes the one a later session inherits from.
+ */
+export function discardWalkingSessionAction(input: CloseWalkingSessionInput): LocalAction {
+  return closeWalkingSessionAction(input, "DISCARDED");
 }

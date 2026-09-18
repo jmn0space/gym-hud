@@ -19,6 +19,7 @@ import {
   StorageCorruptionError,
   type CommitReceipt,
   type DomainStore,
+  type JsonValue,
   type LocalAction,
   type LocalRecord,
   type LocalRepository,
@@ -51,8 +52,17 @@ interface LocalDataState {
   error: LocalDataError | null;
 }
 
+/**
+ * What a caller submits to `commitAction`. A function is built *inside* the commit
+ * queue, immediately before the write, rather than at tap time. That matters
+ * twice: the action sees state no earlier commit of this queue has invalidated,
+ * and `retry()` rebuilds it instead of resubmitting a payload whose timestamps
+ * describe a moment that has long passed.
+ */
+export type LocalActionSource = LocalAction | (() => LocalAction | Promise<LocalAction>);
+
 export interface LocalDataContextValue extends LocalDataState {
-  commitAction: (action: LocalAction) => Promise<CommitReceipt>;
+  commitAction: (action: LocalActionSource) => Promise<CommitReceipt>;
   /**
    * The pending queue read straight from this provider's repository, i.e. the same
    * IndexedDB connection every other read here uses. Callers that must decide on
@@ -77,6 +87,14 @@ export interface LocalDataContextValue extends LocalDataState {
    * History later -- read them here instead of opening a second connection.
    */
   listRecords: (store: DomainStore, includeDeleted?: boolean) => Promise<LocalRecord[]>;
+  /**
+   * Small, durable key/value state that belongs to a screen rather than to a
+   * record -- the PAD start screen's summary of the last completed session, for
+   * one -- through this provider's repository. Reading a derived number from here
+   * is what keeps a screen's startup cost independent of all-time history.
+   */
+  getSyncMetadata: (key: string) => Promise<JsonValue | undefined>;
+  setSyncMetadata: (key: string, value: JsonValue) => Promise<void>;
   retry: () => Promise<void>;
   /** Clears a non-retryable error (conflict/invalid/corruption) once the user has seen it. */
   dismissError: () => void;
@@ -144,6 +162,16 @@ interface WriteErrorClassification {
   message: string;
 }
 
+/**
+ * Whether resubmitting the same write can plausibly succeed. Exported for callers
+ * that keep per-operation state across attempts (the PAD controls reuse an
+ * action's identifiers while a retry is still possible, and drop them once it is
+ * not).
+ */
+export function isRetryableWriteError(error: unknown): boolean {
+  return isRetryableKind(classifyWriteError(error).kind);
+}
+
 function classifyWriteError(error: unknown): WriteErrorClassification {
   if (
     error instanceof ActiveSessionConflictError ||
@@ -180,7 +208,7 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
   const lifecycleRef = useRef(0);
   const operationRef = useRef(0);
   const queueRef = useRef<Promise<void>>(Promise.resolve());
-  const failedActionRef = useRef<LocalAction | null>(null);
+  const failedActionRef = useRef<LocalActionSource | null>(null);
   const failedReadKindRef = useRef<"read" | "refresh" | "postCommitRefresh">("read");
   // Mirrors state.error whenever it holds a non-retryable (sticky) error, so a
   // background refresh can tell -- without waiting on a state update -- whether it
@@ -254,7 +282,7 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
   }, []);
 
   const runCommit = useCallback(
-    async (action: LocalAction): Promise<CommitReceipt> => {
+    async (source: LocalActionSource): Promise<CommitReceipt> => {
       const operation = ++operationRef.current;
       failedActionRef.current = null;
       stickyErrorRef.current = null;
@@ -264,11 +292,16 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
 
       let receipt: CommitReceipt;
       try {
+        // Building here rather than at the call site is deliberate: the queue has
+        // drained, so a builder that reads live state sees everything already
+        // committed. A builder that throws (its state is gone, or reading it
+        // failed) is classified and surfaced exactly like a rejected write.
+        const action = typeof source === "function" ? await source() : source;
         receipt = await repository.commitAction(action);
       } catch (error: unknown) {
         const classification = classifyWriteError(error);
         const retryable = isRetryableKind(classification.kind);
-        failedActionRef.current = retryable ? action : null;
+        failedActionRef.current = retryable ? source : null;
         if (mountedRef.current && operation === operationRef.current) {
           publishError(classification.kind, error, classification.message);
         }
@@ -301,7 +334,7 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
   );
 
   const commitAction = useCallback(
-    (action: LocalAction) => enqueue(() => runCommit(action)),
+    (source: LocalActionSource) => enqueue(() => runCommit(source)),
     [enqueue, runCommit],
   );
 
@@ -311,11 +344,18 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
     (store: DomainStore, includeDeleted?: boolean) => repository.listRecords(store, includeDeleted),
     [repository],
   );
+  const getSyncMetadata = useCallback((key: string) => repository.getSyncMetadata(key), [repository]);
+  const setSyncMetadata = useCallback(
+    (key: string, value: JsonValue) => repository.setSyncMetadata(key, value),
+    [repository],
+  );
 
   const retry = useCallback(async () => {
-    const failedAction = failedActionRef.current;
-    if (failedAction !== null) {
-      await enqueue(() => runCommit(failedAction));
+    const failedSource = failedActionRef.current;
+    if (failedSource !== null) {
+      // A builder is re-run here, so a retry writes what is true now rather than
+      // resubmitting a payload minted before the failure.
+      await enqueue(() => runCommit(failedSource));
       return;
     }
     await enqueue(() => readSnapshot(failedReadKindRef.current));
@@ -388,13 +428,25 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
     () => ({
       ...state,
       commitAction,
+      getSyncMetadata,
       listPendingOutbox,
       listRecords,
       readLiveSnapshot,
+      setSyncMetadata,
       retry,
       dismissError,
     }),
-    [commitAction, dismissError, listPendingOutbox, listRecords, readLiveSnapshot, retry, state],
+    [
+      commitAction,
+      dismissError,
+      getSyncMetadata,
+      listPendingOutbox,
+      listRecords,
+      readLiveSnapshot,
+      setSyncMetadata,
+      retry,
+      state,
+    ],
   );
 
   return <LocalDataContext value={value}>{children}</LocalDataContext>;
