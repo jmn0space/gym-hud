@@ -1,0 +1,166 @@
+# Android/Chrome secure-context preview for issue #17 (installable, offline-capable
+# PWA). Serves the built SPA and the Django API from ONE HTTPS origin through Caddy
+# (deploy/preview/Caddyfile), so a phone on the LAN gets a real secure context:
+# "Install app" appears, the service worker registers, and session/CSRF cookies work
+# same-origin with no CORS. See README.md ("PWA and offline") for the full walkthrough
+# and docs/device-smoke-tests.md for the device procedure this stack exists to support.
+#
+# This is a LAN development aid, not the production deployment. Production stays
+# Cloudflare Tunnel in front of Django with no built-in TLS termination of its own
+# (docker-compose.production.yml, docs/architecture.md); this file is never combined
+# with that one or with the plain docker-compose.yml.
+#
+# Quick start:
+#   1. Build the frontend bundle first -- Caddy only serves what already exists on
+#      disk at ./frontend/dist, it does not build it:
+#        cd frontend && npm ci && npm run build
+#      (Node 24 -- see frontend/.nvmrc; README.md has an equivalent one-off
+#      Docker command for a machine without Node installed.)
+#   2. Start the stack, pointing PREVIEW_HOST at the address typed on the PHONE
+#      (its LAN IP, e.g. 192.168.1.5 -- "localhost" only proves the stack itself
+#      boots, since a phone cannot reach the host machine's loopback address).
+#      DJANGO_SECRET_KEY has no default here (unlike docker-compose.yml) --
+#      generate one first, e.g. `python -c "import secrets; print(secrets.token_urlsafe(50))"`:
+#        PREVIEW_HOST=192.168.1.5 DJANGO_SECRET_KEY=<generated> \
+#          docker compose -f docker-compose.preview.yml up --build
+#   3. Trust Caddy's local CA on the phone once (README.md has the export/install
+#      steps) and open https://<PREVIEW_HOST>/.
+#
+# WARNING: this stack runs config.settings.local with DEBUG=True and publishes
+# 443 on all interfaces by default. An unhandled /api/* exception or an
+# unmatched /api/* path returns Django's full technical error/debug page --
+# including DATABASE_URL with the plaintext POSTGRES_PASSWORD -- to any
+# unauthenticated client on the same LAN/Wi-Fi. Only run this on a network you
+# trust, and take the stack down when you are done testing.
+#
+# None of the three services auto-restart (restart: "no"): bring the stack
+# back up explicitly with the command above rather than relying on Docker to
+# revive it on its own, since a stack left running quietly resumes listening
+# on whatever network the host is on next.
+#
+# Rebuilding the frontend (step 1) again after changing frontend/ source and
+# restarting Caddy (or just reloading the page, since /index.html is served
+# no-cache) is enough to see the change; the "web" and "db" containers do not need
+# to restart for a frontend-only change.
+#
+# Both "web" and "db" are named to match deploy/preview/Caddyfile's fixed
+# `reverse_proxy web:8000`, the same names docker-compose.yml uses. Compose scopes
+# containers by project name (default: the directory name), so running this file and
+# the plain docker-compose.yml from the same checkout AT THE SAME TIME would collide
+# on those container names -- stop one before starting the other, or give this stack
+# its own project name: `docker compose -p gym-hud-preview -f docker-compose.preview.yml up`.
+# Per hard rule R3, new Compose services never get added to docker-compose.yml itself;
+# this preview stack is deliberately a separate file with its own Postgres volume
+# (below) so it never shares state with local dev's database.
+services:
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      # The address typed on the phone. Must be reachable from the phone's Wi-Fi
+      # (a LAN IP, not "localhost") for a real device test; see README.md.
+      PREVIEW_HOST: ${PREVIEW_HOST:-localhost}
+    ports:
+      # Port 80 is deliberately NOT published. Caddy's automatic HTTP->HTTPS
+      # redirect only fires after the browser has already sent the request,
+      # so a signed-in phone hitting http://<host>/ (bare IP, bookmark, a
+      # forced sub-resource) would transmit the session cookie in plaintext
+      # over Wi-Fi before the redirect arrives -- SESSION_COOKIE_SECURE is
+      # False under config.settings.local (see backend/config/settings/local.py,
+      # out of scope for this preview stack to change) and SECURE_HSTS_SECONDS
+      # is 0, so nothing upgrades that first hit. The cost is that a tester
+      # who forgets "https://" gets a connection failure instead of a
+      # redirect; the docs already tell testers to type https:// explicitly.
+      - "443:443"
+    volumes:
+      - ./deploy/preview/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Read-only: Caddy only ever serves this build, never writes to it.
+      - ./frontend/dist:/srv/dist:ro
+      # Without this, "tls internal" mints a brand-new local root CA on every
+      # `up`, and the phone would have to re-trust it every time. Named volumes
+      # survive `down` (only `down -v` removes them), so the CA -- and the
+      # certificate issued from it -- persists across restarts.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+    # Not unless-stopped: this stack listens on every interface with
+    # DEBUG=True behind it (see the "web" service below). "unless-stopped"
+    # would bring the whole thing back on every Docker daemon (re)start --
+    # including on whatever Wi-Fi the phone testing happens to be on weeks
+    # later -- with nobody around who meant to start it. Bring it back up
+    # explicitly instead.
+    restart: "no"
+
+  web:
+    build:
+      context: .
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.local
+      DJANGO_ENV: local
+      DATABASE_URL: postgresql://${POSTGRES_USER:-gymhud}:${POSTGRES_PASSWORD:-gymhud}@db:5432/${POSTGRES_DB:-gymhud}
+      # No insecure default here (unlike docker-compose.yml, which is
+      # loopback-only by default): this stack's ports are reachable by
+      # anything on the LAN, and a known-value key removes CSRF as an
+      # independent control for every preview stack that ever ran with it.
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set a random preview secret key, e.g. python -c "import secrets; print(secrets.token_urlsafe(50))"}
+      DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1
+      # LocMemCache (config.settings.local's default) is per-process: with
+      # more than one Gunicorn worker, the login throttle keeps one counter
+      # per worker instead of one shared counter, so the advertised rate is
+      # really rate-times-workers. Production avoids this with a shared
+      # DatabaseCache instead (see docker-compose.production.yml); pinning
+      # to a single worker here gets the same effective guarantee without
+      # bringing DatabaseCache's extra moving part into the preview stack.
+      GUNICORN_WORKERS: 1
+      # config.settings.local hardcodes ALLOWED_HOSTS to localhost/127.0.0.1/[::1]
+      # in code (DJANGO_ALLOWED_HOSTS above cannot widen it), and the Caddyfile
+      # presents Host: localhost to this container for exactly that reason -- see
+      # its header_up comment. What must actually track PREVIEW_HOST is the
+      # origin the *browser* sends and Django's CSRF check verifies, so it is
+      # derived from the same variable Caddy's site address uses: the certificate
+      # and the trusted origin can never drift apart.
+      DJANGO_CSRF_TRUSTED_ORIGINS: https://${PREVIEW_HOST:-localhost}
+    depends_on:
+      db:
+        condition: service_healthy
+    expose:
+      - "8000"
+    # deploy/entrypoint.sh runs migrate/createcachetable/collectstatic before
+    # gunicorn binds, which takes several seconds; without this, "caddy"'s
+    # depends_on only waits for this container to start (not for gunicorn to
+    # actually be accepting connections), so /api/* 502s right when someone
+    # follows the quick-start and immediately opens the URL on a phone.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health/', timeout=3)\"",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: "no"
+
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-gymhud}
+      POSTGRES_USER: ${POSTGRES_USER:-gymhud}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gymhud}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gymhud} -d ${POSTGRES_DB:-gymhud}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      # Deliberately its own volume, distinct from docker-compose.yml's
+      # "postgres_data" -- see the file-level comment above.
+      - preview_postgres_data:/var/lib/postgresql/data
+    restart: "no"
+
+volumes:
+  caddy_data:
+  caddy_config:
+  preview_postgres_data:

@@ -20,6 +20,7 @@ import {
   type CommitReceipt,
   type LocalAction,
   type LocalRepository,
+  type OutboxEntry,
   type RecoverySnapshot,
 } from "../storage";
 
@@ -50,6 +51,23 @@ interface LocalDataState {
 
 export interface LocalDataContextValue extends LocalDataState {
   commitAction: (action: LocalAction) => Promise<CommitReceipt>;
+  /**
+   * The pending queue read straight from this provider's repository, i.e. the same
+   * IndexedDB connection every other read here uses. Callers that must decide on
+   * live data rather than on the last snapshot -- the service-worker update gate in
+   * particular -- use this instead of opening a second connection.
+   */
+  listPendingOutbox: () => Promise<OutboxEntry[]>;
+  /**
+   * The full recovery snapshot read straight from this provider's repository, the
+   * same way `listPendingOutbox` is: this calls `repository.readSnapshot()`
+   * directly, not the provider's `enqueue`/React-state path, so it never goes stale
+   * the way the `snapshot` field above can in a tab that has not regained focus
+   * since another tab changed the data. The service-worker update gate needs this
+   * to decide on the *live* active-session state, not on a snapshot another tab may
+   * have already moved past.
+   */
+  readLiveSnapshot: () => Promise<RecoverySnapshot>;
   retry: () => Promise<void>;
   /** Clears a non-retryable error (conflict/invalid/corruption) once the user has seen it. */
   dismissError: () => void;
@@ -278,6 +296,9 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
     [enqueue, runCommit],
   );
 
+  const listPendingOutbox = useCallback(() => repository.listPendingOutbox(), [repository]);
+  const readLiveSnapshot = useCallback(() => repository.readSnapshot(), [repository]);
+
   const retry = useCallback(async () => {
     const failedAction = failedActionRef.current;
     if (failedAction !== null) {
@@ -351,8 +372,8 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
   }, [cancelPendingOperations, closeAfterUnmount, enqueue, readSnapshot, refreshPreservingStickyError]);
 
   const value = useMemo<LocalDataContextValue>(
-    () => ({ ...state, commitAction, retry, dismissError }),
-    [commitAction, dismissError, retry, state],
+    () => ({ ...state, commitAction, listPendingOutbox, readLiveSnapshot, retry, dismissError }),
+    [commitAction, dismissError, listPendingOutbox, readLiveSnapshot, retry, state],
   );
 
   return <LocalDataContext value={value}>{children}</LocalDataContext>;

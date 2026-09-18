@@ -15,6 +15,84 @@ Primary target device: **Xiaomi Redmi Note 13 Pro+ / Android**.
 
 A heavyweight desktop UI framework is unnecessary. The frontend should optimize for large touch targets, minimal keyboard use, reliable recovery, and quick session entry.
 
+## PWA and service worker
+
+The frontend installs as a Progressive Web App: a manifest
+(`frontend/public/manifest.webmanifest`, served at `/manifest.webmanifest`),
+a set of home-screen icons under `/icons/`, and a service worker registered
+at the site root (`/sw.js`, root scope `/`). See [Data &
+synchronization](data-sync.md#authentication-and-offline-continuation) for
+how installation and offline continuation fit the authentication model, and
+[the README's "PWA and offline"
+section](../README.md#pwa-and-offline) for what is cached, the update policy
+in user-facing terms, and the Docker preview quick start used to install and
+test this on the target Android device (see "Preview and device testing"
+below).
+
+### App-shell cache and version policy
+
+The service worker precaches the app shell — `index.html`, the built JS/CSS
+entry chunks, the manifest, the icons, and the offline fallback document —
+under a cache named `gym-hud-shell-<version>`. `<version>` is generated at
+build time from a hash of the precached asset list and their (Vite-assigned,
+content-hashed) filenames, not from a timestamp, so the cache name changes
+exactly when the shell's actual content changes and stays identical across a
+no-op rebuild. On `activate`, the worker deletes every cache whose name
+starts with `gym-hud-shell-` other than the current version, so at most one
+version's worth of shell assets is ever on disk at a time.
+
+Runtime request handling:
+
+- **Navigation requests** (loading/reloading a page): network-first with a
+  short timeout, falling back to the precached `/index.html` app shell, and
+  falling back further to `/offline.html` only if the shell itself is
+  unavailable.
+- **Precached shell assets** (hashed JS/CSS, icons, manifest): cache-first —
+  safe because they are immutable by construction; any real change produces
+  a new filename.
+- **`/api/**`**: never cached, unconditionally network-only, always passed
+  straight through.
+- **Non-GET requests and cross-origin requests**: never intercepted by the
+  service worker at all.
+
+The service worker never applies an update by forcing a reload out from
+under live work: a new worker reaches `installed` and waits; the page
+surfaces a non-blocking "update ready" notice and only triggers the swap
+(and a single guarded reload) when no session is active and the local
+mutation outbox is empty. See [Data &
+synchronization](data-sync.md#service-worker-updates-and-the-outbox) for how
+this interacts with an in-progress workout and pending synchronization.
+
+### The Cache API never holds private data
+
+Private API data lives in IndexedDB only — this is the same login/logout
+boundary [Data & synchronization](data-sync.md#authentication-and-offline-continuation)
+already defines for the rest of the app, extended here to the service worker
+layer. `/api/**` responses are never written to the Cache API, with no
+exceptions: a service worker's `fetch` handler sits ahead of any of the
+application's own authentication logic, so a cached API response would be
+served to whoever loads the page next with no ownership check at all — unlike
+an IndexedDB read, which always goes through
+`frontend/src/storage/repository.ts` and the application-level checks built
+on top of it (e.g. the outbox-owner "different-user protection" in
+data-sync.md). Logging out therefore cannot leave a stale authenticated
+response reachable from the cache the way it could if API responses were
+ever cached; the service worker has nothing of the previous user's to serve.
+
+### Preview and device testing
+
+Android Chrome will not register a service worker, and will not offer
+"Install app," over a plain `http://<LAN-IP>` origin — that is not a secure
+context. `docker-compose.preview.yml` serves the built frontend and the
+Django API from one HTTPS origin (Caddy, `deploy/preview/Caddyfile`, using a
+locally-trusted certificate) so the target phone gets a real secure context
+without CORS or cross-origin cookies. This is a LAN development/testing aid,
+not a production ingress — see "Deployment topology" below for what actually
+serves the application in production, and the README's "PWA and offline"
+section for the exact commands. The real-device installation/offline-reopen
+result this workflow exists to support is recorded in
+[`docs/device-smoke-tests.md`](device-smoke-tests.md).
+
 ## Backend
 
 - Python
@@ -314,8 +392,14 @@ fails a test instead of shipping open.
 The SPA shell itself is **not currently served by Django**: the production
 `Dockerfile` builds and runs only the Django/Gunicorn image; it does not copy
 a compiled `frontend/` build into `STATICFILES_DIRS` or add a catch-all route
-for it. Serving the built SPA (and deciding whether that route is public) is
-therefore still open work, not something this change silently adds.
+for it. Serving the built SPA in production (and deciding whether that route
+is public) is therefore still open work — issue #17's Docker preview
+workflow (["PWA and service worker" above](#pwa-and-service-worker),
+`docker-compose.preview.yml`) covers the *device-testing* need for a
+single-origin HTTPS deployment during development, but it is a separate,
+non-production Compose file and does not change what the production
+`Dockerfile`/`docker-compose.production.yml` serve. Nothing in this
+repository makes Django serve the SPA in production yet.
 
 ### Cookies and CSRF settings
 

@@ -5,6 +5,7 @@ import { AccountMismatchBanner } from "../auth/AccountMismatchBanner";
 import { ExpiredSessionBanner } from "../auth/ExpiredSessionBanner";
 import { StorageWarningBanner } from "../auth/StorageWarningBanner";
 import { AccountStatus } from "./AccountStatus";
+import { AppUpdateBanner } from "./AppUpdateBanner";
 import { BottomNav } from "./BottomNav";
 import { LocalDataStatus } from "./LocalDataStatus";
 
@@ -30,6 +31,7 @@ export function AppLayout() {
         <StorageWarningBanner />
         <ExpiredSessionBanner />
         <AccountMismatchBanner />
+        <AppUpdateBanner />
         <LocalDataStatus />
         <AccountStatus />
         <Outlet />

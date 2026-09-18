@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router";
 
 import { App } from "./App";
+import { registerServiceWorker } from "./pwa/registerServiceWorker";
 import "./styles.css";
 
 const rootElement = document.getElementById("root");
@@ -17,3 +18,15 @@ createRoot(rootElement).render(
     </BrowserRouter>
   </StrictMode>,
 );
+
+// Registration happens after the first render and only once the page has loaded, so
+// it never competes with first paint. Restricting it to production builds keeps it
+// out of `vite dev` (which serves no `/sw.js`) and out of the jsdom test run.
+if (import.meta.env.PROD) {
+  window.addEventListener("load", () => {
+    // `register()` already resolves to `null` rather than rejecting, but the catch
+    // keeps a future change from turning a registration failure into an unhandled
+    // rejection at start-up.
+    void registerServiceWorker().catch(() => undefined);
+  });
+}

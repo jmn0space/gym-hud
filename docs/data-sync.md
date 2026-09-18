@@ -295,6 +295,42 @@ A successfully acknowledged mutation is removed from the pending local outbox.
 Its action receipt remains durable for retry deduplication. Failed mutations remain
 queued. The server acknowledgement exchange itself remains part of issue #13.
 
+## Service-worker updates and the outbox
+
+The application must never depend on background sync (step 5 above) to flush
+the outbox. The service-worker update policy is the complementary half of
+that same carefulness applied to the *code* the app runs, not just its
+queued mutations: a new service-worker version never forces a reload while
+there is local work it could interrupt.
+
+Concretely, a new worker version reaching `installed` while an existing
+controller is already active does not take over automatically. The page
+surfaces a non-blocking "update ready" notice and defers actually applying
+it — sending the worker `SKIP_WAITING` and reloading once the new one takes
+control — until both of the following hold:
+
+- no session is currently `ACTIVE` (as read from the same local repository
+  snapshot described under [Active-session recovery](#active-session-recovery));
+- the mutation outbox (`listPendingOutbox()`) is empty.
+
+While either is non-empty, the banner stays visible and explains that the
+update applies once the current session finishes, and the app keeps running
+on the previous worker version indefinitely — there is no timeout that
+forces the swap regardless. This means a long-running PAD session, or a
+mutation still waiting on triggers 1–4 above (particularly "restore
+connectivity" after an offline stretch), is never interrupted by a deploy:
+the update and the pending sync work wait for the same condition, for the
+same reason background sync itself is never load-bearing — the app's own
+foreground triggers, not anything running behind its back, are what the user
+can see and trust to eventually finish the job.
+
+This also means an update can sit pending indefinitely if the outbox is
+never drained (e.g. synchronization stays paused because `canSync` is false —
+see the sync gate below). That is intentional: an indefinitely-deferred
+*code* update is recoverable (the next reload picks up the new version
+regardless, once nothing is left to protect), while a forced reload that
+silently drops an in-progress bout or a queued mutation is not.
+
 ## Authentication and offline continuation
 
 The frontend uses Django session authentication (see [Architecture](architecture.md)).
