@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 import { Link } from "react-router";
 
 import { HealthStatus } from "../components/HealthStatus";
@@ -6,28 +6,27 @@ import { Page } from "../components/Page";
 import { ResumeCard } from "../components/ResumeCard";
 import { deriveActiveSessionSummaries } from "../local/activeSessions";
 import { useLocalData } from "../local/LocalDataProvider";
+import { useNow } from "../pad";
 import { routes } from "../routes";
 
 export function HomePage() {
   const { snapshot, status } = useLocalData();
-  const [now, setNow] = useState(() => Date.now());
+  // Whether any card carries a timer depends on the persisted records, not on the
+  // clock, so this is derived once per snapshot with a placeholder `now` rather
+  // than on every tick. A card with a timer means a session is running, and the
+  // clock then has to resynchronize after the phone was locked (see `useNow`),
+  // not merely tick while it happened to be awake.
+  const hasRunningTimer = useMemo(
+    () =>
+      snapshot !== null &&
+      deriveActiveSessionSummaries(snapshot, 0).some((session) => session.elapsedMs !== undefined),
+    [snapshot],
+  );
+  const now = useNow(hasRunningTimer);
   const persistedSessions = useMemo(
     () => (snapshot === null ? [] : deriveActiveSessionSummaries(snapshot, now)),
     [now, snapshot],
   );
-  const hasRunningTimer = persistedSessions.some((session) => session.elapsedMs !== undefined);
-
-  useEffect(() => {
-    if (!hasRunningTimer) {
-      return;
-    }
-    const timer = window.setInterval(() => {
-      setNow(Date.now());
-    }, 1000);
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, [hasRunningTimer]);
 
   return (
     <Page heading="Gym HUD" documentTitle="Gym HUD">

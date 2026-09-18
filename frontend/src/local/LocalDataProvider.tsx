@@ -18,7 +18,9 @@ import {
   RecordNotFoundError,
   StorageCorruptionError,
   type CommitReceipt,
+  type DomainStore,
   type LocalAction,
+  type LocalRecord,
   type LocalRepository,
   type OutboxEntry,
   type RecoverySnapshot,
@@ -68,6 +70,13 @@ export interface LocalDataContextValue extends LocalDataState {
    * have already moved past.
    */
   readLiveSnapshot: () => Promise<RecoverySnapshot>;
+  /**
+   * Full history for one store, through this provider's repository. The recovery
+   * snapshot is deliberately bounded to live ACTIVE state, so screens that need
+   * past sessions -- PAD settings inheritance from the previous completed session,
+   * History later -- read them here instead of opening a second connection.
+   */
+  listRecords: (store: DomainStore, includeDeleted?: boolean) => Promise<LocalRecord[]>;
   retry: () => Promise<void>;
   /** Clears a non-retryable error (conflict/invalid/corruption) once the user has seen it. */
   dismissError: () => void;
@@ -298,6 +307,10 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
 
   const listPendingOutbox = useCallback(() => repository.listPendingOutbox(), [repository]);
   const readLiveSnapshot = useCallback(() => repository.readSnapshot(), [repository]);
+  const listRecords = useCallback(
+    (store: DomainStore, includeDeleted?: boolean) => repository.listRecords(store, includeDeleted),
+    [repository],
+  );
 
   const retry = useCallback(async () => {
     const failedAction = failedActionRef.current;
@@ -372,8 +385,16 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
   }, [cancelPendingOperations, closeAfterUnmount, enqueue, readSnapshot, refreshPreservingStickyError]);
 
   const value = useMemo<LocalDataContextValue>(
-    () => ({ ...state, commitAction, listPendingOutbox, readLiveSnapshot, retry, dismissError }),
-    [commitAction, dismissError, listPendingOutbox, readLiveSnapshot, retry, state],
+    () => ({
+      ...state,
+      commitAction,
+      listPendingOutbox,
+      listRecords,
+      readLiveSnapshot,
+      retry,
+      dismissError,
+    }),
+    [commitAction, dismissError, listPendingOutbox, listRecords, readLiveSnapshot, retry, state],
   );
 
   return <LocalDataContext value={value}>{children}</LocalDataContext>;

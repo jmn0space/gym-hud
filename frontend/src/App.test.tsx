@@ -56,7 +56,6 @@ describe("navigation smoke test", () => {
   });
 
   it.each([
-    ["PAD", "PAD walking", "Not available yet"],
     ["Resistance", "Resistance training", "Not available yet"],
     ["Cardio", "Cardio machines", "Not available yet"],
     ["History", "History", "No history yet"],
@@ -79,6 +78,25 @@ describe("navigation smoke test", () => {
       expect(pageHeading).toHaveFocus();
     });
     expect(document.title).toBe(`${heading} · Gym HUD`);
+  });
+
+  it("navigates to PAD and offers the start screen", async () => {
+    const user = userEvent.setup();
+    renderApp();
+
+    await user.click((await primaryNav()).getByRole("link", { name: "PAD" }));
+
+    const pageHeading = screen.getByRole("heading", { level: 1, name: "PAD walking" });
+    expect(await screen.findByLabelText("Speed (km/h)")).toHaveValue(5);
+    expect(screen.getByRole("button", { name: "Start" })).toBeEnabled();
+    expect((await primaryNav()).getByRole("link", { name: "PAD" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    await waitFor(() => {
+      expect(pageHeading).toHaveFocus();
+    });
+    expect(document.title).toBe("PAD walking · Gym HUD");
   });
 
   it("leaves focus alone on first load", async () => {
@@ -104,6 +122,28 @@ describe("navigation smoke test", () => {
     await user.click(await screen.findByRole("link", { name: "PAD walking" }));
 
     expect(screen.getByRole("heading", { level: 1, name: "PAD walking" })).toBeInTheDocument();
+  });
+
+  it("walks Home → Start PAD → Start walking → Home and offers a Resume card", async () => {
+    const user = userEvent.setup();
+    const repository = createLocalRepository({
+      databaseName: `gym-hud-pad-end-to-end-${crypto.randomUUID()}`,
+    });
+    renderApp("/", repository);
+
+    await user.click(await screen.findByRole("link", { name: "PAD walking" }));
+    await user.click(await screen.findByRole("button", { name: "Start" }));
+    await user.click(await screen.findByRole("button", { name: "Start walking" }));
+    expect(await screen.findByText("Walking")).toBeInTheDocument();
+
+    await user.click((await primaryNav()).getByRole("link", { name: "Home" }));
+
+    expect(await screen.findByText("Walking · Bout 1")).toBeInTheDocument();
+    await user.click(screen.getByRole("link", { name: "Resume PAD Walking" }));
+    expect(await screen.findByText("Bout 1")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Finish session" })).toBeInTheDocument();
+
+    repository.close();
   });
 
   it("shows a not-found screen for unknown routes", async () => {
@@ -159,7 +199,7 @@ describe("navigation smoke test", () => {
       "href",
       "/pad",
     );
-    expect(screen.getByText("Paused")).toBeInTheDocument();
+    expect(screen.getByText("Paused · Bout 1")).toBeInTheDocument();
     expect(screen.getByText("02:00")).toBeInTheDocument();
     expect(screen.getByText("1 saved change waiting to sync. Server sync is not available yet."))
       .toBeInTheDocument();
