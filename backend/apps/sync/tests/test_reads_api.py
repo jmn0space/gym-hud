@@ -155,6 +155,26 @@ def test_the_feed_orders_changes_oldest_first_and_parents_first(
     ]
 
 
+def test_a_page_lists_a_parent_before_an_older_child(api: APIClient, device: Device) -> None:
+    """The session was edited after its bout was written: it still comes first on the page."""
+    start, session_id = device.start_session(at(0))
+    bout, _ = device.start_bout(session_id, at(1))
+    edit = device.edit(at(2), "walking_sessions", session_id, session_notes="hi")
+    assert statuses(push(api, device, start, bout, edit)) == ["applied"] * 3
+
+    page = api.get(CHANGES_URL).json()
+    assert [(c["store"], c["change_seq"]) for c in page["changes"]] == [
+        ("walking_sessions", 3),
+        ("walking_bouts", 2),
+    ]
+    assert (page["cursor"], page["has_more"]) == (3, False)
+
+    # Paging still follows change order: the bout's page cannot wait for its parent.
+    first = api.get(CHANGES_URL, {"limit": 1}).json()
+    assert [(c["store"], c["change_seq"]) for c in first["changes"]] == [("walking_bouts", 2)]
+    assert (first["cursor"], first["has_more"]) == (2, True)
+
+
 def test_the_feed_pages_on_mutation_boundaries(api: APIClient, device: Device) -> None:
     _session_with_history(api, device)
     whole = api.get(CHANGES_URL).json()["changes"]

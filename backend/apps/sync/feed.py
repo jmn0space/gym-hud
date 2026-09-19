@@ -6,7 +6,9 @@ committed, and one user's mutations commit strictly in counter order, so
 "everything with ``change_seq`` above my cursor" is exactly what a device has
 not seen yet. A row appears once, at its latest version -- tombstones included
 -- so a device that stores each returned record as-is converges on the
-server's state.
+server's state. Records carry only the fields the server models; fields a
+device keeps locally beyond those are not in them (docs/data-sync.md, "Pull:
+changes feed").
 """
 
 from __future__ import annotations
@@ -47,13 +49,18 @@ def _entry(spec: StoreSpec, row: SyncedRecord) -> dict[str, object]:
 
 
 def changes_since(user_id: int, since: int, limit: int) -> dict[str, object]:
-    """One page of records changed after ``since``, oldest change first.
+    """One page of records changed after ``since``, parents before children.
 
-    Pages end on a mutation boundary: rows sharing a ``change_seq`` were
-    written by one mutation and are never split across pages, so a page may
-    exceed ``limit`` by at most one mutation's changes. Within a mutation,
-    parents come before children. ``cursor`` is where the next request should
-    start, and ``has_more`` says whether it would return anything.
+    A page is every row whose ``change_seq`` lies in ``(since, cursor]``, and
+    it ends on a mutation boundary: rows sharing a ``change_seq`` were written
+    by one mutation and are never split across pages, so a page may exceed
+    ``limit`` by at most one mutation's changes. Which rows make a page is
+    decided in change order; the page is then listed parents first (by store
+    depth, then change order), so a child never precedes a parent that is on
+    the same page. A parent last changed *after* the page's cursor is on a
+    later page -- the client applies feed records without parent checks.
+    ``cursor`` is where the next request should start, and ``has_more`` says
+    whether it would return anything.
 
     The counter is read *before* the rows, and rows above it are left for the
     next page: a mutation committing mid-read can only be picked up later,
@@ -80,7 +87,6 @@ def changes_since(user_id: int, since: int, limit: int) -> dict[str, object]:
         for spec in specs:
             rows = spec.model._default_manager.filter(user_id=user_id, change_seq=cursor)
             page.extend((row.change_seq, spec.depth, str(row.pk), spec, row) for row in rows)
-        page.sort(key=lambda item: item[:3])
         has_more = any(
             spec.model._default_manager.filter(
                 user_id=user_id, change_seq__gt=cursor, change_seq__lte=high
@@ -90,6 +96,7 @@ def changes_since(user_id: int, since: int, limit: int) -> dict[str, object]:
         if not has_more:
             cursor = high
 
+    page.sort(key=lambda item: (item[1], item[0], item[2]))
     return {
         "changes": [_entry(spec, row) for _, _, _, spec, row in page],
         "cursor": cursor,
