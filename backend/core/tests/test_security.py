@@ -155,3 +155,35 @@ def test_audit_security_accepts_a_well_formed_login_throttle_rate(rate: str) -> 
         database_url="sqlite:///db.sqlite3",
         login_throttle_rate=rate,
     )
+
+
+# --- DJANGO_SYNC_THROTTLE_RATE gets the same startup check -------------------
+
+
+@pytest.mark.parametrize("rate", ["", "10", "10/fortnight", "0/min"])
+def test_audit_security_rejects_a_malformed_sync_throttle_rate(rate: str) -> None:
+    """A bad sync rate would 500 every /api/v1/sync/ request; it must fail at startup instead."""
+    with pytest.raises(ImproperlyConfigured, match="DJANGO_SYNC_THROTTLE_RATE"):
+        audit_security(
+            environment="local",
+            debug=True,
+            secret_key="insecure-local-development-key-do-not-use-in-production",
+            allowed_hosts=["localhost"],
+            csrf_trusted_origins=["http://localhost:5173"],
+            database_url="sqlite:///db.sqlite3",
+            login_throttle_rate="10/min",
+            sync_throttle_rate=rate,
+        )
+
+
+def test_audit_security_accepts_the_default_sync_throttle_rate() -> None:
+    audit_security(
+        environment="local",
+        debug=True,
+        secret_key="insecure-local-development-key-do-not-use-in-production",
+        allowed_hosts=["localhost"],
+        csrf_trusted_origins=["http://localhost:5173"],
+        database_url="sqlite:///db.sqlite3",
+        login_throttle_rate="10/min",
+        sync_throttle_rate="120/min",
+    )
