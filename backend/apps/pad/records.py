@@ -33,7 +33,6 @@ from apps.pad.models import (
 from apps.sync.models import SyncedRecord
 from apps.sync.protocol import (
     INVALID_RECORD,
-    INVALID_TIMING,
     Rejected,
     format_timestamp,
     read_choice,
@@ -60,8 +59,6 @@ def parse_walking_session(record: Mapping[str, object]) -> dict[str, object]:
         raise Rejected(INVALID_RECORD, "completed_at must be null while the session is ACTIVE.")
     if status != WalkingSessionStatus.ACTIVE and completed_at is None:
         raise Rejected(INVALID_RECORD, f"completed_at is required for a {status} session.")
-    if completed_at is not None and completed_at < started_at:
-        raise Rejected(INVALID_TIMING, "completed_at must not be before started_at.")
     return {
         "status": status,
         "started_at": started_at,
@@ -74,12 +71,12 @@ def parse_walking_session(record: Mapping[str, object]) -> dict[str, object]:
 
 
 def _interval(record: Mapping[str, object]) -> tuple[datetime, datetime | None]:
-    """``started_at`` and ``ended_at``; an absent ``ended_at`` means open, as locally."""
-    started_at = read_timestamp(record, "started_at")
-    ended_at = read_optional_timestamp(record, "ended_at")
-    if ended_at is not None and ended_at < started_at:
-        raise Rejected(INVALID_TIMING, "ended_at must not be before started_at.")
-    return started_at, ended_at
+    """``started_at`` and ``ended_at``; an absent ``ended_at`` means open, as locally.
+
+    An end before its start is not refused here: the engine clamps it
+    (``StoreSpec.interval``), because only a device clock stepping back makes one.
+    """
+    return read_timestamp(record, "started_at"), read_optional_timestamp(record, "ended_at")
 
 
 def parse_walking_bout(record: Mapping[str, object]) -> dict[str, object]:

@@ -8,11 +8,14 @@ exactly the interleavings that would apply a mutation twice or fail with a 500.
 
 SQLite serializes every writer on one database-wide lock and has no row locks,
 so there is nothing meaningful to prove there; the module is skipped unless
-``TEST_DATABASE_URL`` points at PostgreSQL (as it does in CI).
+``TEST_DATABASE_URL`` points at PostgreSQL. In CI (the ``CI`` environment
+variable is set) it must run, so there it *fails* instead of skipping: a
+misconfigured database URL cannot quietly drop these proofs.
 """
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections import Counter
@@ -22,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from django.conf import settings
 from django.contrib.auth.models import User
-from django.db import connections
+from django.db import connection, connections, transaction
 from rest_framework.test import APIClient
 
 from apps.pad.models import WalkingBout, WalkingSession
@@ -34,13 +37,34 @@ from apps.sync.tests.device import Device, at
 if TYPE_CHECKING:
     from rest_framework.response import _MonkeyPatchedResponse as Response
 
+_ON_POSTGRESQL = settings.DATABASES["default"]["ENGINE"] == "django.db.backends.postgresql"
+_IN_CI = bool(os.environ.get("CI"))
+
+#: Long enough for any request here; a thread still alive after it is a hang.
+_JOIN_TIMEOUT_SECONDS = 60
+
 pytestmark = [
     pytest.mark.django_db(transaction=True),
     pytest.mark.skipif(
-        settings.DATABASES["default"]["ENGINE"] != "django.db.backends.postgresql",
+        not _ON_POSTGRESQL and not _IN_CI,
         reason="needs PostgreSQL: row locks and truly concurrent connections",
     ),
 ]
+
+
+@pytest.fixture(autouse=True)
+def _require_postgresql_in_ci() -> None:
+    if not _ON_POSTGRESQL:
+        pytest.fail("CI must run the concurrency proofs on PostgreSQL; set TEST_DATABASE_URL.")
+
+
+def _join_all(threads: Sequence[threading.Thread]) -> None:
+    """Wait for every thread, and fail loudly rather than flush the database under one."""
+    deadline = time.monotonic() + _JOIN_TIMEOUT_SECONDS
+    for thread in threads:
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    stuck = [thread.name for thread in threads if thread.is_alive()]
+    assert not stuck, f"threads still running after {_JOIN_TIMEOUT_SECONDS}s: {stuck}"
 
 
 @pytest.fixture(autouse=True)
@@ -78,8 +102,7 @@ def _post_concurrently(requests: Sequence[tuple[User, dict[str, Any]]]) -> list[
     ]
     for thread in threads:
         thread.start()
-    for thread in threads:
-        thread.join(timeout=30)
+    _join_all(threads)
     assert not errors, errors
     finished = [response for response in responses if response is not None]
     assert len(finished) == len(requests)
@@ -126,21 +149,21 @@ def test_a_retry_racing_the_original_batch_applies_each_mutation_once(
 
 
 def test_two_devices_racing_for_the_active_session_slot(user: User) -> None:
+    """Whichever commits second supersedes the first: one ACTIVE, one closed, no 500."""
     phone, tablet = Device(), Device()
     phone_start, _ = phone.start_session(at(0))
-    tablet_start, _ = tablet.start_session(at(0))
+    tablet_start, _ = tablet.start_session(at(1))
 
     responses = _post_concurrently(
         [(user, _batch(phone, phone_start)), (user, _batch(tablet, tablet_start))]
     )
 
-    outcomes = sorted(
-        (item["status"], item.get("code"))
-        for response in responses
-        for item in response.json()["results"]
-    )
-    assert outcomes == [("applied", None), ("rejected", "active_conflict")]
+    assert _statuses(responses) == Counter({"applied": 2})
     assert WalkingSession.objects.filter(status="ACTIVE").count() == 1
+    assert WalkingSession.objects.filter(status="COMPLETED").count() == 1
+    assert SyncState.objects.get(user=user).change_seq == 2
+    superseding = [m for m in ProcessedMutation.objects.all() if "superseded" in m.detail]
+    assert len(superseding) == 1
 
 
 def test_two_accounts_racing_on_one_mutation_id(user: User, other_user: User) -> None:
@@ -188,3 +211,40 @@ def test_concurrent_deletion_replay_and_stale_edit_leave_one_tombstone(
     assert bout_row.deleted_at == at(3)  # whichever order they committed in
     assert WalkingBout.objects.count() == 1
     assert ProcessedMutation.objects.count() == 4
+
+
+def test_a_mutation_stuck_behind_a_held_lock_is_retried_not_failed(
+    user: User, device: Device, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """lock_timeout bounds the wait on the account lock; the answer is ``retry``, not a 500."""
+    monkeypatch.setattr(engine, "LOCK_TIMEOUT_MS", 200)
+    start, session_id = device.start_session(at(0))
+    SyncState.objects.get_or_create(user=user)
+    locked = threading.Event()
+    release = threading.Event()
+
+    def hold_the_account_lock() -> None:
+        try:
+            with transaction.atomic():
+                SyncState.objects.select_for_update().get(user=user)
+                locked.set()
+                release.wait(timeout=_JOIN_TIMEOUT_SECONDS)
+        finally:
+            connection.close()
+
+    holder = threading.Thread(target=hold_the_account_lock, name="lock-holder")
+    holder.start()
+    try:
+        assert locked.wait(timeout=10)
+        client = APIClient()
+        client.force_login(user)
+        response = client.post(MUTATIONS_URL, _batch(device, start), format="json")
+    finally:
+        release.set()
+        _join_all([holder])
+
+    assert response.status_code == 200, response.content
+    [result] = response.json()["results"]
+    assert (result["status"], result["code"]) == ("retry", "temporarily_unavailable")
+    assert not WalkingSession.objects.filter(pk=session_id).exists()
+    assert not ProcessedMutation.objects.exists()

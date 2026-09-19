@@ -16,8 +16,23 @@ protocol"):
 
 from __future__ import annotations
 
+import uuid
+
 from django.conf import settings
 from django.db import models
+
+#: ``last_client_id`` of a row the server itself last wrote -- a session it
+#: closed to make room for a newer one, or one an administrator discarded. No
+#: device has this id (``crypto.randomUUID()`` never returns the nil UUID), so
+#: a device's next put to such a row is never judged stale against it.
+SERVER_CLIENT_ID = uuid.UUID(int=0)
+
+#: The most canonical envelope text the ledger keeps. The fingerprint always
+#: covers the whole envelope; only the copy kept for reading is cut. A real
+#: PAD mutation is a few kilobytes -- only a delete of a very long session
+#: comes near this -- so it bounds what an unknown-field-stuffed envelope can
+#: make the ledger store, not what an actual workout records.
+MAX_LEDGER_ENVELOPE_CHARS = 64 * 1024
 
 
 class SyncedRecord(models.Model):
@@ -100,7 +115,14 @@ class ProcessedMutation(models.Model):
     ``mutation_id_conflict``, never a second application. The envelope is kept
     as text rather than ``jsonb`` so it is exactly the text that was hashed,
     and so a string holding ``\\u0000`` (which ``jsonb`` refuses) can still be
-    recorded as rejected instead of failing the request forever.
+    recorded instead of failing the request forever. Only its first
+    :data:`MAX_LEDGER_ENVELOPE_CHARS` characters are kept (``envelope_truncated``
+    says when it was cut); the fingerprint, and with it duplicate detection,
+    always covers the whole envelope.
+
+    Rows the server writes on its own behalf -- an administrator discarding a
+    stuck session -- are recorded here too, with a server-generated
+    ``mutation_id``, ``client_id`` :data:`SERVER_CLIENT_ID` and no ``sequence``.
     """
 
     class Status(models.TextChoices):
@@ -122,6 +144,7 @@ class ProcessedMutation(models.Model):
     detail = models.TextField()
     change_seq = models.BigIntegerField(null=True, blank=True)
     envelope = models.TextField()
+    envelope_truncated = models.BooleanField(default=False)
     processed_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -135,6 +158,8 @@ class ProcessedMutation(models.Model):
         ]
         indexes = [
             models.Index(fields=["user", "processed_at"], name="sync_mutation_user_time"),
+            # The highest sequence processed per device, for the out-of-order warning.
+            models.Index(fields=["user", "client_id", "sequence"], name="sync_mutation_device_seq"),
         ]
 
     def __str__(self) -> str:

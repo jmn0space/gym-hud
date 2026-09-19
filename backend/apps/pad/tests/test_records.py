@@ -123,22 +123,20 @@ def test_other_offsets_are_normalized_to_utc() -> None:
         ({"started_at": 1757844000000}, "invalid_record", "started_at"),
         ({"completed_at": "2026-09-14T10:40:00.000Z"}, "invalid_record", "completed_at"),
         ({"status": "COMPLETED"}, "invalid_record", "completed_at"),
-        (
-            {"status": "COMPLETED", "completed_at": "2026-09-14T09:59:59.999Z"},
-            "invalid_timing",
-            "completed_at",
-        ),
+        # Valid literals whose UTC instant falls outside what a datetime holds.
+        ({"started_at": "0001-01-01T00:00:00+01:00"}, "invalid_record", "started_at"),
+        ({"started_at": "9999-12-31T23:00:00-05:00"}, "invalid_record", "started_at"),
         ({"speed_kmh": 0}, "invalid_record", "speed_kmh"),
         ({"speed_kmh": -5}, "invalid_record", "speed_kmh"),
         ({"speed_kmh": "5"}, "invalid_record", "speed_kmh"),
         ({"speed_kmh": True}, "invalid_record", "speed_kmh"),
         ({"speed_kmh": math.inf}, "invalid_record", "speed_kmh"),
+        ({"speed_kmh": 10**400}, "invalid_record", "speed_kmh"),  # beyond any double
         ({"incline_pct": -0.5}, "invalid_record", "incline_pct"),
         ({"max_bout_seconds": 0}, "invalid_record", "max_bout_seconds"),
         ({"max_bout_seconds": 480.5}, "invalid_record", "max_bout_seconds"),
         ({"max_bout_seconds": 2**53}, "invalid_record", "max_bout_seconds"),
         ({"session_notes": 42}, "invalid_record", "session_notes"),
-        ({"session_notes": "nul\x00byte"}, "invalid_record", "session_notes"),
     ],
 )
 def test_invalid_session_state_is_rejected(
@@ -209,7 +207,6 @@ def test_every_stop_reason_is_accepted(reason: str) -> None:
         ({"bout_number": 0}, "invalid_record", "bout_number"),
         ({"bout_number": 2**31}, "invalid_record", "bout_number"),
         ({"bout_number": None}, "invalid_record", "bout_number"),
-        ({"ended_at": "2026-09-14T10:00:59.999Z"}, "invalid_timing", "ended_at"),
         ({"notes": ["not", "text"]}, "invalid_record", "notes"),
     ],
 )
@@ -218,6 +215,23 @@ def test_invalid_bout_state_is_rejected(overrides: dict[str, Any], code: str, fi
 
     assert rejected.code == code
     assert field in rejected.detail
+
+
+def test_free_text_is_made_storable_rather_than_refused() -> None:
+    """NUL is dropped and a lone surrogate becomes U+FFFD: the notes survive either way."""
+    values = parse_walking_session(_session(session_notes="nul\x00byte \ud800 ok"))
+
+    assert values["session_notes"] == "nulbyte \ufffd ok"
+    assert parse_walking_bout(_bout(notes="\x00"))["notes"] == ""
+
+
+def test_an_end_before_its_start_is_left_for_the_engine_to_clamp() -> None:
+    """A clock step is not a parse error; ``StoreSpec.interval`` clamps it."""
+    values = parse_walking_bout(_bout(ended_at="2026-09-14T10:00:59.999Z"))
+
+    ended_at, started_at = values["ended_at"], values["started_at"]
+    assert isinstance(ended_at, datetime) and isinstance(started_at, datetime)
+    assert ended_at < started_at
 
 
 def test_an_instant_bout_is_valid() -> None:
@@ -252,7 +266,6 @@ def test_a_pause_or_rest_parses() -> None:
     [
         ({"walking_bout_id": "nope"}, "invalid_record"),
         ({"started_at": None}, "invalid_record"),
-        ({"ended_at": "2026-09-14T10:02:00.000Z"}, "invalid_timing"),
     ],
 )
 def test_an_invalid_pause_or_rest_is_rejected(overrides: dict[str, Any], code: str) -> None:

@@ -208,7 +208,7 @@ def test_registering_is_idempotent_but_names_stay_unique() -> None:
     impostor = SyncDomain(
         name="pad",
         stores=(),
-        check_mutation=lambda written: None,
+        check_mutation=lambda ctx, written: None,
         bootstrap=lambda user_id: {},
         integrity_details={},
     )
@@ -219,7 +219,7 @@ def test_registering_is_idempotent_but_names_stay_unique() -> None:
             SyncDomain(
                 name="pad-copy",
                 stores=PAD_DOMAIN.stores,
-                check_mutation=lambda written: None,
+                check_mutation=lambda ctx, written: None,
                 bootstrap=lambda user_id: {},
                 integrity_details={},
             )

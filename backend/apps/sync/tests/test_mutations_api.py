@@ -10,6 +10,8 @@ the frontend repository does.
 from __future__ import annotations
 
 import copy
+import json
+import logging
 import uuid
 from typing import Any
 
@@ -22,7 +24,8 @@ from rest_framework.test import APIClient
 from rest_framework.throttling import ScopedRateThrottle
 
 from apps.pad.models import WalkingBout, WalkingBoutPause, WalkingRest, WalkingSession
-from apps.sync.models import ProcessedMutation, SyncState
+from apps.sync import engine
+from apps.sync.models import MAX_LEDGER_ENVELOPE_CHARS, ProcessedMutation, SyncState
 from apps.sync.tests.conftest import MUTATIONS_URL, codes, push, results, statuses
 from apps.sync.tests.device import Device, at, iso, new_id
 
@@ -449,14 +452,14 @@ def test_finish_bout_and_start_rest_roll_back_together(api: APIClient, device: D
     start, session_id = device.start_session(at(0))
     bout, bout_id = device.start_bout(session_id, at(1))
     assert statuses(push(api, device, start, bout)) == ["applied", "applied"]
-    finish_bout, rest_id = device.finish_bout(bout_id, at(9))
-    rest_change = next(c for c in finish_bout["changes"] if c["store"] == "walking_rests")
-    rest_change["record"]["started_at"] = iso(at(8))  # before the bout ended
+    finish_bout, rest_id = device.finish_bout(bout_id, at(9), stop_reason="MAX_DURATION")
+    bout_change = next(c for c in finish_bout["changes"] if c["store"] == "walking_bouts")
+    bout_change["record"]["ended_at"] = None  # the rest now belongs to a bout still walking
 
     response = push(api, device, finish_bout)
 
-    assert codes(response) == ["invalid_timing"]
-    assert WalkingBout.objects.get(pk=bout_id).ended_at is None
+    assert codes(response) == ["invalid_transition"]
+    assert WalkingBout.objects.get(pk=bout_id).stop_reason is None  # the bout write rolled back
     assert not WalkingRest.objects.filter(pk=rest_id).exists()
 
 
@@ -466,10 +469,10 @@ def test_close_rest_and_start_next_roll_back_together(api: APIClient, device: De
     finish_bout, rest_id = device.finish_bout(bout_id, at(9))
     assert statuses(push(api, device, start, bout, finish_bout)) == ["applied"] * 3
     next_bout, next_id = device.start_next_bout(rest_id, at(12))
-    bout_change = next(c for c in next_bout["changes"] if c["store"] == "walking_bouts")
-    bout_change["record"]["started_at"] = iso(at(-1))  # before its session started
+    rest_change = next(c for c in next_bout["changes"] if c["store"] == "walking_rests")
+    rest_change["record"]["walking_bout_id"] = new_id()  # fails after the new bout is written
 
-    assert codes(push(api, device, next_bout)) == ["invalid_timing"]
+    assert codes(push(api, device, next_bout)) == ["invalid_transition"]
     assert WalkingRest.objects.get(pk=rest_id).ended_at is None
     assert not WalkingBout.objects.filter(pk=next_id).exists()
 
@@ -522,14 +525,59 @@ def _active_session(api: APIClient, device: Device) -> tuple[str, str]:
     return session_id, bout_id
 
 
-def test_a_second_active_session_is_refused(api: APIClient, device: Device) -> None:
-    _active_session(api, device)
-    second, _ = device.start_session(at(3))
+def test_a_new_session_supersedes_a_stuck_active_one(
+    api: APIClient, user: User, device: Device
+) -> None:
+    """The phone never synced its finish; the tablet's new session closes it on the server."""
+    session_id, bout_id = _active_session(api, device)
+    pause, pause_id = device.pause(bout_id, at(4))
+    assert statuses(push(api, device, pause)) == ["applied"]
+    cursor = _cursor(user)
+    tablet = Device()
+    second, second_id = tablet.start_session(at(30))
 
-    response = push(api, device, second)
+    response = push(api, tablet, second)
+
+    assert statuses(response) == ["applied"]
+    stuck = WalkingSession.objects.get(pk=session_id)
+    assert (stuck.status, stuck.completed_at) == ("COMPLETED", at(4))  # its last sign of life
+    assert WalkingBout.objects.get(pk=bout_id).ended_at == at(4)
+    assert WalkingBoutPause.objects.get(pk=pause_id).ended_at == at(4)
+    assert WalkingSession.objects.get(pk=second_id).status == "ACTIVE"
+    # One mutation, one counter value, on every row the server changed.
+    assert _cursor(user) == cursor + 1
+    for row in (stuck, WalkingBout.objects.get(pk=bout_id)):
+        assert row.change_seq == cursor + 1
+    detail = ProcessedMutation.objects.get(mutation_id=second["mutation_id"]).detail
+    assert f"superseded walking_sessions/{session_id}" in detail
+
+
+def test_the_superseded_device_s_own_finish_still_lands(api: APIClient, device: Device) -> None:
+    """The server's closure is a stand-in: the owning device's finish replaces it."""
+    session_id, bout_id = _active_session(api, device)
+    finish = device.finish_session(session_id, at(20), status="DISCARDED")
+    tablet = Device()
+    second, _ = tablet.start_session(at(30))
+    assert statuses(push(api, tablet, second)) == ["applied"]
+
+    assert statuses(push(api, device, finish)) == ["applied"]
+    session = WalkingSession.objects.get(pk=session_id)
+    assert (session.status, session.completed_at) == ("DISCARDED", at(20))
+    assert WalkingBout.objects.get(pk=bout_id).ended_at == at(20)
+
+
+def test_two_active_sessions_in_one_mutation_are_an_active_conflict(
+    api: APIClient, device: Device
+) -> None:
+    first = device.start_session(at(0))[0]["changes"][0]["record"]
+    second = device.start_session(at(1))[0]["changes"][0]["record"]
+    both = device.commit(at(2), puts=[("walking_sessions", first), ("walking_sessions", second)])
+
+    response = push(api, device, both)
     assert codes(response) == ["active_conflict"]
     if connection.vendor == "postgresql":  # SQLite does not name the violated index
         assert results(response)[0]["detail"] == "Another walking session is already ACTIVE."
+    assert not WalkingSession.objects.exists()
 
 
 def test_a_second_open_bout_is_refused(api: APIClient, device: Device) -> None:
@@ -555,32 +603,59 @@ def test_a_second_rest_for_one_bout_is_refused(api: APIClient, device: Device) -
     ]
 
 
-def test_a_pause_cannot_be_open_in_an_ended_bout(api: APIClient, device: Device) -> None:
+def test_a_pause_left_open_in_an_ended_bout_is_clamped_into_it(
+    api: APIClient, device: Device
+) -> None:
     session_id, bout_id = _active_session(api, device)
     finish_bout, _ = device.finish_bout(bout_id, at(9))
     assert statuses(push(api, device, finish_bout)) == ["applied"]
-    late_pause, _ = device.pause(bout_id, at(10))
+    late_pause, pause_id = device.pause(bout_id, at(10))
 
-    assert codes(push(api, device, late_pause)) == ["invalid_timing"]
+    assert statuses(push(api, device, late_pause)) == ["applied"]
+    pause = WalkingBoutPause.objects.get(pk=pause_id)
+    assert (pause.started_at, pause.ended_at) == (at(9), at(9))
+    detail = ProcessedMutation.objects.get(mutation_id=late_pause["mutation_id"]).detail
+    assert f"walking_pauses/{pause_id} started_at" in detail
+    assert "clamped" in detail
 
 
-def test_a_bout_cannot_be_open_in_a_finished_session(api: APIClient, device: Device) -> None:
+def test_a_bout_started_in_a_finished_session_is_clamped_into_it(
+    api: APIClient, device: Device
+) -> None:
     session_id, _ = _active_session(api, device)
     assert statuses(push(api, device, device.finish_session(session_id, at(5)))) == ["applied"]
-    late_bout, _ = device.start_bout(session_id, at(6))
+    late_bout, late_id = device.start_bout(session_id, at(6))
 
-    assert codes(push(api, device, late_bout)) == ["invalid_timing"]
+    assert statuses(push(api, device, late_bout)) == ["applied"]
+    bout = WalkingBout.objects.get(pk=late_id)
+    assert (bout.started_at, bout.ended_at) == (at(5), at(5))
 
 
-@pytest.mark.parametrize("new_status", ["ACTIVE", "DISCARDED"])
-def test_a_finished_session_stays_finished(api: APIClient, device: Device, new_status: str) -> None:
+def test_a_finished_session_is_not_reopened_but_the_edit_lands(
+    api: APIClient, device: Device
+) -> None:
+    """Another device still thinks the session is ACTIVE: its notes apply, the closure stays."""
+    session_id, _ = _active_session(api, device)
+    tablet = Device()
+    tablet.records = copy.deepcopy(device.records)
+    assert statuses(push(api, device, device.finish_session(session_id, at(5)))) == ["applied"]
+    stale_view = tablet.edit(at(6), "walking_sessions", session_id, session_notes="felt good")
+
+    assert statuses(push(api, tablet, stale_view)) == ["applied"]
+    session = WalkingSession.objects.get(pk=session_id)
+    assert (session.status, session.completed_at) == ("COMPLETED", at(5))
+    assert session.session_notes == "felt good"
+    detail = ProcessedMutation.objects.get(mutation_id=stale_view["mutation_id"]).detail
+    assert "kept COMPLETED" in detail
+
+
+def test_a_completed_session_does_not_become_discarded(api: APIClient, device: Device) -> None:
     session_id, _ = _active_session(api, device)
     assert statuses(push(api, device, device.finish_session(session_id, at(5)))) == ["applied"]
-    fields: dict[str, Any] = {"status": new_status}
-    if new_status == "ACTIVE":
-        fields["completed_at"] = None
 
-    response = push(api, device, device.edit(at(6), "walking_sessions", session_id, **fields))
+    response = push(
+        api, device, device.edit(at(6), "walking_sessions", session_id, status="DISCARDED")
+    )
     assert codes(response) == ["invalid_transition"]
     assert WalkingSession.objects.get(pk=session_id).status == "COMPLETED"
 
@@ -601,46 +676,70 @@ def test_a_missing_parent_is_parent_not_found(api: APIClient, device: Device) ->
     assert codes(push(api, device, orphan)) == ["parent_not_found"]
 
 
-def test_a_parent_cannot_be_deleted_under_live_children(api: APIClient, device: Device) -> None:
-    session_id, bout_id = _active_session(api, device)
-    pause, _ = device.pause(bout_id, at(2))
-    assert statuses(push(api, device, pause)) == ["applied"]
-    only_the_bout = device.commit(at(3), deletes=[("walking_bouts", bout_id)])
+def test_deleting_a_parent_takes_the_children_it_did_not_list(
+    api: APIClient, user: User, device: Device
+) -> None:
+    """Another device added a bout and a pause; deleting the session removes them too."""
+    start, session_id = device.start_session(at(0))
+    assert statuses(push(api, device, start)) == ["applied"]
+    tablet = Device()
+    tablet.records = copy.deepcopy(device.records)
+    bout, bout_id = tablet.start_bout(session_id, at(1))
+    pause, pause_id = tablet.pause(bout_id, at(2))
+    assert statuses(push(api, tablet, bout, pause)) == ["applied", "applied"]
+    delete = device.commit(at(3), deletes=[("walking_sessions", session_id)])
 
-    assert codes(push(api, device, only_the_bout)) == ["invalid_transition"]
-    assert WalkingBout.objects.get(pk=bout_id).deleted_at is None
+    assert statuses(push(api, device, delete)) == ["applied"]
+    cursor = _cursor(user)
+    for model, pk in (
+        (WalkingSession, session_id),
+        (WalkingBout, bout_id),
+        (WalkingBoutPause, pause_id),
+    ):
+        row = model.objects.get(pk=pk)
+        assert (row.deleted_at, row.change_seq) == (at(3), cursor)
+        assert str(row.last_client_id) == device.client_id
+    detail = ProcessedMutation.objects.get(mutation_id=delete["mutation_id"]).detail
+    assert f"deleted walking_pauses/{pause_id}" in detail
 
 
 # --- Timestamp ordering and containment -------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    ("store_field", "value_minutes"),
+    ("field", "value_minutes", "expected"),
     [
-        (("walking_bouts", "ended_at"), 0.5),  # before the bout started (at 1)
-        (("walking_bouts", "started_at"), -1),  # before the session started (at 0)
+        ("ended_at", 0.5, ("started_at", at(1))),  # before the bout started (at 1)
+        ("started_at", -1, ("started_at", at(0))),  # before the session started (at 0)
     ],
 )
-def test_bad_bout_timing_is_invalid_timing(
-    api: APIClient, device: Device, store_field: tuple[str, str], value_minutes: float
+def test_bout_timing_inversions_are_clamped(
+    api: APIClient, device: Device, field: str, value_minutes: float, expected: tuple[str, Any]
 ) -> None:
     session_id, bout_id = _active_session(api, device)
-    store, field = store_field
-    edit = device.edit(at(2), store, bout_id, **{field: iso(at(value_minutes))})
+    edit = device.edit(at(2), "walking_bouts", bout_id, **{field: iso(at(value_minutes))})
 
-    assert codes(push(api, device, edit)) == ["invalid_timing"]
+    assert statuses(push(api, device, edit)) == ["applied"]
+    bout = WalkingBout.objects.get(pk=bout_id)
+    expected_field, expected_value = expected
+    assert getattr(bout, expected_field) == expected_value
+    if field == "ended_at":
+        assert bout.ended_at == bout.started_at
 
 
-def test_a_session_cannot_close_before_its_children_end(api: APIClient, device: Device) -> None:
+def test_children_are_clamped_to_a_session_that_closed_earlier(
+    api: APIClient, device: Device
+) -> None:
     session_id, bout_id = _active_session(api, device)
-    finish_bout, _ = device.finish_bout(bout_id, at(9))
+    finish_bout, rest_id = device.finish_bout(bout_id, at(9))
     assert statuses(push(api, device, finish_bout)) == ["applied"]
     finish = device.finish_session(session_id, at(12))
     session_change = next(c for c in finish["changes"] if c["store"] == "walking_sessions")
     session_change["record"]["completed_at"] = iso(at(10))  # the rest closes at 12
 
-    assert codes(push(api, device, finish)) == ["invalid_timing"]
-    assert WalkingSession.objects.get(pk=session_id).status == "ACTIVE"
+    assert statuses(push(api, device, finish)) == ["applied"]
+    assert WalkingSession.objects.get(pk=session_id).status == "COMPLETED"
+    assert WalkingRest.objects.get(pk=rest_id).ended_at == at(10)
 
 
 def test_a_time_correction_is_judged_on_the_finished_state(api: APIClient, device: Device) -> None:
@@ -650,11 +749,6 @@ def test_a_time_correction_is_judged_on_the_finished_state(api: APIClient, devic
     resume = device.resume(pause_id, at(8))
     finish_bout, rest_id = device.finish_bout(bout_id, at(20))
     assert statuses(push(api, device, pause, resume, finish_bout)) == ["applied"] * 3
-
-    # The bout really ended at 7, mid-pause: alone, that leaves the pause outside it.
-    alone = device.edit(at(21), "walking_bouts", bout_id, ended_at=iso(at(7)))
-    assert codes(push(api, device, alone)) == ["invalid_timing"]
-    assert WalkingBout.objects.get(pk=bout_id).ended_at == at(20)
 
     corrected = device.commit(
         at(22),
@@ -667,6 +761,12 @@ def test_a_time_correction_is_judged_on_the_finished_state(api: APIClient, devic
     assert WalkingBout.objects.get(pk=bout_id).ended_at == at(7)
     assert WalkingBoutPause.objects.get(pk=pause_id).ended_at == at(7)
     assert WalkingRest.objects.get(pk=rest_id).started_at == at(20)
+    assert ProcessedMutation.objects.get(mutation_id=corrected["mutation_id"]).detail == "Applied."
+
+    # The bout's end alone, moved into the pause: the pause is clamped to it.
+    alone = device.edit(at(23), "walking_bouts", bout_id, ended_at=iso(at(6.5)))
+    assert statuses(push(api, device, alone)) == ["applied"]
+    assert WalkingBoutPause.objects.get(pk=pause_id).ended_at == at(6.5)
 
 
 # --- Deletes, undo, and "latest explicit edit wins" ---------------------------------------
@@ -785,3 +885,240 @@ def test_another_account_cannot_touch_or_see_these_records(
     assert WalkingBout.objects.get(pk=bout_id).deleted_at is None
     assert WalkingBout.objects.count() == 1
     assert other_api.get("/api/v1/sync/changes/").json()["changes"] == []
+
+
+# --- Tombstones win, across devices -----------------------------------------------------
+
+
+def test_a_put_from_another_device_never_revives_a_tombstone(
+    api: APIClient, device: Device
+) -> None:
+    session_id, bout_id = _active_session(api, device)
+    tablet = Device()
+    tablet.records = copy.deepcopy(device.records)
+    assert statuses(push(api, device, device.delete_bout(bout_id, at(3)))) == ["applied"]
+    late_edit = tablet.edit(at(4), "walking_bouts", bout_id, pain_min=3, pain_max=3)
+    late_pause, pause_id = tablet.pause(bout_id, at(5))
+
+    assert statuses(push(api, tablet, late_edit, late_pause)) == ["applied", "applied"]
+    bout = WalkingBout.objects.get(pk=bout_id)
+    assert (bout.deleted_at, bout.pain_min) == (at(3), None)
+    assert not WalkingBoutPause.objects.filter(pk=pause_id).exists()
+    ledger = ProcessedMutation.objects.get(mutation_id=late_edit["mutation_id"])
+    assert f"skipped walking_bouts/{bout_id}: deleted by another device" in ledger.detail
+    ledger = ProcessedMutation.objects.get(mutation_id=late_pause["mutation_id"])
+    assert "its parent was deleted by another device" in ledger.detail
+
+
+def test_only_the_deleting_device_can_undo_a_delete(api: APIClient, device: Device) -> None:
+    """The other direction: the tablet deletes; the phone cannot revive it, the tablet can."""
+    session_id, bout_id = _active_session(api, device)
+    tablet = Device()
+    tablet.records = copy.deepcopy(device.records)
+    before = tablet.record("walking_bouts", bout_id)
+    assert statuses(push(api, tablet, tablet.delete_bout(bout_id, at(3)))) == ["applied"]
+
+    phone_restore = device.restore(at(4), "walking_bouts", device.record("walking_bouts", bout_id))
+    assert statuses(push(api, device, phone_restore)) == ["applied"]
+    assert WalkingBout.objects.get(pk=bout_id).deleted_at == at(3)
+
+    tablet_undo = tablet.restore(at(5), "walking_bouts", before)
+    assert statuses(push(api, tablet, tablet_undo)) == ["applied"]
+    assert WalkingBout.objects.get(pk=bout_id).deleted_at is None
+
+
+# --- Clock steps are clamped, never refused -----------------------------------------------
+
+
+def test_a_clock_step_back_does_not_strand_the_rest_of_the_queue(
+    api: APIClient, device: Device
+) -> None:
+    """The finish is stamped before the bout started; nothing behind it is lost."""
+    start, session_id = device.start_session(at(10))
+    bout, bout_id = device.start_bout(session_id, at(11))
+    finish = device.finish_session(session_id, at(9))  # the clock stepped back two minutes
+    next_start, next_id = device.start_session(at(20))
+
+    assert statuses(push(api, device, start, bout, finish, next_start)) == ["applied"] * 4
+    session = WalkingSession.objects.get(pk=session_id)
+    assert (session.status, session.completed_at) == ("COMPLETED", at(10))
+    bout_row = WalkingBout.objects.get(pk=bout_id)
+    assert (bout_row.started_at, bout_row.ended_at) == (at(10), at(10))
+    assert WalkingSession.objects.get(pk=next_id).status == "ACTIVE"
+    detail = ProcessedMutation.objects.get(mutation_id=finish["mutation_id"]).detail
+    assert f"walking_sessions/{session_id} completed_at" in detail
+
+
+def test_clamps_are_deterministic(api: APIClient, other_api: APIClient) -> None:
+    """The same inverted history, sent by two accounts, is stored identically."""
+    stored = []
+    for client in (api, other_api):
+        device = Device()
+        start, session_id = device.start_session(at(10))
+        bout, bout_id = device.start_bout(session_id, at(9.5))
+        finish = device.finish_session(session_id, at(9))
+        assert statuses(push(client, device, start, bout, finish)) == ["applied"] * 3
+        row = WalkingBout.objects.get(pk=bout_id)
+        session = WalkingSession.objects.get(pk=session_id)
+        stored.append((row.started_at, row.ended_at, session.completed_at))
+    assert stored[0] == stored[1] == (at(10), at(10), at(10))
+
+
+# --- Malformed values: answered, never a 500 --------------------------------------------------
+
+
+def _post_raw(api: APIClient, device: Device, *envelopes: dict[str, Any]) -> Any:
+    """POST through ``json.dumps``: ASCII escapes, so lone surrogates and huge integers survive."""
+    body = json.dumps({"client_id": device.client_id, "mutations": list(envelopes)})
+    return api.post(MUTATIONS_URL, data=body, content_type="application/json")
+
+
+@pytest.mark.parametrize("created_at", ["0001-01-01T00:00:00+01:00", "9999-12-31T23:00:00-05:00"])
+def test_an_out_of_range_envelope_timestamp_is_invalid_envelope(
+    api: APIClient, device: Device, created_at: str
+) -> None:
+    start, _ = device.start_session(at(0))
+    start["created_at"] = created_at
+
+    assert codes(push(api, device, start)) == ["invalid_envelope"]
+    assert ProcessedMutation.objects.get().code == "invalid_envelope"
+
+
+def test_an_out_of_range_record_timestamp_is_invalid_record(api: APIClient, device: Device) -> None:
+    start, _ = device.start_session(at(0))
+    start["changes"][0]["record"]["started_at"] = "9999-12-31T23:00:00-05:00"
+
+    assert codes(push(api, device, start)) == ["invalid_record"]
+    assert ProcessedMutation.objects.get().code == "invalid_record"
+
+
+def test_a_number_beyond_any_double_is_invalid_record(api: APIClient, device: Device) -> None:
+    start, _ = device.start_session(at(0))
+    start["changes"][0]["record"]["speed_kmh"] = 10**400
+
+    assert codes(_post_raw(api, device, start)) == ["invalid_record"]
+    assert ProcessedMutation.objects.get().code == "invalid_record"
+
+
+def test_free_text_with_nul_or_a_lone_surrogate_is_kept(api: APIClient, device: Device) -> None:
+    start, session_id = device.start_session(at(0))
+    start["changes"][0]["record"]["session_notes"] = "x\ud800y\x00z"
+
+    assert statuses(_post_raw(api, device, start)) == ["applied"]
+    assert WalkingSession.objects.get(pk=session_id).session_notes == "x�yz"
+
+
+def test_lone_surrogates_in_identity_fields_are_answered_not_500(
+    api: APIClient, device: Device
+) -> None:
+    broken_id, _ = device.start_session(at(0))
+    broken_id["mutation_id"] = "\ud800"
+    odd_store, _ = device.start_session(at(1))
+    odd_store["changes"][0]["store"] = "cardio\ud800"
+
+    response = _post_raw(api, device, broken_id, odd_store)
+
+    assert [(r["status"], r["code"]) for r in results(response)] == [
+        ("rejected", "invalid_envelope"),
+        ("retry", "unsupported_store"),
+    ]
+    assert results(response)[0]["mutation_id"] == "�"
+    assert "cardio�" in results(response)[1]["detail"]
+
+
+def test_an_unexpected_error_is_a_retry_and_earlier_results_survive(
+    api: APIClient,
+    user: User,
+    device: Device,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A server bug on one mutation is not a permanent rejection, nor a 500 for the batch."""
+    start, session_id = device.start_session(at(0))
+    bout, bout_id = device.start_bout(session_id, at(1))
+    pause, _ = device.pause(bout_id, at(2))
+    real_apply = engine._apply
+
+    def buggy_apply(user_id: int, client_id: uuid.UUID, envelope: Any, change_seq: int) -> Any:
+        if envelope.sequence == bout["sequence"]:
+            raise RuntimeError("a server bug")
+        return real_apply(user_id, client_id, envelope, change_seq)
+
+    monkeypatch.setattr(engine, "_apply", buggy_apply)
+    with caplog.at_level(logging.ERROR, logger="apps.sync.engine"):
+        response = push(api, device, start, bout, pause)
+
+    assert results(response) == [
+        {"mutation_id": start["mutation_id"], "status": "applied"},
+        {
+            "mutation_id": bout["mutation_id"],
+            "status": "retry",
+            "code": "server_error",
+            "retryable": True,
+            "detail": "The server failed while processing this mutation; retry later.",
+        },
+    ]
+    assert "a server bug" in caplog.text  # logged with its stack trace
+    assert ProcessedMutation.objects.count() == 1
+    assert _cursor(user) == 1
+
+    monkeypatch.setattr(engine, "_apply", real_apply)
+    assert statuses(push(api, device, start, bout, pause)) == ["duplicate", "applied", "applied"]
+
+
+# --- Ledger bookkeeping --------------------------------------------------------------------
+
+
+def test_the_ledger_keeps_a_bounded_envelope_but_hashes_all_of_it(
+    api: APIClient, device: Device
+) -> None:
+    start, _ = device.start_session(at(0))
+    start["changes"][0]["record"]["padding"] = "x" * (MAX_LEDGER_ENVELOPE_CHARS * 2)
+
+    assert statuses(push(api, device, start)) == ["applied"]
+    entry = ProcessedMutation.objects.get()
+    assert len(entry.envelope) == MAX_LEDGER_ENVELOPE_CHARS
+    assert entry.envelope_truncated is True
+    assert statuses(push(api, device, start)) == ["duplicate"]
+
+    # Identical within the stored prefix, different beyond it: still a different payload.
+    changed_tail = copy.deepcopy(start)
+    changed_tail["changes"][0]["record"]["padding"] += "y"
+    assert codes(push(api, device, changed_tail)) == ["mutation_id_conflict"]
+
+
+def test_an_ordinary_envelope_is_kept_whole(api: APIClient, device: Device) -> None:
+    start, _ = device.start_session(at(0))
+    assert statuses(push(api, device, start)) == ["applied"]
+
+    entry = ProcessedMutation.objects.get()
+    assert entry.envelope_truncated is False
+    assert json.loads(entry.envelope) == start
+
+
+def test_an_out_of_order_sequence_is_logged_but_processed(
+    api: APIClient, device: Device, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Ascending order is the client's obligation; the server only makes a lapse visible."""
+    start, session_id = device.start_session(at(0))
+    bout, _ = device.start_bout(session_id, at(1))
+    edit = device.edit(at(2), "walking_sessions", session_id, session_notes="later")
+    assert statuses(push(api, device, start, edit)) == ["applied", "applied"]
+
+    with caplog.at_level(logging.WARNING, logger="apps.sync.engine"):
+        assert statuses(push(api, device, bout)) == ["applied"]
+        assert "drained out of order" in caplog.text
+        caplog.clear()
+        assert statuses(push(api, device, bout)) == ["duplicate"]  # a duplicate is not a lapse
+        assert "drained out of order" not in caplog.text
+
+
+def test_an_unsupported_store_is_logged(
+    api: APIClient, device: Device, caplog: pytest.LogCaptureFixture
+) -> None:
+    start, _ = device.start_session(at(0))
+    start["changes"][0]["store"] = "cardio_sessions"
+
+    with caplog.at_level(logging.WARNING, logger="apps.sync.engine"):
+        assert codes(push(api, device, start)) == ["unsupported_store"]
+    assert "unsupported_store" in caplog.text

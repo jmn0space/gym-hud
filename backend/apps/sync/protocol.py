@@ -39,7 +39,6 @@ RETRY = "retry"
 # retry of the same mutation is answered with the same rejection.
 INVALID_ENVELOPE = "invalid_envelope"
 INVALID_RECORD = "invalid_record"
-INVALID_TIMING = "invalid_timing"
 INVALID_TRANSITION = "invalid_transition"
 ACTIVE_CONFLICT = "active_conflict"
 PARENT_NOT_FOUND = "parent_not_found"
@@ -51,9 +50,14 @@ MUTATION_ID_CONFLICT = "mutation_id_conflict"
 UNSUPPORTED_STORE = "unsupported_store"
 UNSUPPORTED_VERSION = "unsupported_version"
 TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
+SERVER_ERROR = "server_error"
 
 PUT = "put"
 DELETE = "delete"
+
+# A JSON parser joins an escaped surrogate *pair* into one character, so any
+# surrogate left in a parsed string is a lone one.
+_SURROGATE = re.compile("[\ud800-\udfff]")
 
 _CANONICAL_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
@@ -164,7 +168,12 @@ def parse_timestamp(value: object) -> datetime | None:
         return None
     if parsed.utcoffset() is None:
         return None
-    return parsed.astimezone(UTC)
+    try:
+        return parsed.astimezone(UTC)
+    except OverflowError:
+        # "0001-01-01T00:00:00+01:00" is a valid literal whose UTC instant is
+        # before year 1 -- unrepresentable, so as unusable as a malformed one.
+        return None
 
 
 def parse_integer(value: object) -> int | None:
@@ -241,7 +250,11 @@ def read_number(
     value = record.get(field)
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise _invalid(field, "a number")
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        # An integer literal beyond any double (JSON allows 1e400 written out).
+        raise _invalid(field, "a finite number") from None
     in_range = number > minimum if exclusive else number >= minimum
     if not math.isfinite(number) or not in_range:
         bound = "greater than" if exclusive else "at least"
@@ -249,15 +262,30 @@ def read_number(
     return number
 
 
+def storable_text(value: str) -> str:
+    """``value`` with what a PostgreSQL ``text`` column cannot hold repaired.
+
+    NUL characters are removed (PostgreSQL text cannot hold one at all), and a
+    lone UTF-16 surrogate -- which a JSON ``\\ud800`` escape produces, but UTF-8
+    cannot encode -- becomes U+FFFD. Only ever used for free text: the user's
+    words are kept rather than their workout refused over one character.
+    """
+    return _SURROGATE.sub("\ufffd", value.replace("\x00", ""))
+
+
+def printable(value: str) -> str:
+    """``value`` made safe to echo in an acknowledgement or a log line."""
+    return _SURROGATE.sub("\ufffd", value)
+
+
 def read_optional_text(record: Mapping[str, object], field: str) -> str | None:
-    """A text field that may be absent or ``null``."""
+    """A free-text field that may be absent or ``null``, made storable (:func:`storable_text`)."""
     value = record.get(field)
     if value is None:
         return None
-    if not isinstance(value, str) or "\x00" in value:
-        # PostgreSQL text cannot hold a NUL character at all.
-        raise _invalid(field, "text without NUL characters, or null")
-    return value
+    if not isinstance(value, str):
+        raise _invalid(field, "text, or null")
+    return storable_text(value)
 
 
 def read_choice(record: Mapping[str, object], field: str, choices: list[str]) -> str:

@@ -31,9 +31,11 @@ from apps.sync.protocol import (
     UNSUPPORTED_VERSION,
     Deferred,
     Rejected,
+    format_timestamp,
     is_canonical_uuid,
     parse_integer,
     parse_timestamp,
+    printable,
     read_timestamp,
 )
 from apps.sync.registry import StoreSpec, SyncDomain, store_entry
@@ -61,7 +63,8 @@ class Change:
 
     For a put, ``values`` holds every model field to write (the handler's
     parsed fields plus the record's ``created_at``/``updated_at``); for a
-    delete, only the tombstone's ``updated_at`` and ``deleted_at``.
+    delete, only the tombstone's ``updated_at`` and ``deleted_at``. ``notes``
+    describe any adjustment parsing made (an end clamped up to its start).
     """
 
     domain: SyncDomain
@@ -69,6 +72,7 @@ class Change:
     entity_id: uuid.UUID
     operation: str
     values: Mapping[str, object]
+    notes: tuple[str, ...] = ()
 
     @property
     def label(self) -> str:
@@ -178,7 +182,7 @@ def parse_envelope(raw: object) -> Envelope:
         raise Deferred(
             UNSUPPORTED_STORE,
             "This server does not synchronize "
-            + ", ".join(sorted(unsupported))
+            + ", ".join(sorted(printable(store) for store in unsupported))
             + " yet; keep the mutation queued.",
         )
 
@@ -228,12 +232,36 @@ def _parse_change(index: int, change: Mapping[str, object]) -> Change:
         values = _record_values(spec, str(operation), record)
     except Rejected as exc:
         raise Rejected(exc.code, f"{label}: {exc.detail}") from exc
+    notes: tuple[str, ...] = ()
+    if operation == PUT and spec.interval is not None:
+        note = clamp_end(values, *spec.interval)
+        notes = () if note is None else (f"{label} {note}",)
     return Change(
         domain=domain,
         spec=spec,
         entity_id=uuid.UUID(str(entity_id)),
         operation=str(operation),
         values=values,
+        notes=notes,
+    )
+
+
+def clamp_end(values: dict[str, object], start_field: str, end_field: str) -> str | None:
+    """Move ``end_field`` up to ``start_field`` if it is earlier; describe the move.
+
+    An end before its own start can only come from a device clock that stepped
+    back between the two stamps. Refusing it would strand real workout data on
+    the device, so the interval becomes zero-length at its start instead --
+    deterministic, and inside the database's ``end >= start`` constraints.
+    """
+    start = values.get(start_field)
+    end = values.get(end_field)
+    if not isinstance(start, datetime) or not isinstance(end, datetime) or end >= start:
+        return None
+    values[end_field] = start
+    return (
+        f"{end_field} {format_timestamp(end)} clamped to {format_timestamp(start)} "
+        f"(before {start_field})"
     )
 
 

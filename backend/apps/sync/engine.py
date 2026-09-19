@@ -17,25 +17,52 @@ The rules implemented here are the v1 server contract in docs/data-sync.md
   changes are then written in dependency order and the finished state of
   everything the mutation touched is validated before commit. Any failure
   rolls the whole mutation back.
-- **Latest explicit edit wins.** A write from the same device carrying a lower
-  sequence than the one that last wrote the row is skipped (acknowledged as
-  part of an ``applied`` mutation, never rejected); across devices the last
-  committed mutation wins. A tombstone therefore only comes back to life
-  through a newer put -- an explicit undo -- never through a stale replay.
+- **Latest explicit edit wins, and a tombstone wins.** A write from the same
+  device carrying a lower sequence than the one that last wrote the row is
+  skipped (acknowledged as part of an ``applied`` mutation, never rejected);
+  across devices the last committed mutation wins -- except that a tombstone
+  can only be brought back by the device that deleted it, through a later
+  mutation (an undo). A put from any other device onto a tombstone, or under a
+  tombstoned parent, is skipped the same way.
+- **Repaired, not refused, where the device cannot be wrong.** Clock-step
+  timestamp inversions are clamped, a session stuck ``ACTIVE`` is closed to
+  make room for a newer one, and a deleted parent takes its live children with
+  it. Each is deterministic, lands in the same transaction with the same
+  change-counter value (so the changes feed carries it), and is noted in the
+  ledger's ``detail``.
+- **A server fault is not the device's fault.** An unexpected exception while
+  processing one mutation is logged and answered ``retry``/``server_error``
+  (never recorded), ending the batch; what committed before it is still
+  acknowledged.
 """
 
 from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from typing import cast
 
-from django.db import DataError, IntegrityError, InterfaceError, OperationalError, transaction
+from django.db import (
+    DatabaseError,
+    DataError,
+    IntegrityError,
+    InterfaceError,
+    OperationalError,
+    connection,
+    transaction,
+)
+from django.db.models import Max
 
 from apps.sync.envelope import Change, Envelope, envelope_sequence, parse_envelope
-from apps.sync.models import ProcessedMutation, SyncedRecord, SyncState
+from apps.sync.models import (
+    MAX_LEDGER_ENVELOPE_CHARS,
+    SERVER_CLIENT_ID,
+    ProcessedMutation,
+    SyncedRecord,
+    SyncState,
+)
 from apps.sync.protocol import (
     ACTIVE_CONFLICT,
     APPLIED,
@@ -50,6 +77,7 @@ from apps.sync.protocol import (
     PUT,
     REJECTED,
     RETRY,
+    SERVER_ERROR,
     TEMPORARILY_UNAVAILABLE,
     Ack,
     Deferred,
@@ -58,12 +86,26 @@ from apps.sync.protocol import (
     fingerprint,
     is_canonical_uuid,
     parse_timestamp,
+    printable,
 )
-from apps.sync.registry import WrittenChange, child_specs, domains, store_spec
+from apps.sync.registry import (
+    ApplyContext,
+    StoreSpec,
+    WrittenChange,
+    child_specs,
+    domains,
+    store_spec,
+)
 
 logger = logging.getLogger(__name__)
 
 _UNIQUE_VIOLATION = "23505"
+
+#: How long a mutation waits for a row lock (the account's ``SyncState`` row,
+#: in practice) before giving up with a retryable answer, on PostgreSQL. A
+#: mutation takes milliseconds; a wait this long means something is stuck, and
+#: a request should not hold a worker for it.
+LOCK_TIMEOUT_MS = 5000
 
 
 def process_batch(user_id: int, client_id: uuid.UUID, mutations: Sequence[object]) -> list[Ack]:
@@ -88,7 +130,7 @@ def process_batch(user_id: int, client_id: uuid.UUID, mutations: Sequence[object
 def process_mutation(user_id: int, client_id: uuid.UUID, raw: object) -> Ack:
     """Apply one outbox envelope exactly once, or explain why not."""
     raw_id = raw.get("mutation_id") if isinstance(raw, Mapping) else None
-    echo = raw_id if isinstance(raw_id, str) else None
+    echo = printable(raw_id) if isinstance(raw_id, str) else None
     if not is_canonical_uuid(raw_id):
         # Nothing to key a ledger row on; the answer is deterministic anyway.
         return Ack(echo, REJECTED, INVALID_ENVELOPE, "mutation_id must be a lowercase UUID.")
@@ -97,6 +139,7 @@ def process_mutation(user_id: int, client_id: uuid.UUID, raw: object) -> Ack:
     payload_hash = fingerprint(canonical)
     try:
         with transaction.atomic():
+            _bound_lock_wait()
             return _process_locked(user_id, client_id, raw, mutation_id, canonical, payload_hash)
     except IntegrityError:
         # The ledger insert lost a race to another transaction that committed
@@ -108,6 +151,8 @@ def process_mutation(user_id: int, client_id: uuid.UUID, raw: object) -> Ack:
             raise
         return _replay(prior, user_id, payload_hash)
     except (OperationalError, InterfaceError):
+        # Includes PostgreSQL's lock_timeout (LOCK_TIMEOUT_MS), a deadlock and
+        # a serialization failure.
         logger.warning("Mutation %s deferred by a database error", mutation_id, exc_info=True)
         return Ack(
             str(mutation_id),
@@ -115,6 +160,27 @@ def process_mutation(user_id: int, client_id: uuid.UUID, raw: object) -> Ack:
             TEMPORARILY_UNAVAILABLE,
             "The server could not complete this mutation right now; retry later.",
         )
+    except DatabaseError:
+        raise
+    except Exception:
+        # Not the device's fault as far as anyone can tell: it may be a server
+        # bug on perfectly valid data. Recording a rejection would strand the
+        # workout on the device, so it is retryable and never recorded; the
+        # batch ends here, and what committed before it is still acknowledged.
+        logger.exception("Mutation %s failed with an unexpected error", mutation_id)
+        return Ack(
+            str(mutation_id),
+            RETRY,
+            SERVER_ERROR,
+            "The server failed while processing this mutation; retry later.",
+        )
+
+
+def _bound_lock_wait() -> None:
+    """Cap how long this transaction waits for a row lock (PostgreSQL only)."""
+    if connection.vendor == "postgresql":
+        with connection.cursor() as cursor:
+            cursor.execute(f"SET LOCAL lock_timeout = {int(LOCK_TIMEOUT_MS)}")
 
 
 def _process_locked(
@@ -129,11 +195,21 @@ def _process_locked(
     prior = ProcessedMutation.objects.filter(mutation_id=mutation_id).first()
     if prior is not None:
         return _replay(prior, user_id, payload_hash)
+    _warn_if_out_of_order(user_id, client_id, mutation_id, raw)
 
     record = _Recorder(user_id, client_id, raw, mutation_id, canonical, payload_hash)
     try:
         envelope = parse_envelope(raw)
     except Deferred as deferred:
+        # Nothing is lost, but the device's queue is stuck behind this until
+        # the server learns the store or version: make that visible.
+        logger.warning(
+            "Mutation %s from client %s deferred (%s): %s",
+            mutation_id,
+            client_id,
+            deferred.code,
+            deferred.detail,
+        )
         return Ack(str(mutation_id), RETRY, deferred.code, deferred.detail)
     except Rejected as rejected:
         return record.rejection(rejected)
@@ -141,7 +217,7 @@ def _process_locked(
     change_seq = state.change_seq + 1
     try:
         with transaction.atomic():
-            skipped = _apply(user_id, client_id, envelope, change_seq)
+            notes = _apply(user_id, client_id, envelope, change_seq)
     except Rejected as rejected:
         return record.rejection(rejected)
     except IntegrityError as error:
@@ -153,15 +229,84 @@ def _process_locked(
 
     state.change_seq = change_seq
     state.save(update_fields=["change_seq"])
-    detail = "Applied."
-    if skipped:
-        detail = (
-            "Applied; skipped as superseded by a newer edit from this device: "
-            + ", ".join(skipped)
-            + "."
-        )
-    record.applied(change_seq, detail)
+    record.applied(change_seq, _applied_detail(notes))
     return Ack(str(mutation_id), APPLIED)
+
+
+def _applied_detail(notes: Sequence[str]) -> str:
+    """The ledger ``detail`` of an applied mutation: everything done beyond applying it as sent."""
+    return "Applied." if not notes else "Applied; " + "; ".join(notes) + "."
+
+
+def _warn_if_out_of_order(
+    user_id: int, client_id: uuid.UUID, mutation_id: uuid.UUID, raw: object
+) -> None:
+    """Log a new mutation whose sequence is below what this device already sent.
+
+    The server does not enforce contiguous or ascending sequences across
+    requests -- that is the client's obligation (one drainer per device,
+    ascending order; docs/data-sync.md, "Client obligations") -- but a
+    violation defeats the same-device staleness rule, so it should be seen.
+    """
+    sequence = envelope_sequence(raw)
+    if sequence is None:
+        return
+    highest = ProcessedMutation.objects.filter(user_id=user_id, client_id=client_id).aggregate(
+        highest=Max("sequence")
+    )["highest"]
+    if highest is not None and sequence < highest:
+        logger.warning(
+            "Mutation %s from client %s has sequence %s, below the %s already processed "
+            "for that device: its outbox is being drained out of order",
+            mutation_id,
+            client_id,
+            sequence,
+            highest,
+        )
+
+
+def apply_server_action(
+    user_id: int,
+    action: str,
+    payload: Mapping[str, object],
+    detail: str,
+    apply: Callable[[ApplyContext], None],
+) -> ProcessedMutation:
+    """Make a change on the server's own authority, through the mutation path.
+
+    Same account lock, same lock-wait bound, one transaction, one new
+    change-counter value stamped on every row ``apply`` saves (so the changes
+    feed carries it to the devices), and a ledger row -- ``code`` ``action``,
+    ``client_id`` :data:`~apps.sync.models.SERVER_CLIENT_ID`, the ``payload``
+    (who asked for it, and what) as its envelope. ``apply`` raises
+    :class:`~apps.sync.protocol.Rejected` to refuse; nothing is then written.
+    """
+    SyncState.objects.get_or_create(user_id=user_id)
+    canonical = canonical_json(payload)
+    with transaction.atomic():
+        _bound_lock_wait()
+        state = SyncState.objects.select_for_update().get(user_id=user_id)
+        change_seq = state.change_seq + 1
+        ctx = ApplyContext(
+            user_id=user_id, client_id=SERVER_CLIENT_ID, sequence=0, change_seq=change_seq
+        )
+        apply(ctx)
+        state.change_seq = change_seq
+        state.save(update_fields=["change_seq"])
+        return ProcessedMutation.objects.create(
+            mutation_id=uuid.uuid4(),
+            user_id=user_id,
+            client_id=SERVER_CLIENT_ID,
+            sequence=None,
+            client_created_at=None,
+            fingerprint=fingerprint(canonical),
+            status=ProcessedMutation.Status.APPLIED,
+            code=action,
+            detail=detail if not ctx.notes else f"{detail} " + "; ".join(ctx.notes) + ".",
+            change_seq=change_seq,
+            envelope=canonical[:MAX_LEDGER_ENVELOPE_CHARS],
+            envelope_truncated=len(canonical) > MAX_LEDGER_ENVELOPE_CHARS,
+        )
 
 
 def _replay(prior: ProcessedMutation, user_id: int, payload_hash: str) -> Ack:
@@ -213,7 +358,8 @@ class _Recorder:
             code=code,
             detail=detail,
             change_seq=change_seq,
-            envelope=self.canonical,
+            envelope=self.canonical[:MAX_LEDGER_ENVELOPE_CHARS],
+            envelope_truncated=len(self.canonical) > MAX_LEDGER_ENVELOPE_CHARS,
         )
 
     def applied(self, change_seq: int, detail: str) -> None:
@@ -249,10 +395,21 @@ def _is_stale(row: SyncedRecord, client_id: uuid.UUID, sequence: int) -> bool:
     return row.last_client_id == client_id and row.last_sequence > sequence
 
 
+def _deleted_elsewhere(row: SyncedRecord | None, client_id: uuid.UUID) -> bool:
+    """Whether ``row`` is a tombstone that only another device could bring back."""
+    return row is not None and row.deleted_at is not None and row.last_client_id != client_id
+
+
 def _apply(user_id: int, client_id: uuid.UUID, envelope: Envelope, change_seq: int) -> list[str]:
-    """Write a parsed mutation and validate the result; returns stale-skipped labels."""
+    """Write a parsed mutation and settle the result; returns the ledger notes."""
+    ctx = ApplyContext(
+        user_id=user_id,
+        client_id=client_id,
+        sequence=envelope.sequence,
+        change_seq=change_seq,
+        targets=frozenset((c.spec.store, c.entity_id) for c in envelope.changes),
+    )
     written: list[tuple[Change, WrittenChange]] = []
-    skipped: list[str] = []
     for change in _canonical_order(envelope.changes):
         spec = change.spec
         row = spec.model._default_manager.filter(pk=change.entity_id).first()
@@ -261,7 +418,13 @@ def _apply(user_id: int, client_id: uuid.UUID, envelope: Envelope, change_seq: i
                 continue  # Nothing of this account's to delete; say nothing more.
             raise Rejected(NOT_FOUND, f"{change.label} is not available to this account.")
         if row is not None and _is_stale(row, client_id, envelope.sequence):
-            skipped.append(change.label)
+            ctx.notes.append(f"skipped {change.label}: superseded by a newer edit from this device")
+            continue
+        if change.operation == PUT and _deleted_elsewhere(row, client_id):
+            ctx.notes.append(f"skipped {change.label}: deleted by another device")
+            continue
+        if change.operation == PUT and _deleted_elsewhere(_parent_row(user_id, change), client_id):
+            ctx.notes.append(f"skipped {change.label}: its parent was deleted by another device")
             continue
 
         creating = row is None
@@ -272,29 +435,71 @@ def _apply(user_id: int, client_id: uuid.UUID, envelope: Envelope, change_seq: i
             row.deleted_at = cast(datetime, change.values["deleted_at"])
         else:
             _check_parent_reference(user_id, change, row)
+            values = dict(change.values)
             if row is not None and spec.check_update is not None:
                 try:
-                    spec.check_update(row, change.values)
+                    notes = spec.check_update(row, values)
                 except Rejected as exc:
                     raise Rejected(exc.code, f"{change.label}: {exc.detail}") from exc
+                ctx.notes.extend(f"{change.label} {note}" for note in notes)
             if row is None:
                 row = spec.model(id=change.entity_id, user_id=user_id)
-            for field, value in change.values.items():
+            for field, value in values.items():
                 setattr(row, field, value)
             row.deleted_at = None
+            ctx.notes.extend(change.notes)
+            if change.domain.before_put is not None:
+                change.domain.before_put(ctx, spec, row)
 
         row.last_client_id = client_id
         row.last_sequence = envelope.sequence
         row.change_seq = change_seq
         row.save(force_insert=creating)
         written.append((change, WrittenChange(spec=spec, row=row, operation=change.operation)))
+        if change.operation == DELETE:
+            _cascade_delete(ctx, spec, row)
 
     _check_structure(user_id, [item for _, item in written])
     for domain in domains():
         own = [item for change, item in written if change.domain is domain]
         if own:
-            domain.check_mutation(own)
-    return skipped
+            domain.check_mutation(ctx, own)
+    return ctx.notes
+
+
+def _parent_row(user_id: int, change: Change) -> SyncedRecord | None:
+    """This account's row that a put's record names as its parent, if there is one."""
+    parent = change.spec.parent
+    if parent is None:
+        return None
+    parent_id = cast(uuid.UUID, change.values[parent.field])
+    model = store_spec(parent.store).model
+    return model._default_manager.filter(pk=parent_id, user_id=user_id).first()
+
+
+def _cascade_delete(ctx: ApplyContext, spec: StoreSpec, row: SyncedRecord) -> None:
+    """Tombstone every live descendant of a row this mutation deleted.
+
+    The deleting device listed the children it knew about; another device may
+    have added more since. Those go with their parent -- same ``deleted_at``,
+    same writer (so only the deleting device can undo it), same change-counter
+    value -- rather than leaving live records under a tombstone.
+    """
+    for child in child_specs(spec.store):
+        if child.parent is None:  # pragma: no cover -- child_specs guarantees it
+            continue
+        live = child.model._default_manager.filter(
+            **{child.parent.field: row.pk, "deleted_at__isnull": True}
+        ).order_by("pk")
+        for orphan in live:
+            orphan.updated_at = row.updated_at
+            orphan.deleted_at = row.deleted_at
+            orphan.last_client_id = ctx.client_id
+            orphan.last_sequence = ctx.sequence
+            orphan.change_seq = ctx.change_seq
+            orphan.save()
+            ctx.notes.append(f"deleted {child.store}/{orphan.pk} with {spec.store}/{row.pk}")
+            _cascade_delete(ctx, child, orphan)
 
 
 def _check_parent_reference(user_id: int, change: Change, row: SyncedRecord | None) -> None:
@@ -317,39 +522,25 @@ def _check_parent_reference(user_id: int, change: Change, row: SyncedRecord | No
 
 
 def _check_structure(user_id: int, written: Sequence[WrittenChange]) -> None:
-    """Parent/child liveness of the finished state, for every store.
+    """A live record of the finished state needs a live parent, in every store.
 
-    A live record needs a live parent (a tombstoned parent is as absent as a
-    missing one), and a record may only be deleted together with its live
-    children -- the local contract orders those child deletes first.
+    A tombstoned parent is as absent as a missing one. (The reverse -- live
+    children under a deleted parent -- cannot happen: a delete cascades.)
     """
     for item in written:
         spec, row = item.spec, item.row
-        label = f"{spec.store}/{row.pk}"
-        if row.deleted_at is None and spec.parent is not None:
-            parent_spec = store_spec(spec.parent.store)
-            parent_id = cast(uuid.UUID, getattr(row, spec.parent.field))
-            parent_live = parent_spec.model._default_manager.filter(
-                pk=parent_id, user_id=user_id, deleted_at__isnull=True
-            ).exists()
-            if not parent_live:
-                raise Rejected(
-                    PARENT_NOT_FOUND,
-                    f"{label}: parent {spec.parent.store}/{parent_id} is deleted.",
-                )
-        if row.deleted_at is not None:
-            for child in child_specs(spec.store):
-                if child.parent is None:  # pragma: no cover -- child_specs guarantees it
-                    continue
-                live_children = child.model._default_manager.filter(
-                    **{child.parent.field: row.pk, "deleted_at__isnull": True}
-                )
-                if live_children.exists():
-                    raise Rejected(
-                        INVALID_TRANSITION,
-                        f"{label} cannot be deleted while it has live {child.store}; "
-                        "delete them in the same mutation.",
-                    )
+        if row.deleted_at is not None or spec.parent is None:
+            continue
+        parent_spec = store_spec(spec.parent.store)
+        parent_id = cast(uuid.UUID, getattr(row, spec.parent.field))
+        parent_live = parent_spec.model._default_manager.filter(
+            pk=parent_id, user_id=user_id, deleted_at__isnull=True
+        ).exists()
+        if not parent_live:
+            raise Rejected(
+                PARENT_NOT_FOUND,
+                f"{spec.store}/{row.pk}: parent {spec.parent.store}/{parent_id} is deleted.",
+            )
 
 
 def _integrity_rejection(error: IntegrityError) -> Rejected:
