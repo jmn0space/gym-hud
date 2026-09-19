@@ -30,4 +30,5 @@ audit_security(
     csrf_trusted_origins=CSRF_TRUSTED_ORIGINS,
     database_url=DATABASE_URL,  # noqa: F405
     login_throttle_rate=LOGIN_THROTTLE_RATE,  # noqa: F405
+    sync_throttle_rate=SYNC_THROTTLE_RATE,  # noqa: F405
 )

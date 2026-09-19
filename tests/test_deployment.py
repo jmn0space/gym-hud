@@ -74,12 +74,13 @@ def test_production_compose_uses_deployment_values_without_local_database():
         **PRODUCTION_ENV,
         "DJANGO_SETTINGS_MODULE": "config.settings.production",
         "DJANGO_ENV": "production",
-        # Not set in PRODUCTION_ENV: both are optional, defaulted in the
+        # Not set in PRODUCTION_ENV: all three are optional, defaulted in the
         # Compose file itself, and must still reach the container so
         # config.settings.base picks them up instead of silently running
         # with whatever the image's own defaults happen to be.
         "DJANGO_SESSION_COOKIE_AGE": "2592000",
         "DJANGO_LOGIN_THROTTLE_RATE": "10/min",
+        "DJANGO_SYNC_THROTTLE_RATE": "120/min",
     }
     assert not web.get("ports")
     assert not web.get("depends_on")
