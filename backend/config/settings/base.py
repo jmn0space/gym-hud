@@ -79,6 +79,8 @@ INSTALLED_APPS = [
     "corsheaders",
     "rest_framework",
     "core",
+    "apps.sync",
+    "apps.pad",
 ]
 
 MIDDLEWARE = [
@@ -158,6 +160,13 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # (str | list[str] | dict[str, str]) value type.
 LOGIN_THROTTLE_RATE = _env_str("DJANGO_LOGIN_THROTTLE_RATE", "10/min")
 
+# Shared by the three /api/v1/sync/ endpoints (apps.sync.views), keyed per
+# authenticated user. Generous: a device drains its outbox in requests of up
+# to 50 mutations and pages the changes feed, so this only exists to stop a
+# runaway client from hammering the database. Validated at startup the same
+# way as LOGIN_THROTTLE_RATE.
+SYNC_THROTTLE_RATE = _env_str("DJANGO_SYNC_THROTTLE_RATE", "120/min")
+
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "core.authentication.SessionAuthentication",
@@ -168,6 +177,7 @@ REST_FRAMEWORK = {
     "EXCEPTION_HANDLER": "core.exceptions.exception_handler",
     "DEFAULT_THROTTLE_RATES": {
         "login": LOGIN_THROTTLE_RATE,
+        "sync": SYNC_THROTTLE_RATE,
     },
 }
 
@@ -227,8 +237,13 @@ _YELLOW = "\033[33m"
 _RESET = "\033[0m"
 
 
-def _validate_login_throttle_rate(rate: str) -> None:
+def _validate_throttle_rate(rate: str, *, env_var: str = "DJANGO_LOGIN_THROTTLE_RATE") -> None:
     """Raise ``ImproperlyConfigured`` if ``rate`` is not a usable DRF throttle rate.
+
+    Checks every throttle rate these settings define -- the login rate and the
+    sync rate -- with ``env_var`` naming the variable in the error message. The
+    login rate is the sharpest case, described below; the sync rate fails the
+    same way on every ``/api/v1/sync/`` request.
 
     ``core.throttling.check_login_rate_limit`` and DRF's own
     ``ScopedRateThrottle`` both parse ``DJANGO_LOGIN_THROTTLE_RATE`` lazily,
@@ -262,6 +277,10 @@ def _validate_login_throttle_rate(rate: str) -> None:
     exactly what happened during development of this function, caught by
     ``core.tests.test_auth.test_login_is_throttled_after_repeated_failures``
     failing only when the whole suite ran together.
+
+    ``env_var`` names the variable in the error message: the same check
+    guards ``DJANGO_SYNC_THROTTLE_RATE``, whose malformed value would
+    likewise turn every synchronization request into a 500.
     """
     try:
         num, period = rate.split("/")
@@ -269,12 +288,12 @@ def _validate_login_throttle_rate(rate: str) -> None:
         _duration = {"s": 1, "m": 60, "h": 3600, "d": 86400}[period[0]]
     except (ValueError, IndexError, KeyError) as exc:
         raise ImproperlyConfigured(
-            f"🚨 SECURITY: DJANGO_LOGIN_THROTTLE_RATE={rate!r} is not a valid DRF rate "
+            f"🚨 SECURITY: {env_var}={rate!r} is not a valid DRF rate "
             '("<count>/<second|minute|hour|day>", e.g. "10/min").'
         ) from exc
     if num_requests < 1:
         raise ImproperlyConfigured(
-            f"🚨 SECURITY: DJANGO_LOGIN_THROTTLE_RATE={rate!r} must allow at least 1 request."
+            f"🚨 SECURITY: {env_var}={rate!r} must allow at least 1 request."
         )
 
 
@@ -287,9 +306,12 @@ def audit_security(
     csrf_trusted_origins: Sequence[str],
     database_url: str,
     login_throttle_rate: str,
+    sync_throttle_rate: str | None = None,
 ) -> None:
     """Validate settings after environment-specific overrides are applied."""
-    _validate_login_throttle_rate(login_throttle_rate)
+    _validate_throttle_rate(login_throttle_rate)
+    if sync_throttle_rate is not None:
+        _validate_throttle_rate(sync_throttle_rate, env_var="DJANGO_SYNC_THROTTLE_RATE")
     insecure_hosts = {"*", "localhost", "127.0.0.1", "0.0.0.0", "[::1]"}  # noqa: S104
 
     if environment == "production":

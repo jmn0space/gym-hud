@@ -11,6 +11,7 @@ from django.views import defaults as django_error_views
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/v1/", include("core.urls")),
+    path("api/v1/", include("apps.sync.urls")),
 ]
 
 

@@ -344,12 +344,30 @@ function fieldValue(raw: string, accepts: (value: number) => boolean): number | 
   return Number.isFinite(value) && accepts(value) ? value : null;
 }
 
+/**
+ * Whole seconds are what gets stored, and a session needs at least one: 0.001
+ * minutes is positive but rounds to 0 s, which neither the local parser nor the
+ * server accepts.
+ */
+function isStorableMaxBout(minutes: number): boolean {
+  return Math.round(minutes * 60) >= 1;
+}
+
 function parseDraft(draft: SettingsDraft): ParsedDraft {
   return {
     speed: fieldValue(draft.speed, (value) => value > 0),
     incline: fieldValue(draft.incline, (value) => value >= 0),
-    minutes: fieldValue(draft.maxBoutMinutes, (value) => value > 0),
+    minutes: fieldValue(draft.maxBoutMinutes, isStorableMaxBout),
   };
+}
+
+/** Why Start is disabled: a too-short maximum gets its own explanation. */
+function validationMessage(draft: SettingsDraft): string {
+  const minutes = fieldValue(draft.maxBoutMinutes, (value) => value > 0);
+  if (minutes !== null && !isStorableMaxBout(minutes)) {
+    return "The maximum bout must be at least 1 second (0.01 minutes).";
+  }
+  return "Enter a speed, an incline and a maximum bout to start.";
 }
 
 function draftSettings(parsed: ParsedDraft): WalkingSessionSettings | null {
@@ -525,7 +543,7 @@ function WalkingStartScreen({ busy, onStart }: WalkingStartScreenProps) {
         </div>
         {settings === null && (
           <p className="muted" id={validationId}>
-            Enter a speed, an incline and a maximum bout to start.
+            {validationMessage(draft)}
           </p>
         )}
         <button className="button button--primary" disabled={settings === null || busy} type="submit">

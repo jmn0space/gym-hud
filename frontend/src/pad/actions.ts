@@ -21,6 +21,37 @@ import type { WalkingSessionSettings } from "./types";
  * injected time.
  */
 
+/**
+ * The time a PAD action stamps: `now`, unless something already recorded in the
+ * session is later -- the device clock stepped back (an NTP correction, a manual
+ * change) since it was written. Then the latest recorded moment is used instead,
+ * so within one session recorded time only moves forward: a clock step can never
+ * produce an end before its start, a bout before its session, or a rest before
+ * its bout ended (docs/data-sync.md, "PAD validation"). The server clamps the
+ * same inversions, but a device that never makes one needs no repair.
+ *
+ * Takes raw values, not parsed records: an unparseable timestamp is skipped.
+ */
+export function monotonicNow(now: Date, recorded: Iterable<unknown>): Date {
+  let latest = now.getTime();
+  for (const value of recorded) {
+    const time = typeof value === "string" ? Date.parse(value) : Number.NaN;
+    if (Number.isFinite(time) && time > latest) {
+      latest = time;
+    }
+  }
+  return new Date(latest);
+}
+
+const RECORDED_TIME_FIELDS = ["started_at", "ended_at", "completed_at"] as const;
+
+/** Every start and end a set of session records holds, for `monotonicNow`. */
+function recordedTimes(records: readonly object[]): unknown[] {
+  return records.flatMap((record) =>
+    RECORDED_TIME_FIELDS.map((field) => (record as Readonly<Record<string, unknown>>)[field]),
+  );
+}
+
 /** Guards a follow-up action against a session that another tab already finished. */
 function activeSessionPrecondition(sessionId: string): RecordPrecondition {
   return { store: "walking_sessions", id: sessionId, expected: { status: "ACTIVE" } };
@@ -84,6 +115,10 @@ export function startWalkingBoutAction({
   view,
   now,
 }: StartWalkingBoutInput): LocalAction {
+  const startedAt = monotonicNow(
+    now,
+    recordedTimes([view.session, ...view.bouts, ...view.pauses, ...view.rests]),
+  );
   return {
     actionId,
     changes: [
@@ -94,7 +129,7 @@ export function startWalkingBoutAction({
           id: boutId,
           walking_session_id: view.session.id,
           bout_number: view.currentBoutNumber,
-          started_at: now.toISOString(),
+          started_at: startedAt.toISOString(),
           ended_at: null,
           pain_min: null,
           pain_max: null,
@@ -170,18 +205,6 @@ function closeWalkingSessionAction(
     );
   }
 
-  const endedAt = now.toISOString();
-  const changes: LocalAction["changes"] = [];
-  const preconditions: RecordPrecondition[] = [activeSessionPrecondition(sessionId)];
-  const close = (store: DomainStore, record: LocalRecord) => {
-    changes.push({
-      store,
-      operation: "put",
-      record: { ...carriedFields(record), ended_at: endedAt },
-    });
-    preconditions.push(...stillOpenPreconditions(store, record));
-  };
-
   // Raw rows, not parsed ones: a row the parser dropped is still open as far as
   // the repository's markers are concerned, and leaving it behind is exactly what
   // makes a session unfinishable later.
@@ -193,6 +216,26 @@ function closeWalkingSessionAction(
     ["walking_pauses", snapshot.records.walking_pauses],
     ["walking_rests", snapshot.records.walking_rests],
   ];
+  const sessionRows = [
+    sessionRecord,
+    ...boutRows,
+    ...intervalRows.flatMap(([, records]) =>
+      records.filter((record) => boutIds.has(recordText(record, "walking_bout_id") ?? "")),
+    ),
+  ];
+  // One moment for every close, never before anything the session recorded.
+  const endedAt = monotonicNow(now, recordedTimes(sessionRows)).toISOString();
+
+  const changes: LocalAction["changes"] = [];
+  const preconditions: RecordPrecondition[] = [activeSessionPrecondition(sessionId)];
+  const close = (store: DomainStore, record: LocalRecord) => {
+    changes.push({
+      store,
+      operation: "put",
+      record: { ...carriedFields(record), ended_at: endedAt },
+    });
+    preconditions.push(...stillOpenPreconditions(store, record));
+  };
 
   // Children first, then their bouts, then the session: closing every open
   // interval, not only the "current" one, is what keeps the open-interval markers

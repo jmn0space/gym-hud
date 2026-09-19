@@ -106,6 +106,20 @@ Django is preferred for v1 because the application benefits from its built-in au
 
 The REST API and frontend use the same Django session authentication.
 
+Django apps (under `backend/`):
+
+- `core` — health, session login/logout/status, CSRF and JSON error handling,
+  throttling, the throttled admin site;
+- `apps.sync` — the server synchronization protocol: the processed-mutation
+  ledger, per-account change counter, envelope parsing, the transactional replay
+  engine, and the `/api/v1/sync/` endpoints. Domains plug their stores in through
+  `apps.sync.registry`;
+- `apps.pad` — PAD walking sessions, bouts, pauses and rests, their validation
+  rules, and the admin-editable PAD defaults.
+
+See [Data & synchronization: server synchronization
+protocol](data-sync.md#server-synchronization-protocol) for the contract.
+
 ## Database
 
 Primary database: **PostgreSQL hosted on Neon**.
@@ -338,6 +352,11 @@ construction rather than by sharing that code path:
 | Login rejected: missing/empty/non-string username or password | 400 | `invalid_request` |
 | Login rejected: well-formed but wrong credentials, or inactive user | 400 | `invalid_credentials` |
 | Login throttled (`POST /api/v1/auth/login/`) | 429 | `throttled` |
+| Sync request malformed (`client_id`, `mutations`, feed parameters) | 400 | `invalid_request` |
+| Request body is not valid JSON | 400 | `parse_error` |
+| Request body is not JSON (`POST /api/v1/sync/mutations/`) | 415 | `unsupported_media_type` |
+| Sync request body over `DATA_UPLOAD_MAX_MEMORY_SIZE` | 413 | `request_too_large` |
+| Sync rate limit (`/api/v1/sync/`, per account) | 429 | `throttled` |
 | No URL pattern matches an `/api/` path | 404 | `not_found` |
 | Unhandled exception under `/api/` | 500 | `server_error` |
 
@@ -377,8 +396,11 @@ Public (no authentication required):
   requires an authenticated staff/superuser session, enforced by Django admin
   independently of the DRF settings below.
 
-Everything else under `/api/v1/` (workout, configuration, sync, export, and
-any future endpoints) is protected by default: `REST_FRAMEWORK`'s
+Everything else under `/api/v1/` is protected -- today that is the
+synchronization API (`POST /api/v1/sync/mutations/`, `GET
+/api/v1/sync/bootstrap/`, `GET /api/v1/sync/changes/`; see [Data &
+synchronization](data-sync.md#server-synchronization-protocol)), and it will be
+any future workout, configuration or export endpoint. Protection is the default: `REST_FRAMEWORK`'s
 `DEFAULT_PERMISSION_CLASSES` is `["rest_framework.permissions.IsAuthenticated"]`
 and `DEFAULT_AUTHENTICATION_CLASSES` is
 `["core.authentication.SessionAuthentication"]`, so a new view is private
@@ -557,10 +579,16 @@ The Django container:
 
 Django Admin is the v1 configuration surface for infrequently changed values such as:
 
-- PAD defaults;
+- PAD defaults (implemented: the `PadDefaults` singleton, served to devices by
+  `GET /api/v1/sync/bootstrap/`);
 - muscle-group progression percentages;
 - exercise configuration;
 - allowed starting-load percentages;
 - cardio-machine registry.
 
 Domain-specific details are documented in [PAD walking](pad-walking.md) and [Resistance & cardio](training.md).
+
+Synchronized workout records (PAD sessions, bouts, pauses, rests) and the
+processed-mutation ledger are shown in the admin **read-only**: every change to
+them must arrive as a device mutation, so that it is recorded in the ledger and
+reaches other devices through the changes feed.

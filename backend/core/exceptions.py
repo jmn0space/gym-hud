@@ -26,6 +26,7 @@ _VALIDATION_ERROR = "validation_error"
 _NOT_FOUND = "not_found"
 _METHOD_NOT_ALLOWED = "method_not_allowed"
 _PARSE_ERROR = "parse_error"
+_UNSUPPORTED_MEDIA_TYPE = "unsupported_media_type"
 _ERROR = "error"
 
 _CODES_BY_EXCEPTION: tuple[tuple[type[exceptions.APIException], str], ...] = (
@@ -40,6 +41,7 @@ _CODES_BY_EXCEPTION: tuple[tuple[type[exceptions.APIException], str], ...] = (
     (exceptions.MethodNotAllowed, _METHOD_NOT_ALLOWED),
     (exceptions.Throttled, _THROTTLED),
     (exceptions.ParseError, _PARSE_ERROR),
+    (exceptions.UnsupportedMediaType, _UNSUPPORTED_MEDIA_TYPE),
     (exceptions.ValidationError, _VALIDATION_ERROR),
 )
 

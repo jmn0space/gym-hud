@@ -175,6 +175,24 @@ describe("PAD start screen", () => {
     expect(await screen.findByText("1 bout · 08:00 walking")).toBeInTheDocument();
   });
 
+  it("refuses a maximum bout that rounds to zero seconds, and says why", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    const repository = freshRepository();
+    renderPad(repository);
+
+    const maxBout = await screen.findByLabelText("Maximum bout (minutes)");
+    fireEvent.change(maxBout, { target: { value: "0.001" } });
+
+    expect(screen.getByRole("button", { name: "Start" })).toBeDisabled();
+    expect(maxBout).toHaveAttribute("aria-invalid", "true");
+    expect(
+      screen.getByText("The maximum bout must be at least 1 second (0.01 minutes)."),
+    ).toBeInTheDocument();
+
+    fireEvent.change(maxBout, { target: { value: "0.01" } });
+    expect(screen.getByRole("button", { name: "Start" })).toBeEnabled();
+  });
+
   it("keeps the settings editable and starts the session with the edited values", async () => {
     useFrozenClock("2026-09-18T10:00:00.000Z");
     const repository = freshRepository();

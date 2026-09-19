@@ -5,6 +5,7 @@ import type { DomainStore, JsonValue, LocalRecord, RecoverySnapshot } from "../s
 import {
   discardWalkingSessionAction,
   finishWalkingSessionAction,
+  monotonicNow,
   startWalkingBoutAction,
   startWalkingSessionAction,
 } from "./actions";
@@ -605,6 +606,82 @@ describe("PAD actions", () => {
     ]);
     expect(action.preconditions).toEqual([
       { store: "walking_sessions", id: "session-broken", expected: { status: "ACTIVE" } },
+    ]);
+  });
+});
+
+describe("PAD clock stepping backwards", () => {
+  // The session started at 10:00, bout 1 ran 10:01-10:05 and its rest started
+  // then; the device clock has since been corrected back to 10:03.
+  const steppedBack = new Date("2026-09-18T10:03:00.000Z");
+  const latestRecorded = "2026-09-18T10:05:00.000Z";
+  const records = {
+    walking_bouts: [bout({ id: "bout-1", ended_at: latestRecorded })],
+    walking_rests: [
+      { id: "rest-1", walking_bout_id: "bout-1", started_at: latestRecorded, ended_at: null },
+    ],
+  };
+
+  it("never stamps a time before the latest one the session recorded", () => {
+    expect(monotonicNow(steppedBack, [SESSION.started_at, latestRecorded]).toISOString()).toBe(
+      latestRecorded,
+    );
+    const later = new Date("2026-09-18T10:07:00.000Z");
+    expect(monotonicNow(later, [latestRecorded])).toEqual(later);
+    expect(monotonicNow(steppedBack, ["not a date", null, 42])).toEqual(steppedBack);
+  });
+
+  it("starts the next bout no earlier than the last recorded moment", () => {
+    const action = startWalkingBoutAction({
+      actionId: "action-clock-1",
+      boutId: "bout-2",
+      view: view({ walking_bouts: records.walking_bouts }),
+      now: steppedBack,
+    });
+
+    expect(action.changes[0]).toEqual(
+      expect.objectContaining({
+        record: expect.objectContaining({ started_at: latestRecorded }) as unknown,
+      }),
+    );
+  });
+
+  it("finishes a session without an end before any start it closes", () => {
+    const action = finishWalkingSessionAction({
+      actionId: "action-clock-2",
+      snapshot: padSnapshot(records),
+      sessionId: "session-1",
+      now: steppedBack,
+    });
+
+    const stamps = action.changes.map((change) =>
+      change.operation === "put"
+        ? (change.record.ended_at ?? change.record.completed_at)
+        : undefined,
+    );
+    expect(stamps).toEqual([latestRecorded, latestRecorded]); // the rest, then the session
+  });
+
+  it("ignores records of other sessions", () => {
+    const action = discardWalkingSessionAction({
+      actionId: "action-clock-3",
+      snapshot: padSnapshot({
+        walking_bouts: [
+          bout({
+            id: "bout-elsewhere",
+            walking_session_id: "session-other",
+            ended_at: "2026-09-18T11:00:00.000Z",
+          }),
+        ],
+      }),
+      sessionId: "session-1",
+      now: steppedBack,
+    });
+
+    expect(action.changes).toEqual([
+      expect.objectContaining({
+        record: expect.objectContaining({ completed_at: steppedBack.toISOString() }) as unknown,
+      }),
     ]);
   });
 });
