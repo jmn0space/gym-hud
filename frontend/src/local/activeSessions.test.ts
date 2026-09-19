@@ -29,7 +29,9 @@ describe("deriveActiveSessionSummaries", () => {
   it("derives effective walking time from the open bout and persisted pauses", () => {
     const summaries = deriveActiveSessionSummaries(
       recovery({
-        walking_sessions: [{ id: "session-1", status: "ACTIVE" }],
+        walking_sessions: [
+          { id: "session-1", status: "ACTIVE", started_at: "2026-09-14T11:45:00.000Z" },
+        ],
         walking_bouts: [
           {
             id: "bout-1",
@@ -51,14 +53,16 @@ describe("deriveActiveSessionSummaries", () => {
     );
 
     expect(summaries).toEqual([
-      expect.objectContaining({ status: "Walking", elapsedMs: 9 * 60_000 }),
+      expect.objectContaining({ status: "Walking · Bout 1", elapsedMs: 9 * 60_000 }),
     ]);
   });
 
   it("derives paused and resting timers from their own open intervals", () => {
     const paused = deriveActiveSessionSummaries(
       recovery({
-        walking_sessions: [{ id: "session-1", status: "ACTIVE" }],
+        walking_sessions: [
+          { id: "session-1", status: "ACTIVE", started_at: "2026-09-14T11:45:00.000Z" },
+        ],
         walking_bouts: [
           {
             id: "bout-1",
@@ -80,7 +84,9 @@ describe("deriveActiveSessionSummaries", () => {
     );
     const resting = deriveActiveSessionSummaries(
       recovery({
-        walking_sessions: [{ id: "session-1", status: "ACTIVE" }],
+        walking_sessions: [
+          { id: "session-1", status: "ACTIVE", started_at: "2026-09-14T11:45:00.000Z" },
+        ],
         walking_bouts: [
           {
             id: "bout-1",
@@ -101,14 +107,18 @@ describe("deriveActiveSessionSummaries", () => {
       now,
     );
 
-    expect(paused[0]).toEqual(expect.objectContaining({ status: "Paused", elapsedMs: 120_000 }));
-    expect(resting[0]).toEqual(expect.objectContaining({ status: "Resting", elapsedMs: 60_000 }));
+    expect(paused[0]).toEqual(
+      expect.objectContaining({ status: "Paused · Bout 1", elapsedMs: 120_000 }),
+    );
+    expect(resting[0]).toEqual(
+      expect.objectContaining({ status: "Resting after bout 1", elapsedMs: 60_000 }),
+    );
   });
 
   it("returns one persisted resume card for each simultaneously active workout type", () => {
     const summaries = deriveActiveSessionSummaries(
       recovery({
-        walking_sessions: [{ id: "pad", status: "ACTIVE" }],
+        walking_sessions: [{ id: "pad", status: "ACTIVE", started_at: "2026-09-14T12:00:00.000Z" }],
         resistance_sessions: [{ id: "weights", status: "ACTIVE", title: "Day 3" }],
         resistance_rows: [
           { id: "row-1", resistance_session_id: "weights", completed: true },
@@ -129,7 +139,7 @@ describe("deriveActiveSessionSummaries", () => {
 
     expect(summaries).toHaveLength(3);
     expect(summaries).toEqual([
-      expect.objectContaining({ title: "PAD Walking", status: "Ready" }),
+      expect.objectContaining({ title: "PAD Walking", status: "Ready to start bout 1" }),
       expect.objectContaining({ title: "Day 3", status: "1 / 2 exercises complete" }),
       expect.objectContaining({ title: "Cardio · Arm crank", elapsedMs: 300_000 }),
     ]);

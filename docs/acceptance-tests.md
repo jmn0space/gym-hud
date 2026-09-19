@@ -76,39 +76,46 @@ part of issue #15. Issue #17 delivered the installation/service-worker work,
 which turns the installation and offline-reopen items below into a fully
 specified, runnable device procedure — see
 [`docs/device-smoke-tests.md`](device-smoke-tests.md) for the exact numbered
-steps and its results table for whether it has actually been run. The other
-items still depend on PAD controls or the backend synchronization contract
-(issue #13), neither of which issue #17 implements, and remain out of scope
-here; each is annotated below with exactly what it is still waiting on.
+steps and its results table for whether it has actually been run. Issue #18
+then delivered the first PAD controls — start a walking session, start a
+walking bout, finish the session — which unblocks the walking half of several
+items below (Part B of `docs/device-smoke-tests.md` is now a runnable
+procedure). Pause, finish-bout and rest controls, and the backend
+synchronization contract (issue #13), are still outstanding; each item is
+annotated below with exactly what it is still waiting on.
 
 - [ ] Start a PAD bout while offline and confirm the saved state is visible.
-  **Blocked on PAD controls** (a separate, not-yet-implemented issue): there
-  is currently no UI action that starts a walking bout at all —
-  `frontend/src/pages/PadPage.tsx` is an explicit "Not available yet" stub —
-  so this cannot be exercised on any build, offline or not, regardless of
-  installation/service-worker state.
+  **No longer blocked; not yet run.** Issue #18 added the start-session and
+  start-walking controls to `frontend/src/pages/PadPage.tsx`, so this is now a
+  runnable device procedure — see Part B of
+  [`docs/device-smoke-tests.md`](device-smoke-tests.md). This box records the
+  manual device run only, which has not happened.
 - [ ] Lock the phone long enough for the timer display to become stale, then unlock
   and confirm elapsed time is recomputed from stored UTC timestamps.
-  **Blocked on PAD controls**, for the same reason as above: this is PAD-01's
-  scenario, and PAD-01 needs a bout already in progress to lock the phone
-  during.
+  **No longer blocked; not yet run.** This is PAD-01's scenario, and a bout can
+  now be started to lock the phone during (Part B of
+  [`docs/device-smoke-tests.md`](device-smoke-tests.md)). Automated,
+  clock-controlled coverage of the same derivation exists (see PAD-01 below);
+  it is not a substitute for this box, which is about a real locked phone.
 - [ ] Force-stop the installed PWA/browser process, reopen it, and confirm Home shows
   `Resume PAD Walking` with the correct WALKING, PAUSED, or RESTING state.
-  **Partially specified by issue #17, partially still blocked.** The
+  **Runnable for WALKING; PAUSED and RESTING still blocked; not yet run.** The
   "installed," "force-stop," and "cold-start reopen while offline" mechanics
-  this item needs are now a concrete procedure in
-  [`docs/device-smoke-tests.md`](device-smoke-tests.md) (steps covering
-  installation over the HTTPS preview through a cold offline reopen).
-  Confirming the specific claim in this item — that `Resume PAD Walking`
-  then appears with the correct WALKING/PAUSED/RESTING state — is PAD-02
-  below, and still requires an actual active walking bout to exist on the
-  device, which needs PAD controls; `docs/device-smoke-tests.md` records
-  that half as blocked, not as run.
+  are a concrete procedure in
+  [`docs/device-smoke-tests.md`](device-smoke-tests.md), and issue #18's
+  controls can now put a real walking bout on the device before the force-stop,
+  so the WALKING case (PAD-02 below) is runnable. PAUSED and RESTING cannot yet
+  be produced through the UI — pause and finish-bout controls are the deferred
+  story — so that part of this item stays blocked. The application reconstructs
+  and displays both states when the records exist, and automated tests cover
+  that, but no device run has been performed.
 - [ ] Complete a multi-record transition offline, reload, and confirm its pending
   synchronization action is still present exactly once.
-  **Blocked on PAD controls**: a "multi-record transition" (e.g. finishing a
-  bout and starting its rest in one action, per LOCAL-03) is itself a PAD
-  control action that does not exist in the UI yet.
+  **Partially unblocked; not yet run.** `FINISH SESSION` with a bout still open
+  is a multi-record transition in one action (it closes the bout and completes
+  the session together), so this item can now be exercised that way. The
+  specific transition LOCAL-03 names — finishing a bout and starting its rest —
+  still needs the deferred finish-bout control.
 - [ ] Restore connectivity and confirm a failed synchronization attempt remains
   pending for retry.
   **Blocked on the backend synchronization contract (issue #13)**: there is
@@ -134,6 +141,15 @@ this document for the acceptance-level statement these checks, PAD-02, and
 
 Expected: displayed duration matches timestamp-derived duration.
 
+Automated coverage (issue #18): `PAD-01 — lock-screen recovery` in
+`frontend/src/pages/PadPage.test.tsx` runs this with every timer faked, so no
+tick is delivered while the clock advances; the display only catches up when the
+app becomes visible again, and then matches the timestamp-derived duration
+exactly. That covers the derivation, not the device: the real locked-phone run
+is the checklist box above and Part B of
+[`docs/device-smoke-tests.md`](device-smoke-tests.md), neither of which has been
+performed.
+
 ### PAD-02 — Application termination
 
 1. Start a bout.
@@ -141,6 +157,16 @@ Expected: displayed duration matches timestamp-derived duration.
 3. Reopen the application.
 
 Expected: the home screen exposes `Resume PAD Walking` and reconstructs the correct state and elapsed duration.
+
+Automated coverage (issue #18): `PAD-02 — application termination` in
+`frontend/src/pages/PadPage.test.tsx` starts a session and bout through the UI,
+unmounts the view and closes the repository connection, then reopens the same
+database with a new connection and provider; the HUD and the Home Resume-card
+summary are both reconstructed from persisted records alone, with the correct
+bout number and elapsed duration. Terminating a React tree is not terminating an
+Android process: the real force-stop run is Part B of
+[`docs/device-smoke-tests.md`](device-smoke-tests.md) and has not been
+performed.
 
 ### PAD-03 — Offline session
 

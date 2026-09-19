@@ -135,7 +135,7 @@ describe("offline continuity across reconnects and schema upgrades", () => {
       expect.objectContaining({ mutation_id: "start-pad", sequence: 1 }),
     ]);
     expect(deriveActiveSessionSummaries(snapshot, NOW)).toEqual([
-      expect.objectContaining({ id: "pad-1", title: "PAD Walking", status: "Walking" }),
+      expect.objectContaining({ id: "pad-1", title: "PAD Walking", status: "Walking · Bout 1" }),
     ]);
     expect(hasLiveWork(snapshot, snapshot.pendingOutbox)).toBe(true);
   });
@@ -161,7 +161,7 @@ describe("offline continuity across reconnects and schema upgrades", () => {
     // The upgrade rebuilt the active markers, so the Resume card still resolves.
     const summaries = deriveActiveSessionSummaries(snapshot, NOW);
     expect(summaries).toEqual([
-      expect.objectContaining({ id: "pad-1", title: "PAD Walking", status: "Walking" }),
+      expect.objectContaining({ id: "pad-1", title: "PAD Walking", status: "Walking · Bout 1" }),
     ]);
     expect(summaries[0]?.elapsedMs).toBe(NOW - Date.parse("2026-09-16T09:45:00.000Z"));
     expect(hasLiveWork(snapshot, snapshot.pendingOutbox)).toBe(true);
@@ -195,7 +195,7 @@ describe("offline continuity across reconnects and schema upgrades", () => {
     ]);
     const snapshot = await upgraded.readSnapshot();
     expect(deriveActiveSessionSummaries(snapshot, NOW)).toEqual([
-      expect.objectContaining({ id: "pad-1", status: "Paused" }),
+      expect.objectContaining({ id: "pad-1", status: "Paused · Bout 1" }),
     ]);
   });
 

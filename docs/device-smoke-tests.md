@@ -3,9 +3,10 @@
 [← Documentation index](README.md) · [Architecture](architecture.md) · [Data & sync](data-sync.md) · [Acceptance criteria](acceptance-tests.md)
 
 This is the real-device evidence record for acceptance criterion 5 of issue
-#17 ("Record a real-device installation/offline-reopen smoke result").
-Target device: **Xiaomi Redmi Note 13 Pro+ / Android** (`docs/architecture.md`,
-"Primary target device").
+#17 ("Record a real-device installation/offline-reopen smoke result") and for
+the target-device evidence PAD-01 and PAD-02 require (issue #18, acceptance
+criterion 5). Target device: **Xiaomi Redmi Note 13 Pro+ / Android**
+(`docs/architecture.md`, "Primary target device").
 
 **Honesty statement.** No one has run this procedure on hardware yet. Every
 row in the [Results](#results) table below is marked `NOT YET RUN`. This
@@ -24,17 +25,24 @@ This procedure has two parts.
   and the "Force-stop the installed PWA/browser process, reopen it..." item
   in [`docs/acceptance-tests.md`](acceptance-tests.md#follow-up-android-and-synchronization-checklist)
   need.
-- **Part B — PAD-02 and cached reference data.** Cannot be genuinely
-  exercised yet. PAD-02 (see `docs/acceptance-tests.md`, "PAD-02 —
-  Application termination") needs an active walking bout to already exist on
-  the device, which needs PAD walking controls — a separate, not-yet-implemented
-  issue (`frontend/src/pages/PadPage.tsx` is currently an explicit "Not
-  available yet" stub). Confirming cached reference data survives an offline
-  reopen needs something to have actually written that cache, which needs the
-  backend synchronization contract (issue #13) — there is no sync engine yet
-  (see [Data & synchronization: sync gate](data-sync.md#sync-gate)). Both
-  remain out of scope for this smoke test and are recorded as blocked, not
-  attempted. Re-run Part B once its blocking issue ships.
+- **Part B — PAD-01 and PAD-02 (walking state).** Runnable since issue #18
+  added the first PAD controls: `START` on the PAD screen creates a walking
+  session, and `START WALKING` starts a bout, so an active bout can exist on
+  the device before the phone is locked or the process is force-stopped. The
+  numbered procedure is below; it has not been run.
+
+  Two things inside Part B remain blocked and must not be recorded as passing:
+
+  - the PAUSED and RESTING variants of "Home shows `Resume PAD Walking` with
+    the correct state". Pause and finish-bout controls are the deferred
+    pause/rest/pain/completion story, so the UI cannot produce those states
+    yet. Only WALKING can be exercised on a device today;
+  - confirming cached reference data survives an offline reopen, which needs
+    something to have written that cache — the backend synchronization
+    contract (issue #13); there is no sync engine yet (see [Data &
+    synchronization: sync gate](data-sync.md#sync-gate)).
+
+  Re-run the blocked items once their blocking issue ships.
 
 ## Prerequisites
 
@@ -160,18 +168,52 @@ This procedure has two parts.
     down -v`). Leaving the CA trusted and the key on disk is the whole risk
     step 2 describes; do not skip this because the app worked.
 
-### Part B — blocked; do not attempt yet
+### Part B — PAD-01 and PAD-02 on the device
 
-- Confirming `Resume PAD Walking` appears with the correct WALKING/PAUSED/
-  RESTING state after step 9 above (PAD-02, and the "active-session
-  presence" and "current PAD walking/pause/rest state" clauses of the
-  Overall v1 continuity criterion in `docs/acceptance-tests.md`) requires an
-  active walking bout to exist before step 7. There is no UI to create one
-  yet. Re-run steps 6–10 once PAD controls ship, starting a bout between
-  steps 6 and 7.
-- Confirming cached reference data survives the same offline reopen requires
-  something to have written that cache first, which requires the backend
-  synchronization contract (issue #13). Re-run once that exists.
+Run Part A first, at least through step 6 (installed, launched standalone,
+signed in). Part B then continues on the same installed app, so leave Part A's
+step 12 teardown (removing the CA and destroying the preview volume) until Part
+B is finished too. Steps B1–B4 are PAD-01; steps B5–B9 are PAD-02.
+
+B1. On the installed app, open `PAD` from the bottom navigation. Confirm the
+    start screen shows the treadmill settings (speed, incline, maximum bout)
+    and a `Start` button. On a device that has completed a walking session
+    before, confirm the settings match that session's; on a fresh install,
+    confirm they are the application defaults `5.0 km/h`, `2.0 %`, `8`
+    minutes.
+B2. Press `Start`, then press `Start walking`. Confirm the screen shows
+    `Bout 1`, the state `Walking`, and a timer counting from `00:00`. Note the
+    wall-clock time here — everything below is checked against it, not against
+    what the app was showing when the screen went off.
+B3. Lock the phone (power button) and leave it locked for at least five
+    minutes. Do not merely switch apps: the screen must be off long enough for
+    the timer to be throttled or stopped entirely.
+B4. Unlock and return to the app. Confirm the displayed duration equals the
+    real time elapsed since B2 (within a second), not a smaller value that
+    stopped while the screen was off. **This is PAD-01.**
+B5. Enable Airplane Mode (if Part A left it off) and confirm the bout keeps
+    running with no error banner. **This is the "start a PAD bout while
+    offline" checklist item** in `docs/acceptance-tests.md`; if the bout was
+    started online in B2, start a second session offline to exercise it
+    properly: press `Finish session`, then `Start` and `Start walking` again
+    while offline.
+B6. Fully terminate the app process, exactly as in Part A step 8 (Recent Apps
+    → swipe away, or Settings → Apps → Gym HUD → Force stop). This must be a
+    real process termination.
+B7. While still offline, cold-start the app from its home-screen icon.
+B8. Confirm Home shows a `Resume PAD Walking` card whose state reads
+    `Walking · Bout N` for the bout that was running, with an elapsed time
+    matching the real time since that bout started. **This is PAD-02.**
+B9. Press `Resume`. Confirm the PAD screen shows the same bout number, the
+    same treadmill settings, and the same elapsed time (within a second), then
+    press `Finish session` to leave the device with no active session.
+
+Not attemptable yet, and to be left as `BLOCKED` in the results table:
+
+- the PAUSED and RESTING variants of B8 — the controls that produce those
+  states are the deferred pause/finish-bout story;
+- confirming cached reference data survives the same offline reopen, which
+  requires the backend synchronization contract (issue #13).
 
 ## Results
 
@@ -202,7 +244,16 @@ Per-step results (Run 1):
 | 9 | A | Cold-start offline | NOT YET RUN | |
 | 10 | A | Shell loads offline; reaches `unverified`; Home renders | NOT YET RUN | |
 | 11 | A | Reconnect; reconciles to `authenticated` automatically | NOT YET RUN | |
-| — | B | `Resume PAD Walking` with correct state (PAD-02) | BLOCKED | needs PAD controls (separate issue) |
+| B1 | B | PAD start screen with inherited or default settings | NOT YET RUN | |
+| B2 | B | `Start` then `Start walking`; Bout 1 counting | NOT YET RUN | |
+| B3 | B | Phone locked at least five minutes | NOT YET RUN | |
+| B4 | B | Duration matches real elapsed time after unlock (PAD-01) | NOT YET RUN | |
+| B5 | B | Bout started/continued offline, state visible | NOT YET RUN | |
+| B6 | B | Force-stop the app process with a bout running | NOT YET RUN | |
+| B7 | B | Cold-start offline | NOT YET RUN | |
+| B8 | B | `Resume PAD Walking` shows `Walking · Bout N` and correct elapsed (PAD-02) | NOT YET RUN | |
+| B9 | B | PAD screen resumes the same bout; session finished | NOT YET RUN | |
+| — | B | `Resume PAD Walking` in PAUSED or RESTING state | BLOCKED | needs pause/finish-bout controls (deferred story) |
 | — | B | Cached reference data survives offline reopen | BLOCKED | needs backend sync contract (issue #13) |
 
 An unrun step must never be recorded as `PASS`. If a step is executed and
