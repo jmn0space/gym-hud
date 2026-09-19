@@ -237,10 +237,13 @@ _YELLOW = "\033[33m"
 _RESET = "\033[0m"
 
 
-def _validate_login_throttle_rate(
-    rate: str, *, env_var: str = "DJANGO_LOGIN_THROTTLE_RATE"
-) -> None:
+def _validate_throttle_rate(rate: str, *, env_var: str = "DJANGO_LOGIN_THROTTLE_RATE") -> None:
     """Raise ``ImproperlyConfigured`` if ``rate`` is not a usable DRF throttle rate.
+
+    Checks every throttle rate these settings define -- the login rate and the
+    sync rate -- with ``env_var`` naming the variable in the error message. The
+    login rate is the sharpest case, described below; the sync rate fails the
+    same way on every ``/api/v1/sync/`` request.
 
     ``core.throttling.check_login_rate_limit`` and DRF's own
     ``ScopedRateThrottle`` both parse ``DJANGO_LOGIN_THROTTLE_RATE`` lazily,
@@ -306,9 +309,9 @@ def audit_security(
     sync_throttle_rate: str | None = None,
 ) -> None:
     """Validate settings after environment-specific overrides are applied."""
-    _validate_login_throttle_rate(login_throttle_rate)
+    _validate_throttle_rate(login_throttle_rate)
     if sync_throttle_rate is not None:
-        _validate_login_throttle_rate(sync_throttle_rate, env_var="DJANGO_SYNC_THROTTLE_RATE")
+        _validate_throttle_rate(sync_throttle_rate, env_var="DJANGO_SYNC_THROTTLE_RATE")
     insecure_hosts = {"*", "localhost", "127.0.0.1", "0.0.0.0", "[::1]"}  # noqa: S104
 
     if environment == "production":

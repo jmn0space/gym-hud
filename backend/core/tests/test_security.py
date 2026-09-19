@@ -128,7 +128,7 @@ def test_audit_security_rejects_a_malformed_login_throttle_rate(rate: str) -> No
     ScopedRateThrottle only discover a bad rate the first time a request
     needs to parse it: manage.py check reports no issues, the health probe
     passes, and then every login (API and /admin/) 500s. See
-    config.settings.base._validate_login_throttle_rate's docstring for the
+    config.settings.base._validate_throttle_rate's docstring for the
     exact exception each of these shapes raises downstream.
     """
     with pytest.raises(ImproperlyConfigured, match="DJANGO_LOGIN_THROTTLE_RATE"):
