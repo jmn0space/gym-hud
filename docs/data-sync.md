@@ -73,9 +73,10 @@ transaction cannot start because it went stale (`InvalidStateError`), the
 repository drops its cached connection so the next call reopens automatically,
 rather than failing every read and write until the page is reloaded.
 
-This is a versioned **local contract**. Its outbox envelope and ordering rules are
-provisional until the backend synchronization contract in issue #13 is agreed. It
-does not define server conflict resolution or an acknowledgement API.
+This is a versioned **local contract**. Its v1 outbox envelope is, unchanged, the
+payload of the server protocol: see [Server synchronization
+protocol](#server-synchronization-protocol) for the acknowledgement, idempotency,
+validation and conflict rules the server applies to it.
 
 ## Local action contract
 
@@ -160,8 +161,9 @@ After screen lock, reload, PWA termination, or browser-process termination, the 
 
 The current local baseline allows at most one `ACTIVE` session per type: one PAD,
 one resistance, and one cardio session. Different session types may be active at
-the same time, and Home exposes one Resume card for each. This baseline is pending
-the final backend model and synchronization decisions in issue #13.
+the same time, and Home exposes one Resume card for each. The server enforces the
+same rule for PAD (at most one live `ACTIVE` walking session per account, as a
+database constraint); resistance and cardio get theirs with their server stores.
 
 Within a PAD session, the transaction also prevents two live open bouts for the
 same session and two live open pauses or rests for the same bout. This protects
@@ -277,7 +279,8 @@ exercise_registry
 
 The server records processed mutation IDs. Replaying the same mutation must not duplicate logical events.
 
-Synchronization is therefore **idempotent**.
+Synchronization is therefore **idempotent** (see [Idempotency and the
+processed-mutation ledger](#idempotency-and-the-processed-mutation-ledger)).
 
 ## Synchronization triggers
 
@@ -293,7 +296,388 @@ The application must never depend on step 5.
 
 A successfully acknowledged mutation is removed from the pending local outbox.
 Its action receipt remains durable for retry deduplication. Failed mutations remain
-queued. The server acknowledgement exchange itself remains part of issue #13.
+queued, and permanently rejected ones are kept for attention rather than discarded
+(see [Client obligations](#client-obligations)). The acknowledgement exchange is
+defined under [Server synchronization protocol](#server-synchronization-protocol);
+the client engine that performs it is issue #20.
+
+## Server synchronization protocol
+
+**Status: agreed v1 server contract** (issue #19). It settles the acknowledgement,
+idempotency, conflict and validation parts of issue #13 for PAD. The server side is
+implemented in `backend/apps/sync` (ledger, envelope parsing, engine, endpoints) and
+`backend/apps/pad` (PAD models and rules); the client engine that drains the outbox
+through it is issue #20. Resistance, cardio and routine stores are not synchronized
+yet (see [Unsupported stores and versions](#unsupported-stores-and-versions)).
+
+### Endpoints
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/v1/sync/mutations/` | POST | Push pending outbox entries; one acknowledgement per processed mutation. |
+| `/api/v1/sync/bootstrap/` | GET | PAD defaults, the settings a new session inherits, the change cursor, request limits. |
+| `/api/v1/sync/changes/` | GET | The account's records changed after a cursor, tombstones included, paged. |
+
+All three require the Django session (anonymous: `401 not_authenticated`), are
+never cached (`Cache-Control: no-store`), and share one per-user rate limit (the
+`sync` throttle scope, `DJANGO_SYNC_THROTTLE_RATE`, default `120/min`). The POST is
+CSRF-protected like every unsafe API request (`X-CSRFToken`; failure is
+`403 csrf_failed`).
+
+### Push request
+
+```json
+{
+  "client_id": "b0c9e5a4-3f2d-4e1c-9a8b-7c6d5e4f3a21",
+  "mutations": [
+    {
+      "version": 1,
+      "mutation_id": "0d8e5c4a-6b1f-4f7e-9a2d-3c4b5a697881",
+      "sequence": 41,
+      "created_at": "2026-09-14T10:10:30.000Z",
+      "changes": [
+        {
+          "store": "walking_bouts",
+          "entity_type": "walking_bout",
+          "entity_id": "5e1d2c3b-4a59-4687-b7c6-d5e4f3a2b1c0",
+          "operation": "put",
+          "record": {
+            "id": "5e1d2c3b-4a59-4687-b7c6-d5e4f3a2b1c0",
+            "walking_session_id": "9f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a",
+            "bout_number": 1,
+            "started_at": "2026-09-14T10:02:00.000Z",
+            "ended_at": "2026-09-14T10:10:30.000Z",
+            "pain_min": 2,
+            "pain_max": 3,
+            "stop_reason": "MAX_DURATION",
+            "notes": null,
+            "created_at": "2026-09-14T10:02:00.000Z",
+            "updated_at": "2026-09-14T10:10:30.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_rests",
+          "entity_type": "walking_rest",
+          "entity_id": "7a6b5c4d-3e2f-4012-9345-6789abcdef01",
+          "operation": "put",
+          "record": {
+            "id": "7a6b5c4d-3e2f-4012-9345-6789abcdef01",
+            "walking_bout_id": "5e1d2c3b-4a59-4687-b7c6-d5e4f3a2b1c0",
+            "started_at": "2026-09-14T10:10:30.000Z",
+            "ended_at": null,
+            "created_at": "2026-09-14T10:10:30.000Z",
+            "updated_at": "2026-09-14T10:10:30.000Z",
+            "deleted_at": null
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+- `client_id` is the device's repository client id (`internal_metadata`); the
+  envelope itself carries none.
+- `mutations` are pending outbox entries **verbatim**, in ascending `sequence`
+  order, 1 to 50 per request. The request body may be at most Django's
+  `DATA_UPLOAD_MAX_MEMORY_SIZE` (2.5 MiB by default); one mutation may hold at most
+  500 changes. Both limits are also reported by the bootstrap read.
+
+### Push response
+
+`200` with one entry per **processed** mutation, in request order:
+
+```json
+{
+  "results": [
+    { "mutation_id": "0d8e5c4a-…", "status": "applied" },
+    { "mutation_id": "1f2e3d4c-…", "status": "duplicate" },
+    {
+      "mutation_id": "2a3b4c5d-…",
+      "status": "rejected",
+      "code": "invalid_timing",
+      "retryable": false,
+      "detail": "walking_rests/7a6b…: starts before its bout ended."
+    },
+    {
+      "mutation_id": "3b4c5d6e-…",
+      "status": "retry",
+      "code": "unsupported_store",
+      "retryable": true,
+      "detail": "This server does not synchronize resistance_sessions yet; keep the mutation queued."
+    }
+  ]
+}
+```
+
+| `status` | Meaning | Client action (issue #20) |
+| --- | --- | --- |
+| `applied` | Applied now, in one transaction with its ledger row. | Remove from the outbox (the receipt stays). |
+| `duplicate` | Already applied earlier with an identical payload; nothing was applied again. | Same as `applied`. |
+| `rejected` | Permanent; nothing of the mutation was applied. Recorded, so every retry of the same mutation gets this identical entry. | See [Client obligations](#client-obligations). |
+| `retry` | Retryable; nothing was applied or recorded. | Keep it queued and resend it, and everything after it, later. |
+
+**Batch rule.** Mutations are processed in order, each in its own transaction.
+Processing **stops at the first `retry`**: the mutations after it are neither
+processed nor listed, so nothing is applied ahead of a mutation that will be sent
+again. A `rejected` mutation does **not** stop the batch. A later mutation that
+depended on it -- one that references a record the rejected mutation would have
+created, say -- fails its own validation (`parent_not_found`, `active_conflict`,
+`invalid_transition`, ...) and is rejected in turn. A later put that carries the
+full record itself does not depend on the rejected mutation and can still apply.
+
+### Request-level errors
+
+These use the uniform `{"code", "detail"}` error shape and process nothing:
+
+| Situation | Status | `code` |
+| --- | --- | --- |
+| Body not an object; `client_id` not a lowercase UUID; `mutations` empty, not a list, over 50, or not in strictly ascending `sequence` order | 400 | `invalid_request` |
+| Body is not valid JSON | 400 | `parse_error` |
+| Body is not `application/json` | 415 | `unsupported_media_type` |
+| Body larger than `DATA_UPLOAD_MAX_MEMORY_SIZE` | 413 | `request_too_large` |
+| No session / CSRF failure | 401 / 403 | `not_authenticated` / `csrf_failed` |
+| Rate limit | 429 | `throttled` |
+
+A `5xx` or a lost response may leave earlier mutations of the request committed.
+Resending the whole request is always safe: they come back as `duplicate`.
+
+A single mutation that is unusable as a unit -- its entry is not an object, or its
+`sequence` is not a positive integer -- is that mutation's own `rejected` entry
+rather than a `400`, so one corrupt outbox entry cannot block the queue behind it.
+
+### Codes
+
+| `code` | `retryable` | Recorded | Meaning |
+| --- | --- | --- | --- |
+| `invalid_envelope` | no | yes (no, if `mutation_id` itself is not a UUID) | The envelope's own shape: `version`, `sequence`, `created_at`, `changes` (1–500), a change's `store`/`entity_type`/`entity_id`/`operation`, `record.id` (and a delete's `id`) equal to `entity_id`, one change per record. |
+| `invalid_record` | no | yes | A field of one record: types, lowercase UUIDs, timestamps with a time zone, `status`, `pain_min`/`pain_max`, `stop_reason`, the treadmill settings, `completed_at` versus `status`, `deleted_at` null on a put, a tombstone `deleted_at` on a delete, text without NUL characters. |
+| `invalid_timing` | no | yes | A timestamp ordering or containment rule (see [PAD validation](#pad-validation)). |
+| `invalid_transition` | no | yes | A state rule: a finished session changed status, a parent reference changed, a record deleted while it has live children, or a bout open while a rest is open (PAD-06). |
+| `active_conflict` | no | yes | A "one at a time" rule: a second `ACTIVE` session, open bout per session, open pause per bout, or rest per bout. |
+| `parent_not_found` | no | yes | The parent a record references is missing, deleted, or not this account's. |
+| `not_found` | no | yes | A put names a record id that is not available to this account. |
+| `mutation_id_conflict` | no | no | This `mutation_id` was already used with a different payload (or by another account). The ledger keeps the original. |
+| `unsupported_store` | yes | no | A change targets a store this server does not synchronize yet. |
+| `unsupported_version` | yes | no | An envelope `version` newer than this server applies (1). |
+| `temporarily_unavailable` | yes | no | A database error (lost connection, deadlock, serialization failure); retry later. |
+
+### Idempotency and the processed-mutation ledger
+
+Every final outcome is written to the ledger (`ProcessedMutation`) in the same
+transaction as the mutation: `mutation_id` (unique in the database), the owning
+account, `client_id`, `sequence`, the outcome (`applied` or `rejected`, with `code`
+and `detail`), and the envelope's canonical JSON text with its SHA-256
+**fingerprint** (sorted keys, no whitespace; `client_id` is not part of it).
+
+- Same `mutation_id`, same payload → `duplicate` if it was applied, or the recorded
+  rejection repeated verbatim. Nothing is applied twice.
+- Same `mutation_id`, different payload, or another account's `mutation_id` →
+  `rejected` / `mutation_id_conflict`. The first account's outcome is never revealed.
+- `retry` outcomes are never recorded: retrying them is the point.
+
+Each mutation first locks the account's `SyncState` row (`SELECT … FOR UPDATE`), so
+one account's mutations commit strictly one after another: a second, concurrent
+delivery of the same mutation waits, then finds the ledger row and is answered
+`duplicate`. The unique index on `mutation_id` is the last line of defense between
+accounts. PostgreSQL tests in `apps/sync/tests/test_concurrency_pg.py` prove both
+with real concurrent connections.
+
+### Transactions and validation
+
+For each mutation, inside one database transaction:
+
+1. **Parse everything first.** The envelope and every record are validated before
+   anything is written; any failure rejects the mutation untouched.
+2. **Write in dependency order.** The server does not rely on the envelope's change
+   order. It writes deletes deepest-first, then puts parent-first, and within one
+   depth puts that close a record before puts that open one. Every change targets a
+   different record, so the order cannot change the result; it only keeps each
+   intermediate state inside the database's one-open-record indexes.
+3. **Validate the finished state** of everything the mutation touched: parents live
+   and owned, no live children under a deleted parent, and for PAD the whole tree of
+   every walking session touched (see [PAD validation](#pad-validation)). A
+   multi-record operation -- finish bout + start rest, close rest + start next bout,
+   a time correction moving several timestamps -- is judged only as a whole.
+4. **Record** the outcome in the ledger and advance the account's change counter.
+
+Any failure in steps 2–3 rolls back every write of the mutation; nothing is ever
+partially applied. The finish-bout/start-rest and close-rest/start-next operations
+are therefore all-or-nothing on the server exactly as they are locally.
+
+Records may carry fields the server does not model (the repository carries unknown
+fields forward on every put); they are ignored, not rejected. Every field the
+current frontend writes is accepted with its exact value -- speed and incline are
+stored as double precision, so an inherited `5.65` km/h is neither rounded nor
+refused.
+
+### Conflict rule (latest explicit edit wins)
+
+- **Within one device** (`client_id`), the outbox `sequence` decides. Every server
+  row remembers the device and sequence that last wrote it. A change from the same
+  device with a *lower* sequence than that is **stale** and is skipped, even if the
+  device clock said it was later. A stale-skipped change is **not** a rejection:
+  its mutation is acknowledged `applied` (the ledger's `detail` names the skipped
+  records), because the record already holds that device's newer edit.
+- **Across devices**, the mutation the server commits last wins, record by record.
+- **Deletes** are tombstones (`deleted_at`), never removed. Deleting a record that
+  is already deleted, never reached the server, or belongs to another account
+  changes nothing and is acknowledged `applied`. A tombstone stays unless a *newer*
+  mutation puts the record again -- an explicit undo restores it -- and a stale
+  replay can never resurrect it. Tombstones count toward none of the "one at a
+  time" rules.
+- A record's parent reference (`walking_session_id`, `walking_bout_id`) is fixed
+  once the record exists; ids are never reused for another record.
+
+### PAD validation
+
+Per record (`invalid_record` / `invalid_timing`):
+
+- ids and parent ids are lowercase UUIDs; timestamps are ISO 8601 with a time zone;
+- a session's `status` is `ACTIVE`, `COMPLETED` or `DISCARDED`; `completed_at` is
+  null exactly while `ACTIVE`, and `completed_at >= started_at`;
+- `speed_kmh > 0`, `incline_pct >= 0`, `max_bout_seconds` a positive integer;
+- `bout_number` a positive integer; `stop_reason` null or one of the five reasons;
+- pain is null/null, or one value or two adjacent values from 1 to 5
+  (`pain_min <= pain_max <= pain_min + 1`);
+- every interval has `ended_at >= started_at` (an absent `ended_at` means open).
+
+Across records, on the finished state of each touched session (`invalid_timing`
+unless noted):
+
+- a bout starts at or after its session started;
+- a pause starts at or after its bout started; once the bout has ended, every pause
+  has ended too, at or before the bout's end;
+- a rest belongs to a bout that has ended, and starts at or after that end;
+- once the session is `COMPLETED` or `DISCARDED`, every bout and rest has ended, at
+  or before `completed_at`;
+- **PAD-06**: a session never has an open bout while one of its rests is open
+  (`invalid_transition`). `START NEXT BOUT` closes the rest in the same mutation;
+- at most one `ACTIVE` session per account, one open bout per session, one open
+  pause per bout, and one live rest per bout (`active_conflict`, database
+  constraints);
+- `ACTIVE` may become `COMPLETED` or `DISCARDED`; those are final
+  (`invalid_transition`). A finished session's other fields stay editable;
+- a record is deleted together with its live children, children first
+  (`invalid_transition`).
+
+**The frontend must mirror these rules** in its write transaction, so that it never
+queues a mutation the server will refuse: close every open pause when a bout ends
+and every open bout, pause and rest when the session ends; stamp an end no earlier
+than its start even if the device clock moved backwards; refuse a new bout while a
+rest is open; tombstone a rest when undoing the bout finish that created it; delete
+children with their parent; never reopen a finished session; keep pain, stop reason
+and text within the rules above. Today's local repository enforces the one-at-a-time
+rules but not containment, PAD-06, or the clock guard; the PAD controls (#21, #22)
+and the sync engine (#20) must add them.
+
+### Unsupported stores and versions
+
+A mutation with any change to a store the server does not synchronize yet
+(`resistance_sessions`, `resistance_rows`, `cardio_sessions`, `routine_templates`,
+`routine_exercises`, `exercise_registry`, or any unknown name) is answered `retry` /
+`unsupported_store` before its records are judged, and is not recorded. Like every
+`retry`, it ends the batch. The client keeps it -- and everything queued after it --
+until the server supports the store, so nothing is lost and nothing is applied out
+of order. The consequence is head-of-line blocking: such a mutation holds back later
+PAD mutations too, so a store's server support must ship before the frontend
+produces mutations for it (it produces none today). An envelope `version` newer
+than 1 is handled the same way (`unsupported_version`).
+
+### Client obligations
+
+Implemented by the sync engine (issue #20), not here:
+
+- On `applied` or `duplicate`, acknowledge the outbox entry (the action receipt
+  stays).
+- On `retry`, keep the mutation and every later one queued, and resend them later
+  starting from that mutation. Mutations not listed in the response were not
+  processed.
+- On `rejected`, **keep the mutation and its local data**, mark it as needing
+  attention, and stop retrying it. Never silently discard it: a rejection means the
+  user's workout data did not reach the server, and the user (or the owner, through
+  the ledger's `detail` in Django Admin) has to decide what happens next. Resending
+  the same mutation always returns the same rejection; a corrected version is a new
+  mutation with a new `mutation_id`.
+- On a request-level error, a network failure or a lost response, keep everything
+  queued and resend later; duplicates are answered `duplicate`.
+
+### Pull: bootstrap
+
+`GET /api/v1/sync/bootstrap/`:
+
+```json
+{
+  "cursor": 42,
+  "limits": { "max_mutations_per_request": 50, "max_changes_per_mutation": 500 },
+  "pad": {
+    "defaults": { "speed_kmh": 5.0, "incline_pct": 2.0, "max_bout_seconds": 480 },
+    "next_session_settings": {
+      "source": "previous_session",
+      "walking_session_id": "9f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a",
+      "speed_kmh": 5.65,
+      "incline_pct": 2.0,
+      "max_bout_seconds": 445
+    }
+  }
+}
+```
+
+`pad.defaults` are the `PadDefaults` saved in Django Admin, or the application
+defaults (5.0 km/h, 2.0 %, 480 s) until someone saves them: server configuration
+wins. `next_session_settings` are the most recently completed live session's
+settings (`source: "previous_session"`), else the defaults (`source: "defaults"`,
+`walking_session_id: null`); `DISCARDED` and deleted sessions are never inherited
+from. `cursor` is the account's current change counter.
+
+### Pull: changes feed
+
+`GET /api/v1/sync/changes/?since=<cursor>&limit=<n>` (`since` defaults to 0,
+`limit` to 200, at most 500; anything else is `400 invalid_request`):
+
+```json
+{
+  "changes": [
+    {
+      "store": "walking_bouts",
+      "entity_type": "walking_bout",
+      "entity_id": "5e1d2c3b-4a59-4687-b7c6-d5e4f3a2b1c0",
+      "change_seq": 41,
+      "record": { "id": "5e1d2c3b-…", "walking_session_id": "9f8e…", "…": "…", "deleted_at": null }
+    }
+  ],
+  "cursor": 41,
+  "has_more": true
+}
+```
+
+- Every applied mutation advances the account's change counter by one and stamps
+  the rows it wrote with the new value. The feed returns the account's rows with
+  `change_seq` above `since`, oldest change first and parents before children within
+  one change.
+- Each record appears once, at its latest version, in exactly the local record shape
+  (timestamps in `Date.toISOString()` form, tombstones included), so a device can
+  store it as-is.
+- Pages end on a mutation boundary (a page can exceed `limit` by at most one
+  mutation's changes). Pass the returned `cursor` as the next `since` while
+  `has_more` is true. A record's latest version can appear on a later page than a
+  child that references it.
+- The feed never skips a change that commits while it is being read: it reads the
+  counter first and leaves anything above it for the next request.
+- Only the signed-in account's records are ever returned.
+
+### Server model and administration
+
+`WalkingSession`, `WalkingBout`, `WalkingBoutPause` and `WalkingRest` mirror the
+local records: the client's UUID is the primary key, `created_at`/`updated_at`/
+`deleted_at` are the repository's own timestamps, and every row belongs to one
+account. Single-row and single-table rules are database constraints (check
+constraints and partial unique indexes that ignore tombstones); cross-record rules
+are enforced by the engine as above. Django Admin edits `PadDefaults` (a singleton)
+and shows walking sessions (with their bouts), bouts (with their pauses and rest)
+and the processed-mutation ledger **read-only**: an admin edit would bypass the
+ledger and the change counter, and the device's next edit would overwrite it.
 
 ## Service-worker updates and the outbox
 
@@ -484,8 +868,10 @@ Behavior by scenario:
 
 ### Sync gate
 
-There is no sync engine yet (issue #13). The frontend exposes one gate a future
-sync engine must consult before attempting network synchronization:
+There is no client sync engine yet (issue #20; the server side of the protocol
+exists, see [Server synchronization protocol](#server-synchronization-protocol)).
+The frontend exposes one gate that engine must consult before attempting network
+synchronization:
 
 ```text
 canSync(authStatus, online) := authStatus == "authenticated" AND online
@@ -507,11 +893,19 @@ For editable session data:
 latest explicit edit wins
 ```
 
+Precisely (see [Conflict rule](#conflict-rule-latest-explicit-edit-wins)): within
+one device the outbox `sequence` decides, whatever the wall clock said; across
+devices the mutation the server commits last wins; tombstones stick unless a newer
+mutation restores the record.
+
 For configuration edited through Django Admin:
 
 ```text
 server configuration wins
 ```
+
+For PAD that configuration is the `PadDefaults` singleton, served by
+[`GET /api/v1/sync/bootstrap/`](#pull-bootstrap).
 
 Pending local workout mutations must remain safely represented in the outbox before cached server reference data is replaced.
 

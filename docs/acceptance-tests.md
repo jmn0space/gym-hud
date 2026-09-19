@@ -80,9 +80,13 @@ steps and its results table for whether it has actually been run. Issue #18
 then delivered the first PAD controls — start a walking session, start a
 walking bout, finish the session — which unblocks the walking half of several
 items below (Part B of `docs/device-smoke-tests.md` is now a runnable
-procedure). Pause, finish-bout and rest controls, and the backend
-synchronization contract (issue #13), are still outstanding; each item is
-annotated below with exactly what it is still waiting on.
+procedure). Issue #19 delivered the server side of synchronization (the push
+protocol, the processed-mutation ledger and the PAD models; see [Data &
+synchronization: server synchronization
+protocol](data-sync.md#server-synchronization-protocol)). Pause, finish-bout and
+rest controls, and the client sync engine that drains the outbox (issue #20), are
+still outstanding; each item is annotated below with exactly what it is still
+waiting on.
 
 - [ ] Start a PAD bout while offline and confirm the saved state is visible.
   **No longer blocked; not yet run.** Issue #18 added the start-session and
@@ -118,11 +122,12 @@ annotated below with exactly what it is still waiting on.
   still needs the deferred finish-bout control.
 - [ ] Restore connectivity and confirm a failed synchronization attempt remains
   pending for retry.
-  **Blocked on the backend synchronization contract (issue #13)**: there is
-  no sync engine yet (see [Data & synchronization: sync
-  gate](data-sync.md#sync-gate)), so there is currently no synchronization
-  attempt to fail or retry — restoring connectivity today has nothing queued
-  to send.
+  **Blocked on the client sync engine (issue #20)**: the server protocol exists
+  since issue #19, and its retryable outcomes are defined (see [Data &
+  synchronization: push response](data-sync.md#push-response)), but nothing on
+  the device sends the outbox yet (see [Data & synchronization: sync
+  gate](data-sync.md#sync-gate)), so there is still no synchronization attempt
+  to fail or retry on a device.
 
 These boxes record manual device work only. Automated browser and repository tests
 do not mark them complete. See the Overall v1 continuity criterion at the end of
@@ -185,17 +190,46 @@ After PAD-03, restore connectivity.
 
 Expected: queued data synchronizes without manual re-entry.
 
+The server accepts and acknowledges queued PAD mutations since issue #19; sending
+them on reconnection is the client sync engine (issue #20), so this is not yet
+runnable.
+
 ### PAD-05 — Duplicate mutation
 
 Transmit the same mutation twice.
 
 Expected: only one logical server-side event exists.
 
+Automated coverage (issue #19), server side only:
+`test_pad05_the_same_mutation_twice_is_one_logical_event` in
+`backend/apps/sync/tests/test_mutations_api.py` sends one mutation in two requests
+through the real endpoint and asserts one bout, one ledger row, an unchanged change
+counter and an untouched row, with the second answered `duplicate`;
+`test_retry_after_a_lost_response_applies_nothing_twice` resends a whole batch whose
+response was lost. `backend/apps/sync/tests/test_concurrency_pg.py` delivers the same
+mutation from six concurrent PostgreSQL connections (one `applied`, five
+`duplicate`), races a retry against the original batch, and races two accounts on
+one `mutation_id`. The mutations are built the way the frontend repository builds
+them, but no device sends them yet: the transmit-twice-from-the-phone run needs the
+client sync engine (issue #20) and has not been performed.
+
 ### PAD-06 — Rest integrity
 
 While resting, attempt to start another bout outside the normal control.
 
 Expected: a new walking bout cannot start until the existing rest is closed. `START NEXT BOUT` closes the rest and starts the next bout atomically.
+
+Automated coverage (issue #19), server side only:
+`test_pad06_a_bout_cannot_start_while_a_rest_is_open` in
+`backend/apps/sync/tests/test_mutations_api.py` finishes a bout into a rest, then
+pushes a bare "start bout" mutation (`rejected`, `invalid_transition`, nothing
+written, the rest still open), then a close-rest + start-next mutation (`applied`,
+both records written); `test_close_rest_and_start_next_roll_back_together` and
+`test_finish_bout_and_start_rest_roll_back_together` show both multi-record
+operations roll back as a whole. This is the server refusing the out-of-band start.
+The device side -- the RESTING state, the `START NEXT BOUT` control, and a local
+rule that refuses the start before it is queued -- belongs to the pause/rest
+controls (issues #21/#22), is not built yet, and no device run has been performed.
 
 ### PAD-07 — Maximum timer
 
