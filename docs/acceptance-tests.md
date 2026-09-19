@@ -40,6 +40,14 @@ action ID after acknowledging its outbox entry.
 Expected: persisted sequences remain strictly increasing, and the retry returns the
 original receipt without recreating the action or pending outbox entry.
 
+Related automated coverage (issue #19 review), for the timestamps rather than the
+sequences: PAD actions never stamp a time earlier than the latest one already
+recorded in the session ("PAD clock stepping backwards" in
+`frontend/src/pad/padSession.test.ts`), and the server clamps any inversion that
+still reaches it instead of rejecting the mutation
+(`test_a_clock_step_back_does_not_strand_the_rest_of_the_queue` in
+`backend/apps/sync/tests/test_mutations_api.py`). No device run has been performed.
+
 ### LOCAL-05 — Concurrent connections
 
 Use independent connections to start two sessions of the same type, with an

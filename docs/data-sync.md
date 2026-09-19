@@ -129,7 +129,11 @@ later synchronization attempt can represent the deletion.
 
 The repository allocates `sequence` inside the same transaction. It is the local
 edit order even if the wall clock moves backwards; timestamps remain UTC ISO
-strings for elapsed-time reconstruction and display. An `action UUID` is stable
+strings for elapsed-time reconstruction and display. PAD actions never stamp a
+domain time (`started_at`, `ended_at`, `completed_at`) earlier than the latest one
+already recorded in that session (`monotonicNow` in `frontend/src/pad/actions.ts`):
+after a clock step back they reuse that latest moment, so a device never records an
+end before its start or a child outside its parent. An `action UUID` is stable
 across retries. Its durable receipt remains after the corresponding pending outbox
 entry is acknowledged, preventing a retry from creating a second logical action.
 
@@ -163,7 +167,9 @@ The current local baseline allows at most one `ACTIVE` session per type: one PAD
 one resistance, and one cardio session. Different session types may be active at
 the same time, and Home exposes one Resume card for each. The server enforces the
 same rule for PAD (at most one live `ACTIVE` walking session per account, as a
-database constraint); resistance and cardio get theirs with their server stores.
+database constraint), resolving a second one by closing the older, stuck session
+(see [Stuck ACTIVE sessions](#stuck-active-sessions)); resistance and cardio get
+theirs with their server stores.
 
 Within a PAD session, the transaction also prevents two live open bouts for the
 same session and two live open pauses or rests for the same bout. This protects
@@ -303,8 +309,12 @@ the client engine that performs it is issue #20.
 
 ## Server synchronization protocol
 
-**Status: agreed v1 server contract** (issue #19). It settles the acknowledgement,
-idempotency, conflict and validation parts of issue #13 for PAD. The server side is
+**Status: agreed v1 server contract** (issue #19), as revised by the owner after
+code review: clock-step timing inversions are clamped rather than rejected, a stuck
+`ACTIVE` session is superseded (or discarded by an administrator), a delete cascades
+to live children, a tombstone wins over other devices' puts, and same-device
+ordering is the client's obligation. It settles the acknowledgement, idempotency,
+conflict and validation parts of issue #13 for PAD. The server side is
 implemented in `backend/apps/sync` (ledger, envelope parsing, engine, endpoints) and
 `backend/apps/pad` (PAD models and rules); the client engine that drains the outbox
 through it is issue #20. Resistance, cardio and routine stores are not synchronized
@@ -396,9 +406,9 @@ CSRF-protected like every unsafe API request (`X-CSRFToken`; failure is
     {
       "mutation_id": "2a3b4c5d-…",
       "status": "rejected",
-      "code": "invalid_timing",
+      "code": "invalid_transition",
       "retryable": false,
-      "detail": "walking_rests/7a6b…: starts before its bout ended."
+      "detail": "walking_bouts/5e1d… cannot be walking while walking_rests/7a6b… is still open (PAD-06); …"
     },
     {
       "mutation_id": "3b4c5d6e-…",
@@ -413,10 +423,10 @@ CSRF-protected like every unsafe API request (`X-CSRFToken`; failure is
 
 | `status` | Meaning | Client action (issue #20) |
 | --- | --- | --- |
-| `applied` | Applied now, in one transaction with its ledger row. | Remove from the outbox (the receipt stays). |
+| `applied` | Applied now, in one transaction with its ledger row -- possibly with stale changes skipped or timestamps clamped (the ledger's `detail` says which). | Remove from the outbox (the receipt stays). |
 | `duplicate` | Already applied earlier with an identical payload; nothing was applied again. | Same as `applied`. |
 | `rejected` | Permanent; nothing of the mutation was applied. Recorded, so every retry of the same mutation gets this identical entry. | See [Client obligations](#client-obligations). |
-| `retry` | Retryable; nothing was applied or recorded. | Keep it queued and resend it, and everything after it, later. |
+| `retry` | Retryable; nothing of it was applied or recorded. | Keep it queued and resend it, and everything after it, later. |
 
 **Batch rule.** Mutations are processed in order, each in its own transaction.
 Processing **stops at the first `retry`**: the mutations after it are neither
@@ -440,8 +450,11 @@ These use the uniform `{"code", "detail"}` error shape and process nothing:
 | No session / CSRF failure | 401 / 403 | `not_authenticated` / `csrf_failed` |
 | Rate limit | 429 | `throttled` |
 
-A `5xx` or a lost response may leave earlier mutations of the request committed.
-Resending the whole request is always safe: they come back as `duplicate`.
+A lost response (or a `5xx` from outside the engine, such as a proxy) may leave
+earlier mutations of the request committed. Resending the whole request is always
+safe: they come back as `duplicate`. An unexpected failure while processing one
+mutation is not a `5xx`: it is that mutation's `retry` / `server_error`, and the
+results before it are returned as usual.
 
 A single mutation that is unusable as a unit -- its entry is not an object, or its
 `sequence` is not a positive integer -- is that mutation's own `rejected` entry
@@ -452,16 +465,16 @@ rather than a `400`, so one corrupt outbox entry cannot block the queue behind i
 | `code` | `retryable` | Recorded | Meaning |
 | --- | --- | --- | --- |
 | `invalid_envelope` | no | yes (no, if `mutation_id` itself is not a UUID) | The envelope's own shape: `version`, `sequence`, `created_at`, `changes` (1–500), a change's `store`/`entity_type`/`entity_id`/`operation`, `record.id` (and a delete's `id`) equal to `entity_id`, one change per record. |
-| `invalid_record` | no | yes | A field of one record: types, lowercase UUIDs, timestamps with a time zone, `status`, `pain_min`/`pain_max`, `stop_reason`, the treadmill settings, `completed_at` versus `status`, `deleted_at` null on a put, a tombstone `deleted_at` on a delete, text without NUL characters. |
-| `invalid_timing` | no | yes | A timestamp ordering or containment rule (see [PAD validation](#pad-validation)). |
-| `invalid_transition` | no | yes | A state rule: a finished session changed status, a parent reference changed, a record deleted while it has live children, or a bout open while a rest is open (PAD-06). |
-| `active_conflict` | no | yes | A "one at a time" rule: a second `ACTIVE` session, open bout per session, open pause per bout, or rest per bout. |
+| `invalid_record` | no | yes | A field of one record: types, lowercase UUIDs, timestamps with a time zone that are representable in UTC (years 1–9999), `status`, `pain_min`/`pain_max`, `stop_reason`, the treadmill settings (finite numbers), `completed_at` versus `status`, `deleted_at` null on a put, a tombstone `deleted_at` on a delete, text fields that are strings. |
+| `invalid_transition` | no | yes | A state rule: a `COMPLETED` session turned `DISCARDED` or back (unless the server wrote the closure), a parent reference changed, a rest under a bout that has not ended, or a bout open while a rest is open (PAD-06). |
+| `active_conflict` | no | yes | A "one at a time" rule broken within one mutation: two `ACTIVE` sessions, a second open bout per session, open pause per bout, or rest per bout. (A second `ACTIVE` session in a *later* mutation supersedes the first instead; see [Stuck ACTIVE sessions](#stuck-active-sessions).) |
 | `parent_not_found` | no | yes | The parent a record references is missing, deleted, or not this account's. |
 | `not_found` | no | yes | A put names a record id that is not available to this account. |
 | `mutation_id_conflict` | no | no | This `mutation_id` was already used with a different payload (or by another account). The ledger keeps the original. |
 | `unsupported_store` | yes | no | A change targets a store this server does not synchronize yet. |
 | `unsupported_version` | yes | no | An envelope `version` newer than this server applies (1). |
-| `temporarily_unavailable` | yes | no | A database error (lost connection, deadlock, serialization failure); retry later. |
+| `temporarily_unavailable` | yes | no | A database error (lost connection, deadlock, serialization failure, a lock not granted within 5 s); retry later. |
+| `server_error` | yes | no | An unexpected server failure on this mutation (logged with its stack trace); retry later. Never recorded: it may be a server bug on valid data, so it must not become a permanent rejection. |
 
 ### Idempotency and the processed-mutation ledger
 
@@ -469,42 +482,78 @@ Every final outcome is written to the ledger (`ProcessedMutation`) in the same
 transaction as the mutation: `mutation_id` (unique in the database), the owning
 account, `client_id`, `sequence`, the outcome (`applied` or `rejected`, with `code`
 and `detail`), and the envelope's canonical JSON text with its SHA-256
-**fingerprint** (sorted keys, no whitespace; `client_id` is not part of it).
+**fingerprint** (sorted keys, no whitespace; `client_id` is not part of it). The
+fingerprint always covers the whole envelope; the ledger keeps only the first
+64 KiB of its text (`envelope_truncated` says when it was cut), so a record stuffed
+with unknown fields cannot make the ledger grow without bound. A real PAD mutation
+is a few kilobytes.
 
 - Same `mutation_id`, same payload → `duplicate` if it was applied, or the recorded
   rejection repeated verbatim. Nothing is applied twice.
 - Same `mutation_id`, different payload, or another account's `mutation_id` →
   `rejected` / `mutation_id_conflict`. The first account's outcome is never revealed.
 - `retry` outcomes are never recorded: retrying them is the point.
+- An applied mutation's `detail` lists everything the server did beyond applying it
+  as sent: stale-skipped changes, clamped timestamps, a superseded session, records
+  deleted by cascade (see below).
 
 Each mutation first locks the account's `SyncState` row (`SELECT … FOR UPDATE`), so
 one account's mutations commit strictly one after another: a second, concurrent
 delivery of the same mutation waits, then finds the ledger row and is answered
 `duplicate`. The unique index on `mutation_id` is the last line of defense between
-accounts. PostgreSQL tests in `apps/sync/tests/test_concurrency_pg.py` prove both
-with real concurrent connections.
+accounts. On PostgreSQL the transaction waits at most 5 seconds for a lock
+(`SET LOCAL lock_timeout`); a mutation that times out is `retry` /
+`temporarily_unavailable`, never a `500`. PostgreSQL tests in
+`apps/sync/tests/test_concurrency_pg.py` prove all three with real concurrent
+connections; in CI (`CI` set) that module fails instead of skipping when the test
+database is not PostgreSQL.
+
+The server does **not** enforce that a device's sequences arrive contiguous or
+ascending across requests (within one request they must ascend, or the request is
+a `400`). That is a client obligation (see [Client obligations](#client-obligations));
+the server logs a warning when a new mutation arrives with a sequence below the
+highest one already processed for that account and `client_id`.
 
 ### Transactions and validation
 
 For each mutation, inside one database transaction:
 
 1. **Parse everything first.** The envelope and every record are validated before
-   anything is written; any failure rejects the mutation untouched.
+   anything is written; any failure rejects the mutation untouched. A record whose
+   end precedes its own start is not a failure: the end is clamped up to the start
+   (see [Clock steps are clamped](#clock-steps-are-clamped)).
 2. **Write in dependency order.** The server does not rely on the envelope's change
    order. It writes deletes deepest-first, then puts parent-first, and within one
    depth puts that close a record before puts that open one. Every change targets a
    different record, so the order cannot change the result; it only keeps each
-   intermediate state inside the database's one-open-record indexes.
-3. **Validate the finished state** of everything the mutation touched: parents live
-   and owned, no live children under a deleted parent, and for PAD the whole tree of
-   every walking session touched (see [PAD validation](#pad-validation)). A
-   multi-record operation -- finish bout + start rest, close rest + start next bout,
-   a time correction moving several timestamps -- is judged only as a whole.
+   intermediate state inside the database's one-open-record indexes. Stale puts are
+   skipped here ([Conflict rule](#conflict-rule-latest-explicit-edit-wins)); a delete
+   also tombstones the live children it did not list; a put that makes a session
+   `ACTIVE` first closes any other, stuck, `ACTIVE` session of the account.
+3. **Settle the finished state** of everything the mutation touched: parents live
+   and owned, and for PAD the whole tree of every walking session touched -- clamping
+   timestamps into their parents, then checking the rules clamping cannot fix (see
+   [PAD validation](#pad-validation)). A multi-record operation -- finish bout +
+   start rest, close rest + start next bout, a time correction moving several
+   timestamps -- is judged only as a whole.
 4. **Record** the outcome in the ledger and advance the account's change counter.
+   Every row the mutation wrote *or the server changed on its behalf* (a clamp, a
+   supersede, a cascade) carries the new counter value, so the changes feed carries
+   all of it to every device.
 
-Any failure in steps 2–3 rolls back every write of the mutation; nothing is ever
-partially applied. The finish-bout/start-rest and close-rest/start-next operations
-are therefore all-or-nothing on the server exactly as they are locally.
+A failure in steps 2–3 rolls back every write of the mutation: a rejected or retried
+mutation leaves nothing behind. An applied mutation is applied as one unit, but not
+necessarily *verbatim*: individual changes may be skipped as stale (their records
+already hold something newer), and timestamps may be clamped -- each such deviation
+is named in the ledger's `detail`. The finish-bout/start-rest and close-rest/start-next
+operations are therefore all-or-nothing on the server exactly as they are locally.
+
+An unexpected, non-database exception while one mutation is processed rolls that
+mutation back, is logged with its stack trace, and answers it `retry` /
+`server_error`; the batch ends there, and the results of the mutations before it are
+returned in a normal `200`. It is never recorded as a rejection, because it may be a
+server bug on valid workout data. Database errors keep their own classification
+(`temporarily_unavailable`, or a constraint named as a rejection).
 
 Records may carry fields the server does not model (the repository carries unknown
 fields forward on every put); they are ignored, not rejected. Every field the
@@ -520,57 +569,123 @@ refused.
   device clock said it was later. A stale-skipped change is **not** a rejection:
   its mutation is acknowledged `applied` (the ledger's `detail` names the skipped
   records), because the record already holds that device's newer edit.
-- **Across devices**, the mutation the server commits last wins, record by record.
+- **Across devices**, the mutation the server commits last wins, record by record --
+  except over a tombstone.
 - **Deletes** are tombstones (`deleted_at`), never removed. Deleting a record that
   is already deleted, never reached the server, or belongs to another account
-  changes nothing and is acknowledged `applied`. A tombstone stays unless a *newer*
-  mutation puts the record again -- an explicit undo restores it -- and a stale
-  replay can never resurrect it. Tombstones count toward none of the "one at a
-  time" rules.
+  changes nothing and is acknowledged `applied`. Tombstones count toward none of the
+  "one at a time" rules.
+- **A delete cascades.** Deleting a session or bout also tombstones every live
+  descendant the mutation did not list -- a bout and pause another device added
+  meanwhile, say -- with the same `deleted_at`, the deleting device as writer, and
+  the mutation's counter value.
+- **A tombstone wins.** Only the device that deleted a record can bring it back, with
+  a later mutation that puts it again (an explicit undo). A put from any other device
+  onto a tombstone -- or of a new record under a tombstoned parent -- is skipped like
+  a stale change (`applied`, noted in the ledger); a stale replay from the deleting
+  device itself is skipped by the sequence rule.
 - A record's parent reference (`walking_session_id`, `walking_bout_id`) is fixed
   once the record exists; ids are never reused for another record.
+- **Rows the server changed on its own** -- a supersede, an administrator's discard --
+  record the server (the nil UUID, never a device id) as their last writer, so a
+  device's next put to them is never judged stale: the device's own account replaces
+  the server's stand-in.
 
 ### PAD validation
 
-Per record (`invalid_record` / `invalid_timing`):
+Per record (`invalid_record`):
 
-- ids and parent ids are lowercase UUIDs; timestamps are ISO 8601 with a time zone;
+- ids and parent ids are lowercase UUIDs; timestamps are ISO 8601 with a time zone
+  and representable in UTC (so not `0001-01-01T00:00:00+01:00`);
 - a session's `status` is `ACTIVE`, `COMPLETED` or `DISCARDED`; `completed_at` is
-  null exactly while `ACTIVE`, and `completed_at >= started_at`;
-- `speed_kmh > 0`, `incline_pct >= 0`, `max_bout_seconds` a positive integer;
+  null exactly while `ACTIVE`;
+- `speed_kmh > 0`, `incline_pct >= 0` (finite numbers), `max_bout_seconds` a
+  positive integer;
 - `bout_number` a positive integer; `stop_reason` null or one of the five reasons;
 - pain is null/null, or one value or two adjacent values from 1 to 5
   (`pain_min <= pain_max <= pain_min + 1`);
-- every interval has `ended_at >= started_at` (an absent `ended_at` means open).
+- free text (`session_notes`, `notes`) is a string or null. It is made storable
+  rather than refused: NUL characters are removed (PostgreSQL text cannot hold them)
+  and a lone UTF-16 surrogate becomes U+FFFD. Identity fields stay strict.
 
-Across records, on the finished state of each touched session (`invalid_timing`
-unless noted):
+#### Clock steps are clamped
 
-- a bout starts at or after its session started;
-- a pause starts at or after its bout started; once the bout has ended, every pause
-  has ended too, at or before the bout's end;
-- a rest belongs to a bout that has ended, and starts at or after that end;
-- once the session is `COMPLETED` or `DISCARDED`, every bout and rest has ended, at
-  or before `completed_at`;
+A timestamp inversion only ever comes from a device clock stepping back between two
+stamps, and refusing it would strand real workout data on the device (and block
+nothing but the user). So the server moves the offending timestamp to the nearest
+boundary instead, deterministically, and notes each move in the ledger (`applied`):
+
+- an end before its own start (`ended_at < started_at`, `completed_at < started_at`)
+  moves up to the start;
+- on the finished state of each touched session, parents first: a bout lies within
+  its session (it starts at or after the session started; once the session is
+  `COMPLETED`/`DISCARDED` it has ended, at or before `completed_at`); a pause lies
+  within its bout (and has ended once the bout has); a rest starts at or after its
+  bout ended and, once the session is closed, has ended by `completed_at`. A start
+  outside the range moves to the nearer bound, an end past it moves back to it, an
+  open child of a closed parent is closed at the parent's end, and an end left
+  before a raised start moves up to it.
+
+Every clamp lands inside the database's constraints, and the same input always
+gives the same stored result. Rows the mutation did not itself write can move too (a
+correction that moves a session's start past an existing bout's start, say); they
+get the mutation's counter value like everything else it changed. There is no
+magnitude limit: any limit would turn a large clock error back into a permanent
+rejection of real workout data, and a clamp never moves a time outside the
+boundaries the session itself recorded, so it cannot invent time.
+
+#### What is still refused
+
+On the finished state of each touched session:
+
+- a rest belongs to a bout that has not ended (`invalid_transition`);
 - **PAD-06**: a session never has an open bout while one of its rests is open
   (`invalid_transition`). `START NEXT BOUT` closes the rest in the same mutation;
 - at most one `ACTIVE` session per account, one open bout per session, one open
   pause per bout, and one live rest per bout (`active_conflict`, database
-  constraints);
-- `ACTIVE` may become `COMPLETED` or `DISCARDED`; those are final
-  (`invalid_transition`). A finished session's other fields stay editable;
-- a record is deleted together with its live children, children first
-  (`invalid_transition`).
+  constraints), within one mutation;
+- `ACTIVE` may become `COMPLETED` or `DISCARDED`; those do not turn into each other
+  (`invalid_transition`), unless the server wrote the closure (a supersede or an
+  administrator's discard), in which case the device's own final status wins. A put
+  that still says `ACTIVE` for a finished session -- another device, or the server,
+  closed it meanwhile -- keeps the closure (`status`, `completed_at`) and applies
+  the rest of the record, noted in the ledger: a finished session is never reopened,
+  and the edit is not lost.
 
-**The frontend must mirror these rules** in its write transaction, so that it never
-queues a mutation the server will refuse: close every open pause when a bout ends
-and every open bout, pause and rest when the session ends; stamp an end no earlier
-than its start even if the device clock moved backwards; refuse a new bout while a
+#### Stuck ACTIVE sessions
+
+A session stays `ACTIVE` on the server until its device syncs the finish. When that
+device is offline, lost or reset, the account would otherwise be unable to start
+another session anywhere. Two mechanisms resolve it:
+
+- **Supersede.** When a mutation would create or activate a walking session while
+  the account already has a *different* live `ACTIVE` one that the mutation does not
+  itself name, the server first closes the older one: `COMPLETED`, `completed_at` =
+  the latest timestamp the session records (its own `started_at` if nothing later),
+  and every open bout, pause and rest closed at that same moment. Then it applies the
+  new mutation, all in one transaction and one counter value, with the supersede
+  noted in the ledger. If the older session's device syncs its real finish later,
+  that replaces the server's closure. Two `ACTIVE` sessions within one mutation are
+  that mutation's own contradiction and remain `active_conflict`, as does any other
+  "one at a time" violation within one mutation.
+- **"Discard stuck session"** in Django Admin (the walking-session list, for users
+  with the `change` permission on walking sessions). It is offered for any selection
+  but acts only on live `ACTIVE` sessions (others are reported and left alone). It
+  runs through the same engine path as a mutation -- the account lock, one
+  transaction, a counter bump the changes feed carries to every device, and a ledger
+  row (`code` `admin_discard`, `client_id` the nil UUID, the acting administrator in
+  its `detail` and envelope) plus Django's own admin log entry -- and marks the
+  session `DISCARDED` with its open children closed, at its latest recorded moment.
+
+**The frontend mirrors these rules** in its write transaction, so that it never
+queues a mutation the server has to repair or refuse: close every open pause when a
+bout ends and every open bout, pause and rest when the session ends; stamp times
+monotonically within a session (done: `monotonicNow`); refuse a new bout while a
 rest is open; tombstone a rest when undoing the bout finish that created it; delete
 children with their parent; never reopen a finished session; keep pain, stop reason
 and text within the rules above. Today's local repository enforces the one-at-a-time
-rules but not containment, PAD-06, or the clock guard; the PAD controls (#21, #22)
-and the sync engine (#20) must add them.
+rules and the monotonic clock, but not containment or PAD-06; the PAD controls
+(#21, #22) and the sync engine (#20) must add them.
 
 ### Unsupported stores and versions
 
@@ -582,18 +697,24 @@ A mutation with any change to a store the server does not synchronize yet
 until the server supports the store, so nothing is lost and nothing is applied out
 of order. The consequence is head-of-line blocking: such a mutation holds back later
 PAD mutations too, so a store's server support must ship before the frontend
-produces mutations for it (it produces none today). An envelope `version` newer
-than 1 is handled the same way (`unsupported_version`).
+produces mutations for it (it produces none today). The server logs a warning for
+every such deferral, so a queue stuck behind one is visible in the server logs. An
+envelope `version` newer than 1 is handled the same way (`unsupported_version`).
 
 ### Client obligations
 
 Implemented by the sync engine (issue #20), not here:
 
+- **One drainer per device, in ascending sequence.** Only one tab or worker at a time
+  may send a device's outbox (for example under a Web Locks API lock), and it sends
+  pending entries in ascending `sequence`, never skipping ahead of one still queued.
+  The server relies on this for the same-device staleness rule and does not enforce
+  it; it only logs a lapse.
 - On `applied` or `duplicate`, acknowledge the outbox entry (the action receipt
   stays).
-- On `retry`, keep the mutation and every later one queued, and resend them later
-  starting from that mutation. Mutations not listed in the response were not
-  processed.
+- On `retry` (including `server_error`), keep the mutation and every later one
+  queued, and resend them later starting from that mutation. Mutations not listed in
+  the response were not processed.
 - On `rejected`, **keep the mutation and its local data**, mark it as needing
   attention, and stop retrying it. Never silently discard it: a rejection means the
   user's workout data did not reach the server, and the user (or the owner, through
@@ -602,6 +723,15 @@ Implemented by the sync engine (issue #20), not here:
   mutation with a new `mutation_id`.
 - On a request-level error, a network failure or a lost response, keep everything
   queued and resend later; duplicates are answered `duplicate`.
+- **Apply changes-feed records as server-authoritative**, without the local parent
+  and precondition checks an action goes through (or buffer them until the whole
+  feed is read): a parent can arrive on a later page than its child. The server may
+  also have changed records the device holds -- clamped them, closed a superseded
+  session, cascaded a delete -- and the feed is how the device learns it.
+- **Merge, do not overwrite, local-only fields.** A feed record carries exactly the
+  fields the server models (see [Pull: changes feed](#pull-changes-feed)); fields a
+  device keeps locally beyond those must be carried forward when it stores the
+  record, not dropped.
 
 ### Pull: bootstrap
 
@@ -652,17 +782,24 @@ from. `cursor` is the account's current change counter.
 }
 ```
 
-- Every applied mutation advances the account's change counter by one and stamps
-  the rows it wrote with the new value. The feed returns the account's rows with
-  `change_seq` above `since`, oldest change first and parents before children within
-  one change.
+- Every applied mutation (and every administrator action) advances the account's
+  change counter by one and stamps every row it changed with the new value --
+  including rows the server changed on its own: clamped, superseded or deleted by
+  cascade. The feed returns the account's rows with `change_seq` above `since`.
 - Each record appears once, at its latest version, in exactly the local record shape
-  (timestamps in `Date.toISOString()` form, tombstones included), so a device can
-  store it as-is.
-- Pages end on a mutation boundary (a page can exceed `limit` by at most one
-  mutation's changes). Pass the returned `cursor` as the next `since` while
-  `has_more` is true. A record's latest version can appear on a later page than a
-  child that references it.
+  (timestamps in `Date.toISOString()` form, tombstones included). It carries only
+  the fields the server models -- the ones listed in [PAD validation](#pad-validation)
+  plus `id`, `created_at`, `updated_at`, `deleted_at` -- so a device merges it into
+  its local record rather than replacing fields the server does not know. Server
+  changes leave the device-owned `created_at`/`updated_at` as they were.
+- A page is every row with `change_seq` in `(since, cursor]`: rows are chosen in
+  change order, and a page ends on a mutation boundary (it can exceed `limit` by at
+  most one mutation's changes). Within a page, records are listed **parents first**
+  (sessions, then bouts, then pauses and rests; each in change order). Pass the
+  returned `cursor` as the next `since` while `has_more` is true. A parent whose
+  latest change is newer than the page's cursor is on a later page than its child,
+  so a device applies feed records without parent checks, or buffers them (see
+  [Client obligations](#client-obligations)).
 - The feed never skips a change that commits while it is being read: it reads the
   counter first and leaves anything above it for the next request.
 - Only the signed-in account's records are ever returned.
@@ -677,7 +814,9 @@ constraints and partial unique indexes that ignore tombstones); cross-record rul
 are enforced by the engine as above. Django Admin edits `PadDefaults` (a singleton)
 and shows walking sessions (with their bouts), bouts (with their pauses and rest)
 and the processed-mutation ledger **read-only**: an admin edit would bypass the
-ledger and the change counter, and the device's next edit would overwrite it.
+ledger and the change counter, and the device's next edit would overwrite it. The
+one write is the "Discard stuck session" action, which goes through the engine (see
+[Stuck ACTIVE sessions](#stuck-active-sessions)).
 
 ## Service-worker updates and the outbox
 
@@ -895,8 +1034,8 @@ latest explicit edit wins
 
 Precisely (see [Conflict rule](#conflict-rule-latest-explicit-edit-wins)): within
 one device the outbox `sequence` decides, whatever the wall clock said; across
-devices the mutation the server commits last wins; tombstones stick unless a newer
-mutation restores the record.
+devices the mutation the server commits last wins; a tombstone wins -- only the
+device that deleted a record can restore it, with a newer mutation.
 
 For configuration edited through Django Admin:
 
