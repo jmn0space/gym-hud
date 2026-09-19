@@ -142,6 +142,37 @@ do not mark them complete. See the Overall v1 continuity criterion at the end of
 this document for the acceptance-level statement these checks, PAD-02, and
 `docs/device-smoke-tests.md` all serve.
 
+## Home screen and session cardinality
+
+See [Product overview: Active-session cardinality and Home Resume
+cards](product-overview.md#active-session-cardinality-and-home-resume-cards)
+for the settled combination table this section exercises.
+
+### HOME-01 — Resume cards per combination of active types
+
+For each combination of active session types (PAD, resistance, cardio -- all
+eight subsets, including none), seed the corresponding `ACTIVE` sessions
+through the local repository and load Home.
+
+Expected, per the product-overview table:
+
+- Home shows exactly one Resume card per active type, always ordered PAD,
+  then resistance, then cardio when more than one is active.
+- `START NEW` is offered only for types that are *not* currently active.
+
+This extends LOCAL-05 (concurrent connections enforcing at most one
+same-type `ACTIVE` session) and LOCAL-07 (Home reads Resume cards back from
+IndexedDB after a reload) to every combination, not just the single- and
+all-active cases those already cover.
+
+### HOME-02 — Starting an already-active type is blocked
+
+With a PAD session `ACTIVE`, attempt `START NEW` for PAD from Home.
+
+Expected: the action is unavailable (or refused with an explanation); the
+existing session must be resumed, finished, or discarded first. Starting
+resistance or cardio from the same screen remains unaffected.
+
 ## PAD
 
 ### PAD-01 — Lock-screen recovery
@@ -337,6 +368,70 @@ After a working weight is established, request a progression suggestion.
 
 Expected: the calculation uses `current_working_weight_kg` and muscle-group progression percentage, not `estimated_1rm_kg`.
 
+### LOAD-04 — Assessment input validation
+
+See [Resistance & cardio: Assessment input
+validation](training.md#assessment-input-validation).
+
+Boundary values for assessment repetitions:
+
+| Input | Expected |
+| --- | --- |
+| 1 | accepted |
+| 12 | accepted |
+| 13 | refused, plain message, nothing stored |
+
+Boundary values for assessment weight (kg):
+
+| Input | Expected |
+| --- | --- |
+| 0 | refused (must be > 0), nothing stored |
+| 500 | accepted |
+| 500.5 | refused (must be <= 500), nothing stored |
+
+Expected rounding: `50 kg` × `10 reps` → `estimated_1rm_kg = 66.7` (one
+decimal place; see the worked example in training.md).
+
+## Server-admin configuration precedence
+
+See [Data & synchronization: Server-admin configuration
+precedence](data-sync.md#server-admin-configuration-precedence).
+
+### ADMIN-01 — Device commit after admin edit wins
+
+1. An administrator sets `Exercise.current_working_weight_kg` in Django Admin.
+2. A device, offline since before that edit, later completes the same
+   exercise row and its queued mutation reaches the server after the admin's
+   edit.
+
+Expected: the device's value is the one stored on the server (the later
+commit wins); the admin's earlier edit is not silently reapplied or merged.
+
+### ADMIN-02 — Admin edit after device commit wins
+
+1. A device's mutation changing `RoutineExercise` targets (`SAVE TO ROUTINE`)
+   reaches the server first.
+2. An administrator then edits the same `RoutineExercise` field in Django
+   Admin.
+
+Expected: the admin's value is the one stored on the server; the device is
+not silently overwritten before its own commit lands, but a later admin edit
+does stand once it does.
+
+### ADMIN-03 — Snapshot and history immutability
+
+1. Start a resistance session (its `ResistanceSessionExercise` rows snapshot
+   the routine's target weight/sets/reps at that moment).
+2. While the session is `ACTIVE`, an administrator edits the source
+   `Exercise` or `RoutineExercise`.
+3. Complete the session.
+
+Expected: the already-taken `ResistanceSessionExercise` snapshot and the
+finished historical session are unchanged by the admin edit; only the next
+session copied from the routine reflects it. Pending session edits already
+sitting in the device's outbox are never dropped or rewritten by a bootstrap
+refresh of cached reference data.
+
 ## Cardio
 
 ### CARDIO-01 — Machine selection
@@ -366,6 +461,12 @@ Run the production Docker Compose deployment.
 Expected: Django is reachable from `cloudflared` through `http://web:8000`, but port 8000 is not published directly to the VPS host.
 
 ### AUTH-01 — Unauthenticated access and offline continuation
+
+Covers the settled state machine in [Data & synchronization: Authentication
+and offline continuation](data-sync.md#authentication-and-offline-continuation)
+(confirmed 2026-09-19), including its summary table of all five lifecycle
+cases, local-data retention, and the always-authenticated rule for server
+access.
 
 **(a) No valid session, protected API endpoint**
 

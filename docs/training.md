@@ -136,6 +136,11 @@ The user may edit weight, number of sets, and target repetitions. The entire exe
 
 ## Session edits vs routine edits
 
+See [Data & synchronization: Server-admin configuration
+precedence](data-sync.md#server-admin-configuration-precedence) for how these
+device-writable fields are reconciled against an administrator editing the
+same routine or exercise through Django Admin.
+
 ### Weight
 
 Changing `40 kg → 42.5 kg` changes today's session.
@@ -231,6 +236,42 @@ assessment_weight
 ```
 
 The result is stored as `Exercise.estimated_1rm_kg`. Temporary assessment inputs do not need to persist.
+
+### Assessment input validation
+
+**Settled 2026-09-19.** Inputs are refused outright, not clamped or silently
+corrected; nothing is stored when a value is out of range:
+
+- **assessment repetitions**: an integer from 1 to 12. This is an application
+  policy boundary, not a medical-safety claim (see [Initial percentage
+  ceiling](#initial-percentage-ceiling)): the Brzycki-style formula above gets
+  progressively less reliable at higher rep counts, and its denominator
+  reaches zero at 37 reps, so the policy keeps well clear of that on the low
+  side of practical assessment sets.
+- **assessment weight**: greater than 0 kg and at most 500 kg, in 0.5 kg steps.
+
+An out-of-range value is refused with a plain message (e.g. "Enter reps
+between 1 and 12.") and nothing is written to `Exercise.estimated_1rm_kg`.
+
+`estimated_1RM` and every percentage preview derived from it are rounded to
+one decimal place. Worked example, the input behind the `66.7 kg` example
+below:
+
+```text
+assessment weight = 50 kg
+assessment reps   = 10
+
+estimated_1RM = 50 / (1.0278 - 0.0278 × 10) = 50 / 0.7498 ≈ 66.7 kg
+```
+
+A refused input, by contrast:
+
+```text
+assessment weight = 50 kg
+assessment reps   = 13
+
+Refused: "Enter reps between 1 and 12." Nothing is stored.
+```
 
 ### Starting-load preview
 
@@ -371,5 +412,11 @@ The following training configuration belongs in Django Admin rather than a dedic
 - exercise name, muscle group, machine increment, current working weight, estimated initial 1RM, notes, and archived state;
 - allowed starting 1RM percentages and maximum automatic starting percentage;
 - cardio-machine names and active/inactive state.
+
+These are server-owned reference data: the server always wins, and a device
+only ever caches them (see [Data & synchronization: Server-admin
+configuration precedence](data-sync.md#server-admin-configuration-precedence)
+for the full precedence rule, including the fields below that a device *can*
+write, such as `current_working_weight_kg` and routine targets).
 
 See [Architecture & deployment](architecture.md) for the Django/Admin stack and [Data & synchronization](data-sync.md) for offline persistence.

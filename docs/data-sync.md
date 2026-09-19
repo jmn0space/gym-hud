@@ -163,13 +163,20 @@ The same timestamp-derived approach applies to:
 
 After screen lock, reload, PWA termination, or browser-process termination, the application reconstructs state from IndexedDB and timestamps.
 
-The current local baseline allows at most one `ACTIVE` session per type: one PAD,
-one resistance, and one cardio session. Different session types may be active at
-the same time, and Home exposes one Resume card for each. The server enforces the
-same rule for PAD (at most one live `ACTIVE` walking session per account, as a
-database constraint), resolving a second one by closing the older, stuck session
-(see [Stuck ACTIVE sessions](#stuck-active-sessions)); resistance and cardio get
-theirs with their server stores.
+**Settled 2026-09-19** (see [Product overview: Active-session cardinality and
+Home Resume cards](product-overview.md#active-session-cardinality-and-home-resume-cards)
+for the full combination table). The current local baseline allows at most one
+`ACTIVE` session per type: one PAD, one resistance, and one cardio session.
+Different session types may be active at the same time, and Home exposes one
+Resume card for each, in a fixed PAD/resistance/cardio order. The server
+enforces the same rule for PAD (at most one live `ACTIVE` walking session per
+account, as a database constraint), resolving a second one by closing the
+older, stuck session (see [Stuck ACTIVE sessions](#stuck-active-sessions));
+resistance and cardio stores answer `retry` until the server supports them
+(see [Unsupported stores and versions](#unsupported-stores-and-versions)), and
+the same supersede semantics are the intended direction for their server-side
+enforcement once it does -- this is not new v1 scope, just the stated fallback
+for stores that do not sync yet.
 
 Within a PAD session, the transaction also prevents two live open bouts for the
 same session and two live open pauses or rests for the same bout. This protects
@@ -856,6 +863,28 @@ silently drops an in-progress bout or a queued mutation is not.
 
 ## Authentication and offline continuation
 
+**Status: confirmed 2026-09-19** (originated in #16/#36). The policy below is
+unchanged; this section is the settled answer to issue #13's offline-auth
+criterion. See [Product overview: Authenticated,
+offline-tolerant](product-overview.md#authenticated-offline-tolerant) for the
+cross-link into this section.
+
+Summary of the five lifecycle cases, plus local-data retention and the
+always-authenticated rule for server access:
+
+| Case | `authStatus` | Local data & outbox | Server access |
+| --- | --- | --- | --- |
+| First online login (no marker on this device yet) | `login-required` / `server-unreachable` while unresolved, then `authenticated` | No local workout data exists yet to show | Login itself needs the server; app routes do not render before it succeeds |
+| Offline reopen of a previously authenticated device | `unverified` | Opens local (IndexedDB) data immediately; outbox stays queued, nothing discarded | Sync paused (`canSync` false) until a decisive verify |
+| Server-session expiry (marker exists, server says anonymous or any call gets `401`) | `expired` | Local data and outbox preserved; app stays usable | Sync paused; user must sign in again to resume |
+| Explicit logout | `login-required` (auth marker cleared; outbox owner deliberately kept) | Outbox and local data stay on this device | Requires network and confirmation; no further server access until the next sign-in |
+| Different-user protection (server-confirmed user != this device's outbox owner, with pending entries) | `account-mismatch` | Local data and outbox untouched; the mismatched session is never adopted | Sign-in is blocked until the rightful owner signs the mismatched session out and back in |
+
+In every case, any protected `/api/v1/` endpoint still requires a currently
+authenticated session -- `401 {"code": "not_authenticated"}` otherwise, see
+[Acceptance criteria: AUTH-01(a)](acceptance-tests.md#auth-01--unauthenticated-access-and-offline-continuation)
+-- only previously-persisted local data can ever be shown without one.
+
 The frontend uses Django session authentication (see [Architecture](architecture.md)).
 Credentials, session ids, and tokens are never stored client-side; the session
 cookie is `HttpOnly` and managed entirely by the browser. A second cookie,
@@ -1047,6 +1076,85 @@ For PAD that configuration is the `PadDefaults` singleton, served by
 [`GET /api/v1/sync/bootstrap/`](#pull-bootstrap).
 
 Pending local workout mutations must remain safely represented in the outbox before cached server reference data is replaced.
+
+The rule above covers server-owned reference data. The full precedence rule,
+including the fields both the device and an administrator can write, is
+settled below.
+
+### Server-admin configuration precedence
+
+**Settled 2026-09-19.** Referenced from [Resistance & cardio: Admin-managed
+configuration](training.md#admin-managed-configuration) and [Resistance &
+cardio: Session edits vs routine edits](training.md#session-edits-vs-routine-edits).
+
+**Admin-only / server-owned fields.** Server wins outright; the device treats
+these as cached reference data it never writes to, only replaces wholesale
+once its own pending mutations are safely in the outbox (the rule above):
+
+- muscle-group progression percentages;
+- exercise machine increment;
+- allowed starting 1RM percentages and the automatic starting-percentage ceiling;
+- the cardio-machine list and each machine's active state;
+- PAD defaults (`PadDefaults`);
+- exercise name, muscle group, and archived state.
+
+**Fields both the device and an administrator can write.**
+`Exercise.current_working_weight_kg` (set on the device when a resistance
+exercise row is completed, when a progression suggestion is accepted, or when
+the initial load setup value is chosen) and `RoutineExercise` targets and
+structure (via `SAVE TO ROUTINE` / `SAVE CHANGES TO DAY N`, see
+[training.md](training.md#session-edits-vs-routine-edits)). These follow the
+same settled "latest explicit edit wins" rule as any other cross-writer field
+(see [Conflict rule](#conflict-rule-latest-explicit-edit-wins)): whichever
+write commits to the server last stands, whether that commit is a device
+mutation reaching the server or an administrator's direct edit. A pending
+device mutation that syncs *after* an admin edit overwrites it; an admin edit
+made *after* the device's mutation already committed stands.
+
+Worked examples:
+
+```text
+09:00  Admin sets Exercise("Chest Press").current_working_weight_kg = 45 kg
+09:05  Device completes the Chest Press row offline; a mutation is queued
+       locally with current_working_weight_kg = 42.5 kg
+09:30  Device reconnects; its queued mutation commits at 09:30
+
+Result: 42.5 kg (the device's commit is later than the admin's edit)
+```
+
+```text
+09:00  Device completes the Chest Press row offline; mutation queued
+09:05  Device reconnects; the mutation commits at 09:05 -> 42.5 kg
+09:10  Admin edits current_working_weight_kg = 45 kg in Django Admin
+
+Result: 45 kg (the admin's edit commits after the device's mutation)
+```
+
+```text
+14:00  Device selects SAVE TO ROUTINE for Day 3 / Chest Press: 3x10 -> 3x12
+       (queued while offline)
+14:20  Admin edits the same RoutineExercise's target_reps to 8
+14:45  Device reconnects; its queued mutation commits at 14:45
+
+Result: target_reps = 12 (the device's later commit wins)
+```
+
+**What must be preserved, regardless of the above:**
+
+- Pending session edits sitting in the outbox are never dropped or rewritten
+  when bootstrap/cached reference data is refreshed.
+- `ResistanceSessionExercise` snapshots (target weight/sets/reps copied from
+  the routine when an `ACTIVE` session starts) and historical sessions are
+  **never** changed by an admin edit made after the snapshot was taken --
+  see [Historical truth](product-overview.md#historical-truth) and
+  [Resistance routine model](training.md#resistance-routine-model).
+- Completed-exercise weight memory, an explicit `SAVE TO ROUTINE` change, and
+  an accepted load-setup/progression suggestion are explicit user edits: each
+  one enqueues a mutation and wins or loses only by commit order (as above),
+  never silently or partially.
+- Replacing cached server reference data on a device only happens once that
+  device's pending local mutations are safely represented in its outbox (the
+  existing rule, unchanged).
 
 ## Offline requirements
 
