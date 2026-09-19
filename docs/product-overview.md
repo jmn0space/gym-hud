@@ -8,7 +8,7 @@ Gym HUD is a private, mobile-first Progressive Web Application for tracking:
 
 1. PAD walking bouts and recovery intervals.
 2. A rotating five-day resistance-training routine.
-3. Current working weight and target sets/reps per exercise.
+3. Current working weight per exercise, and target sets/reps per routine exercise.
 4. A one-time, per-exercise [Initial 10RM setup](training.md#initial-10rm-setup) (assessment weight and repetitions) that establishes the starting working load.
 5. Cardio-machine sessions such as arm crank, stationary bike, step climber, or rowing machine.
 6. Historical sessions and incomplete exercises.
@@ -99,7 +99,10 @@ This allows multiple sessions on the same date without forcing them into a paren
 
 The home screen prioritizes resumable work.
 
-If an active session exists, expose a clear `RESUME` action with a compact state summary, for example:
+If one or more active sessions exist, expose a clear `RESUME` action for
+each active type (up to three; see [Active-session
+cardinality](#active-session-cardinality-and-home-resume-cards)) with a
+compact state summary, for example:
 
 ```text
 RESUME
@@ -159,17 +162,19 @@ this holds regardless of how many *other* types are also active.
 | resistance + cardio | resistance, cardio | PAD |
 | PAD + resistance + cardio | PAD, resistance, cardio | none |
 
-This is a local persistence rule (enforced per session-type store; see [Data &
-synchronization: Active-session recovery](data-sync.md#active-session-recovery)).
-The server enforces the same one-`ACTIVE`-per-type rule for PAD today, as a
-database constraint, resolving a stuck one by superseding it (see [Data &
-synchronization: Stuck ACTIVE
-sessions](data-sync.md#stuck-active-sessions)); resistance and cardio mutations
-are answered `retry` until the server supports those stores (see [Data &
-synchronization: Unsupported stores and
-versions](data-sync.md#unsupported-stores-and-versions)), and the same
-supersede semantics are the intended direction for their server-side
-enforcement once it ships, not a v1 feature.
+This is a local persistence rule (enforced per session-type store, per
+device; see [Data & synchronization: Active-session
+recovery](data-sync.md#active-session-recovery)). Because it is per device,
+an offline cross-device start can briefly leave two same-type `ACTIVE`
+sessions until synchronization reaches the server and supersedes one (PAD
+today; see [Data & synchronization: Stuck ACTIVE
+sessions](data-sync.md#stuck-active-sessions)) -- draining the outbox is
+issue #20. The server enforces the same one-`ACTIVE`-per-type rule for PAD
+today, as a database constraint, resolving a stuck one the same way;
+resistance and cardio mutations are answered `retry` until the server
+supports those stores (see [Data & synchronization: Unsupported stores and
+versions](data-sync.md#unsupported-stores-and-versions)); their server-side
+rule is specified when those stores ship.
 
 ## V1 non-goals
 
@@ -214,7 +219,7 @@ or
 → Open suggested resistance day
 → See exercises, weights, and target sets/reps
 → Check exercises off
-→ Adjust weight / sets / repetitions when needed
+→ Adjust weight / target sets / target reps when needed
 → Optionally save structural changes to routine
 → Finish resistance session
 
@@ -225,7 +230,7 @@ or
 On next launch, the application must know:
 
 - whether a session is still active, per type (see [Active-session cardinality](#active-session-cardinality-and-home-resume-cards));
-- the current PAD state (`WALKING`, `PAUSED`, or `RESTING`; see [PAD walking: state machine](pad-walking.md#state-machine));
+- the current PAD state (`READY`, `WALKING`, `PAUSED`, or `RESTING`; see [PAD walking: state machine](pad-walking.md#state-machine));
 - the next suggested resistance routine;
 - remembered working weights;
 - pending unsynchronized changes.

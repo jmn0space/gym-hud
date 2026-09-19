@@ -163,20 +163,19 @@ The same timestamp-derived approach applies to:
 
 After screen lock, reload, PWA termination, or browser-process termination, the application reconstructs state from IndexedDB and timestamps.
 
-**Settled 2026-09-19** (see [Product overview: Active-session cardinality and
-Home Resume cards](product-overview.md#active-session-cardinality-and-home-resume-cards)
-for the full combination table). The current local baseline allows at most one
-`ACTIVE` session per type: one PAD, one resistance, and one cardio session.
-Different session types may be active at the same time, and Home exposes one
-Resume card for each, in a fixed PAD/resistance/cardio order. The server
-enforces the same rule for PAD (at most one live `ACTIVE` walking session per
-account, as a database constraint), resolving a second one by closing the
-older, stuck session (see [Stuck ACTIVE sessions](#stuck-active-sessions));
-resistance and cardio stores answer `retry` until the server supports them
-(see [Unsupported stores and versions](#unsupported-stores-and-versions)), and
-the same supersede semantics are the intended direction for their server-side
-enforcement once it does -- this is not new v1 scope, just the stated fallback
-for stores that do not sync yet.
+**Settled 2026-09-19.** At most one `ACTIVE` session per type; see [Product
+overview: Active-session cardinality and Home Resume
+cards](product-overview.md#active-session-cardinality-and-home-resume-cards)
+for the full combination table and canonical wording. The server enforces the
+same rule for PAD today (at most one live `ACTIVE` walking session per
+account, as a database constraint), resolving a stuck one by superseding it
+(see [Stuck ACTIVE sessions](#stuck-active-sessions)); resistance and cardio
+don't sync yet (see [Unsupported stores and
+versions](#unsupported-stores-and-versions)).
+
+The rule is enforced per device: an offline cross-device start can briefly
+leave two same-type `ACTIVE` sessions until synchronization reaches the
+server and supersedes one (PAD today) -- draining the outbox is issue #20.
 
 Within a PAD session, the transaction also prevents two live open bouts for the
 same session and two live open pauses or rests for the same bout. This protects
@@ -735,6 +734,10 @@ Implemented by the sync engine (issue #20), not here:
   feed is read): a parent can arrive on a later page than its child. The server may
   also have changed records the device holds -- clamped them, closed a superseded
   session, cascaded a delete -- and the feed is how the device learns it.
+  Exception: for a record with a pending outbox mutation, this does not
+  replace that record's device-writable fields (see [Server-admin
+  configuration precedence](#server-admin-configuration-precedence)) -- the
+  pending mutation commits later and wins.
 - **Merge, do not overwrite, local-only fields.** A feed record carries exactly the
   fields the server models (see [Pull: changes feed](#pull-changes-feed)); fields a
   device keeps locally beyond those must be carried forward when it stores the
@@ -825,6 +828,22 @@ ledger and the change counter, and the device's next edit would overwrite it. Th
 one write is the "Discard stuck session" action, which goes through the engine (see
 [Stuck ACTIVE sessions](#stuck-active-sessions)).
 
+**Specified design for `Exercise` and `RoutineExercise` (not yet implemented
+-- the `exercise_registry` and `routine_exercises` stores don't sync yet, see
+[Unsupported stores and versions](#unsupported-stores-and-versions)).** The
+same pattern generalizes once they do: the generic Django Admin change form
+stays read-only for these synced records too, for the same reason -- editing
+them directly would bypass the ledger and the change counter. An
+administrator changes one of the shared fields (see [Server-admin
+configuration precedence](#server-admin-configuration-precedence)) through a
+dedicated admin action, not the change form, exactly like "Discard stuck
+session": the account lock, one transaction, a change-counter bump the
+changes feed carries to every device, a ledger row, and the server (the nil
+UUID, never a device id) recorded as that field's last writer. An admin
+*delete* of a synced record (a `RoutineExercise`, say) is a tombstone through
+that same engine path, never a row removal -- consistent with [the conflict
+rule's tombstones](#conflict-rule-latest-explicit-edit-wins).
+
 ## Service-worker updates and the outbox
 
 The application must never depend on background sync (step 5 above) to flush
@@ -874,7 +893,7 @@ always-authenticated rule for server access:
 
 | Case | `authStatus` | Local data & outbox | Server access |
 | --- | --- | --- | --- |
-| First online login (no marker on this device yet) | `login-required` / `server-unreachable` while unresolved, then `authenticated` | No local workout data exists yet to show | Login itself needs the server; app routes do not render before it succeeds |
+| First online login (no marker on this device yet) | `login-required` / `server-unreachable` while unresolved, then `authenticated` | App routes, and any data already on this device (for example after a logout), stay hidden until sign-in succeeds; nothing is deleted | Login itself needs the server; app routes do not render before it succeeds |
 | Offline reopen of a previously authenticated device | `unverified` | Opens local (IndexedDB) data immediately; outbox stays queued, nothing discarded | Sync paused (`canSync` false) until a decisive verify |
 | Server-session expiry (marker exists, server says anonymous or any call gets `401`) | `expired` | Local data and outbox preserved; app stays usable | Sync paused; user must sign in again to resume |
 | Explicit logout | `login-required` (auth marker cleared; outbox owner deliberately kept) | Outbox and local data stay on this device | Requires network and confirmation; no further server access until the next sign-in |
@@ -1066,50 +1085,83 @@ one device the outbox `sequence` decides, whatever the wall clock said; across
 devices the mutation the server commits last wins; a tombstone wins -- only the
 device that deleted a record can restore it, with a newer mutation.
 
-For configuration edited through Django Admin:
-
-```text
-server configuration wins
-```
+For admin-only configuration edited through Django Admin: server configuration
+wins. Fields both sides write follow [Server-admin configuration
+precedence](#server-admin-configuration-precedence) below.
 
 For PAD that configuration is the `PadDefaults` singleton, served by
 [`GET /api/v1/sync/bootstrap/`](#pull-bootstrap).
 
 Pending local workout mutations must remain safely represented in the outbox before cached server reference data is replaced.
 
-The rule above covers server-owned reference data. The full precedence rule,
-including the fields both the device and an administrator can write, is
-settled below.
-
 ### Server-admin configuration precedence
 
 **Settled 2026-09-19.** Referenced from [Resistance & cardio: Admin-managed
 configuration](training.md#admin-managed-configuration) and [Resistance &
 cardio: Session edits vs routine edits](training.md#session-edits-vs-routine-edits).
+This is the specified design; admin edits to shared fields reach synced
+records through the sync engine (see [Server model and
+administration](#server-model-and-administration)), but the
+`exercise_registry`/`routine_exercises` stores don't sync yet (see
+[Unsupported stores and versions](#unsupported-stores-and-versions)), so none
+of this is implemented today.
 
 **Admin-only / server-owned fields.** Server wins outright; the device treats
 these as cached reference data it never writes to, only replaces wholesale
 once its own pending mutations are safely in the outbox (the rule above):
 
 - muscle-group progression percentages;
-- exercise machine increment;
+- `Exercise.machine_increment_kg`;
 - allowed starting 1RM percentages and the automatic starting-percentage ceiling;
 - the cardio-machine list and each machine's active state;
 - PAD defaults (`PadDefaults`);
-- exercise name, muscle group, and archived state.
+- `Exercise.name`, `Exercise.muscle_group_id`, `Exercise.machine_notes`, and
+  `Exercise.is_archived` -- admin-only *after creation*: the local
+  `exercise_registry` store exists, so a device put can technically carry a
+  full `Exercise` record, but nothing in the spec has a device create or
+  rename an exercise, only Django Admin does;
+- `RoutineTemplate.name`, `sequence_number`, and `is_active`;
+- `RoutineExercise.notes`.
 
 **Fields both the device and an administrator can write.**
 `Exercise.current_working_weight_kg` (set on the device when a resistance
 exercise row is completed, when a progression suggestion is accepted, or when
-the initial load setup value is chosen) and `RoutineExercise` targets and
-structure (via `SAVE TO ROUTINE` / `SAVE CHANGES TO DAY N`, see
+the initial load setup value is chosen), `Exercise.estimated_1rm_kg` (set on
+the device by the [Initial 10RM setup](training.md#initial-10rm-setup); an
+administrator can also correct it), and `RoutineExercise.default_sets` /
+`default_reps` and structure -- order, and which exercises belong to a
+routine day -- (via `SAVE TO ROUTINE` / `SAVE CHANGES TO DAY N`, see
 [training.md](training.md#session-edits-vs-routine-edits)). These follow the
 same settled "latest explicit edit wins" rule as any other cross-writer field
 (see [Conflict rule](#conflict-rule-latest-explicit-edit-wins)): whichever
 write commits to the server last stands, whether that commit is a device
-mutation reaching the server or an administrator's direct edit. A pending
+mutation reaching the server or an administrator's direct edit -- except over
+a tombstone: once a `RoutineExercise` is deleted, only the writer that
+deleted it can restore it (see [Conflict
+rule](#conflict-rule-latest-explicit-edit-wins)); later puts from other
+devices or the administrator are skipped and noted in the ledger. A pending
 device mutation that syncs *after* an admin edit overwrites it; an admin edit
 made *after* the device's mutation already committed stands.
+
+**Field-level ownership on mixed records.** `Exercise` carries both
+admin-only and device-writable fields on the same row. A device put still
+carries the whole local record (see [Local action
+contract](#local-action-contract)), but the server applies only the
+device-writable fields (`current_working_weight_kg`, `estimated_1rm_kg`) from
+it and keeps its own stored values for the admin-only fields above -- this is
+not a rejection, and the mutation is acknowledged normally. "Latest explicit
+edit wins, record by record" then applies only to the device-writable
+fields; an admin-only field changes only through Django Admin. The same
+split applies to `RoutineExercise`: a device put carries the whole record,
+including `default_sets`/`default_reps` even when only one changed, but the
+server only lets the device move the device-writable fields and keeps its
+own `notes` value.
+
+**While a device has a pending mutation for one of these records, a
+changes-feed or bootstrap value does not replace that record's
+device-writable fields locally**; the pending mutation commits later and
+wins once it reaches the server (see the matching exception under [Client
+obligations](#client-obligations)).
 
 Worked examples:
 
@@ -1132,11 +1184,12 @@ Result: 45 kg (the admin's edit commits after the device's mutation)
 
 ```text
 14:00  Device selects SAVE TO ROUTINE for Day 3 / Chest Press: 3x10 -> 3x12
-       (queued while offline)
-14:20  Admin edits the same RoutineExercise's target_reps to 8
+       (queued while offline; the put carries the whole RoutineExercise
+       record, default_sets included even though only default_reps changed)
+14:20  Admin edits the same RoutineExercise's default_reps to 8
 14:45  Device reconnects; its queued mutation commits at 14:45
 
-Result: target_reps = 12 (the device's later commit wins)
+Result: default_reps = 12 (the device's later commit wins)
 ```
 
 **What must be preserved, regardless of the above:**
@@ -1149,9 +1202,10 @@ Result: target_reps = 12 (the device's later commit wins)
   see [Historical truth](product-overview.md#historical-truth) and
   [Resistance routine model](training.md#resistance-routine-model).
 - Completed-exercise weight memory, an explicit `SAVE TO ROUTINE` change, and
-  an accepted load-setup/progression suggestion are explicit user edits: each
-  one enqueues a mutation and wins or loses only by commit order (as above),
-  never silently or partially.
+  an accepted load-setup/progression suggestion are explicit user edits:
+  each one enqueues a mutation and stands or is replaced purely by commit
+  order, whole and never partially; a replaced edit is not flagged to
+  either side in v1.
 - Replacing cached server reference data on a device only happens once that
   device's pending local mutations are safely represented in its outbox (the
   existing rule, unchanged).

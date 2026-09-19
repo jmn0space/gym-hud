@@ -56,7 +56,7 @@ created_at
 updated_at
 ```
 
-`estimated_1rm_kg` is reference data from the initial load assessment only. Normal progression does not depend on it after the initial working load has been established.
+`estimated_1rm_kg` is reference data from the initial load assessment only. Normal progression does not depend on it after the initial working load has been established. It is device-writable at that one moment and admin-editable afterward (see [Data & synchronization: Server-admin configuration precedence](data-sync.md#server-admin-configuration-precedence)).
 
 V1 deliberately excludes machine photos, serial numbers, gym maps, and manufacturer integrations.
 
@@ -239,23 +239,29 @@ The result is stored as `Exercise.estimated_1rm_kg`. Temporary assessment inputs
 
 ### Assessment input validation
 
-**Settled 2026-09-19.** Inputs are refused outright, not clamped or silently
-corrected; nothing is stored when a value is out of range:
+**Settled 2026-09-19.** The valid ranges: assessment repetitions an integer
+from 1 to 12; assessment weight greater than 0 kg and at most 500 kg, in 0.5
+kg steps.
+
+The rest of this section is spec detail under that settled range, not itself
+owner-settled: inputs outside the ranges are refused outright, not clamped or
+silently corrected, and nothing is stored:
 
 - **assessment repetitions**: an integer from 1 to 12. This is an application
   policy boundary, not a medical-safety claim (see [Initial percentage
   ceiling](#initial-percentage-ceiling)): the Brzycki-style formula above gets
   progressively less reliable at higher rep counts, and its denominator
-  reaches zero at 37 reps, so the policy keeps well clear of that on the low
-  side of practical assessment sets.
-- **assessment weight**: greater than 0 kg and at most 500 kg, in 0.5 kg steps.
+  approaches zero near 37 reps; 12 is an application policy limit.
+- **assessment weight**: greater than 0 kg and at most 500 kg, in 0.5 kg
+  steps. Refused with: "Enter a weight above 0 and up to 500 kg, in 0.5 kg
+  steps."
 
 An out-of-range value is refused with a plain message (e.g. "Enter reps
 between 1 and 12.") and nothing is written to `Exercise.estimated_1rm_kg`.
 
-`estimated_1RM` and every percentage preview derived from it are rounded to
-one decimal place. Worked example, the input behind the `66.7 kg` example
-below:
+`estimated_1rm_kg` is stored rounded to one decimal (half up), and percentage
+previews are computed from that stored value, then rounded to one decimal
+(half up). Worked example, the input behind the `66.7 kg` example below:
 
 ```text
 assessment weight = 50 kg
@@ -409,14 +415,21 @@ The most recently used machine and resistance level may be offered as defaults f
 The following training configuration belongs in Django Admin rather than a dedicated v1 settings UI:
 
 - muscle-group progression percentages;
-- exercise name, muscle group, machine increment, current working weight, estimated initial 1RM, notes, and archived state;
+- exercise name, muscle group, machine increment, notes, and archived state
+  (admin-only; `current_working_weight_kg` and `estimated_1rm_kg` are the two
+  `Exercise` fields a device can also write, see below);
 - allowed starting 1RM percentages and maximum automatic starting percentage;
 - cardio-machine names and active/inactive state.
 
-These are server-owned reference data: the server always wins, and a device
-only ever caches them (see [Data & synchronization: Server-admin
+The fields above are server-owned reference data: the server always wins,
+and a device only ever caches them, replacing its cached copy only once its
+own pending mutations are safely represented in the outbox.
+`Exercise.current_working_weight_kg` and `Exercise.estimated_1rm_kg` are
+different: both the device and an administrator can write them, and the
+same "latest explicit edit wins" rule that governs workout data decides
+which commit stands. See [Data & synchronization: Server-admin
 configuration precedence](data-sync.md#server-admin-configuration-precedence)
-for the full precedence rule, including the fields below that a device *can*
-write, such as `current_working_weight_kg` and routine targets).
+for the full precedence rule, including `RoutineExercise`'s device-writable
+`default_sets`/`default_reps` and structure.
 
 See [Architecture & deployment](architecture.md) for the Django/Admin stack and [Data & synchronization](data-sync.md) for offline persistence.
