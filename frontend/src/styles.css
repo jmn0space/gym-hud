@@ -337,14 +337,82 @@ p {
 }
 
 .pad-bouts li {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 0.5rem;
+  display: block;
   padding: 0.5rem 1rem;
   border: 1px solid var(--color-border);
   border-radius: var(--radius);
   background: var(--color-surface);
+}
+
+.pad-bout-record {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.pad-bout-record__summary {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.pad-pain {
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.pad-pain legend {
+  margin-bottom: 0.35rem;
+  font-weight: 600;
+}
+
+.pad-pain__choices {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0.35rem;
+}
+
+.pad-pain__choice {
+  min-height: var(--touch-target);
+  padding: 0.25rem;
+  border: 2px solid var(--color-control-border);
+  border-radius: var(--radius);
+  background: var(--color-surface-raised);
+  color: var(--color-text);
+  font: inherit;
+  font-weight: 700;
+  touch-action: manipulation;
+}
+
+.pad-pain__choice--selected {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+  color: var(--color-accent-text);
+}
+
+.pad-pain__choice:disabled {
+  opacity: 0.55;
+}
+
+.pad-notes {
+  width: 100%;
+  padding: 0.5rem 0;
+  text-align: left;
+}
+
+.pad-notes summary {
+  min-height: var(--touch-target);
+  padding: 0.75rem 0;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.pad-notes[open] {
+  display: grid;
+  gap: 0.75rem;
 }
 
 .health {

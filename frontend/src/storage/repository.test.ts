@@ -6,6 +6,7 @@ import {
   ActiveSessionConflictError,
   createLocalRepository,
   DATABASE_STORES,
+  InvalidActionError,
   LocalStorageError,
   type LocalAction,
   type LocalRecord,
@@ -422,6 +423,72 @@ describe("LocalRepository recovery and logical actions", () => {
 });
 
 describe("LocalRepository retry, concurrency, and ordering", () => {
+  it("rejects a stale legacy workflow when an upgraded write has the same timestamp", async () => {
+    const at = new Date("2026-09-18T10:00:00.000Z");
+    const repo = repository(new IDBFactory(), { now: () => at });
+    await repo.commitAction({ actionId: "legacy", changes: [
+      { store: "walking_sessions", operation: "put", record: { id: "pad", status: "ACTIVE", session_notes: null } },
+    ] });
+    const legacy = await repo.getRecord("walking_sessions", "pad");
+    expect(legacy?.workflow_revision).toBeUndefined();
+    await repo.commitAction({ actionId: "upgrade-note", preconditions: [
+      { store: "walking_sessions", id: "pad", expected: { status: "ACTIVE", updated_at: at.toISOString() }, absentFields: ["workflow_revision"] },
+    ], changes: [
+      { store: "walking_sessions", operation: "put", record: { id: "pad", status: "ACTIVE", session_notes: "Keep this", workflow_revision: 1 } },
+    ] });
+    await expect(repo.commitAction({ actionId: "stale-start", preconditions: [
+      { store: "walking_sessions", id: "pad", expected: { status: "ACTIVE", updated_at: at.toISOString() }, absentFields: ["workflow_revision"] },
+    ], changes: [
+      { store: "walking_bouts", operation: "put", record: { id: "bout-1", walking_session_id: "pad", ended_at: null } },
+      { store: "walking_sessions", operation: "put", record: { id: "pad", status: "ACTIVE", session_notes: null, workflow_revision: 1 } },
+    ] })).rejects.toBeInstanceOf(PreconditionFailedError);
+    expect(await repo.getRecord("walking_sessions", "pad")).toEqual(expect.objectContaining({ session_notes: "Keep this" }));
+    expect(await repo.listRecords("walking_bouts")).toHaveLength(0);
+  });
+
+  it("rejects a rest opened alongside the next bout and reopening a bout during rest", async () => {
+    const repo = repository(new IDBFactory());
+    await repo.commitAction({ actionId: "first-bout", changes: [
+      { store: "walking_bouts", operation: "put", record: { id: "bout-1", walking_session_id: "pad", ended_at: null } },
+    ] });
+    await expect(repo.commitAction({ actionId: "overlap-in-one-action", changes: [
+      { store: "walking_bouts", operation: "put", record: { id: "bout-1", walking_session_id: "pad", ended_at: "2026-09-18T10:01:00.000Z" } },
+      { store: "walking_rests", operation: "put", record: { id: "rest-1", walking_bout_id: "bout-1", ended_at: null } },
+      { store: "walking_bouts", operation: "put", record: { id: "bout-2", walking_session_id: "pad", ended_at: null } },
+    ] })).rejects.toBeInstanceOf(InvalidActionError);
+    expect(await repo.listRecords("walking_rests")).toHaveLength(0);
+    expect(await repo.getRecord("walking_bouts", "bout-1")).toEqual(expect.objectContaining({ ended_at: null }));
+
+    await repo.commitAction({ actionId: "begin-rest", changes: [
+      { store: "walking_bouts", operation: "put", record: { id: "bout-1", walking_session_id: "pad", ended_at: "2026-09-18T10:01:00.000Z" } },
+      { store: "walking_rests", operation: "put", record: { id: "rest-1", walking_bout_id: "bout-1", ended_at: null } },
+    ] });
+    await expect(repo.commitAction({ actionId: "reopen", changes: [
+      { store: "walking_bouts", operation: "put", record: { id: "bout-1", walking_session_id: "pad", ended_at: null } },
+    ] })).rejects.toBeInstanceOf(InvalidActionError);
+    // Put metadata is replaced by the repository. A caller-supplied tombstone
+    // cannot make an open bout invisible to this guard.
+    await expect(repo.commitAction({ actionId: "forged-deleted-at", changes: [
+      { store: "walking_bouts", operation: "put", record: { id: "bout-2", walking_session_id: "pad", ended_at: null, deleted_at: "2026-09-18T10:00:00.000Z" } },
+    ] })).rejects.toBeInstanceOf(InvalidActionError);
+    await repo.commitAction({ actionId: "closed-bout-2", changes: [
+      { store: "walking_bouts", operation: "put", record: { id: "bout-2", walking_session_id: "pad", ended_at: "2026-09-18T10:01:00.000Z" } },
+    ] });
+    await repo.commitAction({ actionId: "delete-bout-2", changes: [
+      { store: "walking_bouts", operation: "delete", id: "bout-2" },
+    ] });
+    await expect(repo.commitAction({ actionId: "restore-during-rest", changes: [
+      { store: "walking_bouts", operation: "put", record: { id: "bout-2", walking_session_id: "pad", ended_at: null, deleted_at: "2026-09-18T10:00:00.000Z" } },
+    ] })).rejects.toBeInstanceOf(InvalidActionError);
+    await expect(repo.commitAction({ actionId: "next-bout", changes: [
+      { store: "walking_rests", operation: "put", record: { id: "rest-1", walking_bout_id: "bout-1", ended_at: "2026-09-18T10:02:00.000Z" } },
+      { store: "walking_bouts", operation: "put", record: { id: "bout-2", walking_session_id: "pad", ended_at: null } },
+    ] })).resolves.toBeDefined();
+    await expect(repo.commitAction({ actionId: "rest-while-walking", changes: [
+      { store: "walking_rests", operation: "put", record: { id: "rest-2", walking_bout_id: "bout-1", ended_at: null } },
+    ] })).rejects.toBeInstanceOf(InvalidActionError);
+  });
+
   it("deduplicates the same action after acknowledgement and rejects ID reuse", async () => {
     const repo = repository(new IDBFactory());
     const action: LocalAction = {

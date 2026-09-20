@@ -178,7 +178,8 @@ describe("navigation smoke test", () => {
     expect(await screen.findByText("Walking · Bout 1")).toBeInTheDocument();
     await user.click(screen.getByRole("link", { name: "Resume PAD Walking" }));
     expect(await screen.findByText("Bout 1")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Finish session" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Finish bout" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Finish session" })).not.toBeInTheDocument();
 
     repository.close();
   });

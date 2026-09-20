@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode } from "react";
 import { MemoryRouter } from "react-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -104,6 +104,20 @@ const ACTIVE_SESSION: LocalRecord = {
   max_bout_seconds: 480,
   session_notes: null,
 };
+
+function openBout(id: string, boutNumber: number): LocalRecord {
+  return {
+    id,
+    walking_session_id: ACTIVE_SESSION.id,
+    bout_number: boutNumber,
+    started_at: "2026-09-18T10:00:00.000Z",
+    ended_at: null,
+    pain_min: null,
+    pain_max: null,
+    stop_reason: null,
+    notes: null,
+  };
+}
 
 /**
  * Only `Date` is faked in the repository-backed tests below: IndexedDB, `waitFor`
@@ -217,6 +231,52 @@ describe("PAD start screen", () => {
 });
 
 describe("PAD walking controls", () => {
+  it.each([
+    ["Pause", "bout-2"],
+    ["Finish bout", "bout-2"],
+  ])("does not apply stale %s to another tab's next bout", async (button, nextBoutId) => {
+    const actions: LocalAction[] = [];
+    let stored = snapshotOf({ walking_sessions: [ACTIVE_SESSION], walking_bouts: [openBout("bout-1", 1)] });
+    const repository = fakeRepository(() => stored, (action) => {
+      actions.push(action);
+      return Promise.resolve({ actionId: action.actionId, sequence: 1, committedAt: "2026-09-18T10:05:00.000Z" });
+    });
+    renderPad(repository);
+    expect(await screen.findByText("Walking")).toBeInTheDocument();
+    stored = snapshotOf({ walking_sessions: [ACTIVE_SESSION], walking_bouts: [
+      { ...openBout("bout-1", 1), ended_at: "2026-09-18T10:04:00.000Z" },
+      openBout(nextBoutId, 2),
+    ] });
+
+    fireEvent.click(screen.getByRole("button", { name: button }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("This action is no longer valid");
+    expect(actions).toHaveLength(0);
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+  });
+
+  it("rejects a stale Retry after another tab changed the paused interval", async () => {
+    const actions: LocalAction[] = [];
+    const paused = (pauseId: string) => snapshotOf({
+      walking_sessions: [ACTIVE_SESSION],
+      walking_bouts: [openBout("bout-1", 1)],
+      walking_pauses: [{ id: pauseId, walking_bout_id: "bout-1", started_at: "2026-09-18T10:01:00.000Z", ended_at: null }],
+    });
+    let stored = paused("pause-1");
+    const repository = fakeRepository(() => stored, (action) => {
+      actions.push(action);
+      return Promise.reject(new DOMException("out of space", "QuotaExceededError"));
+    });
+    renderPad(repository);
+    expect(await screen.findByText("Paused")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Finish bout" }));
+    expect(await screen.findByRole("button", { name: "Retry" })).toBeInTheDocument();
+    stored = paused("pause-2");
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("This action is no longer valid"));
+    expect(actions).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+  });
+
   it("starts a session and its first bout, one committed action each", async () => {
     useFrozenClock("2026-09-18T10:00:00.000Z");
     const repository = freshRepository();
@@ -286,7 +346,7 @@ describe("PAD walking controls", () => {
     ).rejects.toBeInstanceOf(ActiveSessionConflictError);
   });
 
-  it("finishes the session, closing the open bout, and inherits its settings next time", async () => {
+  it("finishes while paused, closing the open pause and bout, and inherits settings", async () => {
     useFrozenClock("2026-09-18T10:00:00.000Z");
     const repository = freshRepository();
     renderPad(repository);
@@ -297,6 +357,8 @@ describe("PAD walking controls", () => {
     await screen.findByText("Walking");
 
     vi.setSystemTime(Date.parse("2026-09-18T10:08:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    expect(await screen.findByText("Paused")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Finish session" }));
 
     // Back to the start screen, now inheriting from the session just completed.
@@ -312,6 +374,8 @@ describe("PAD walking controls", () => {
     );
     const [bout] = await repository.listRecords("walking_bouts");
     expect(bout).toEqual(expect.objectContaining({ ended_at: "2026-09-18T10:08:00.000Z" }));
+    const [pause] = await repository.listRecords("walking_pauses");
+    expect(pause).toEqual(expect.objectContaining({ ended_at: "2026-09-18T10:08:00.000Z" }));
   });
 
   it("surfaces a rejected commit through the shared storage error surface", async () => {
@@ -435,7 +499,27 @@ describe("PAD commit attempts", () => {
 });
 
 describe("PAD finishing a session", () => {
-  it("closes what the live snapshot holds, not what this view last rendered", async () => {
+  it("does not finish a newer rest from a stale rest screen", async () => {
+    const actions: LocalAction[] = [];
+    const resting = (boutId: string, boutNumber: number, restId: string) => snapshotOf({
+      walking_sessions: [ACTIVE_SESSION],
+      walking_bouts: [{ ...openBout(boutId, boutNumber), ended_at: "2026-09-18T10:02:00.000Z" }],
+      walking_rests: [{ id: restId, walking_bout_id: boutId, started_at: "2026-09-18T10:02:00.000Z", ended_at: null }],
+    });
+    let stored = resting("bout-1", 1, "rest-1");
+    const repository = fakeRepository(() => stored, (action) => {
+      actions.push(action);
+      return Promise.resolve({ actionId: action.actionId, sequence: 1, committedAt: "2026-09-18T10:05:00.000Z" });
+    });
+    renderPad(repository);
+    expect(await screen.findByText("Resting")).toBeInTheDocument();
+    stored = resting("bout-2", 2, "rest-2");
+    fireEvent.click(screen.getByRole("button", { name: "Finish session" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("This action is no longer valid");
+    expect(actions).toHaveLength(0);
+  });
+
+  it("rejects session completion when another view started walking", async () => {
     const actions: LocalAction[] = [];
     let stored = snapshotOf({ walking_sessions: [ACTIVE_SESSION] });
     const repository = fakeRepository(
@@ -464,20 +548,8 @@ describe("PAD finishing a session", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Finish session" }));
 
-    await waitFor(() => {
-      expect(actions).toHaveLength(1);
-    });
-    // The bout is closed too: left open inside a COMPLETED session, no later
-    // snapshot could ever reach it again.
-    expect(actions[0]?.changes.map((change) => change.store)).toEqual([
-      "walking_bouts",
-      "walking_sessions",
-    ]);
-    expect(actions[0]?.preconditions).toContainEqual({
-      store: "walking_bouts",
-      id: "bout-1",
-      expected: { ended_at: null },
-    });
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(actions).toHaveLength(0);
   });
 
   it("records the finished session's summary so the next start screen reads one key", async () => {
@@ -492,6 +564,8 @@ describe("PAD finishing a session", () => {
     await screen.findByText("Walking");
 
     vi.setSystemTime(Date.parse("2026-09-18T10:07:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Finish bout" }));
+    expect(await screen.findByText("Resting")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Finish session" }));
 
     await waitFor(async () => {
@@ -571,6 +645,56 @@ describe("PAD finishing a session", () => {
     );
     expect(screen.getByLabelText("Incline (%)")).toBeValid();
     expect(screen.getByRole("button", { name: "Start" })).toBeDisabled();
+  });
+});
+
+describe("PAD note drafts", () => {
+  it("keeps text typed during a pending save after the earlier text is persisted", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    const stored = freshRepository();
+    let releaseSave: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => { releaseSave = resolve; });
+    let saveReached = false;
+    const repository: LocalRepository = {
+      ...stored,
+      commitAction: async (action) => {
+        if (action.changes.some((change) => change.store === "walking_sessions" &&
+          change.operation === "put" && change.record.session_notes === "First note")) {
+          saveReached = true;
+          await gate;
+        }
+        return stored.commitAction(action);
+      },
+    };
+    renderPad(repository);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    await screen.findByText("Ready");
+    fireEvent.click(screen.getByText("Session notes", { selector: "summary" }));
+    const textarea = screen.getByLabelText("Session notes");
+    fireEvent.change(textarea, { target: { value: "First note" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save notes" }));
+    await waitFor(() => { expect(saveReached).toBe(true); });
+    fireEvent.change(textarea, { target: { value: "Second note" } });
+    releaseSave?.();
+    await waitFor(async () => {
+      expect((await stored.listRecords("walking_sessions"))[0]?.session_notes).toBe("First note");
+      expect(screen.getByLabelText("Session notes")).toHaveValue("Second note");
+      expect(screen.getByRole("button", { name: "Save notes" })).toBeEnabled();
+    });
+  });
+
+  it("keeps a dirty draft when another view saves newer notes", async () => {
+    let stored = snapshotOf({ walking_sessions: [ACTIVE_SESSION] });
+    renderPad(fakeRepository(() => stored));
+    expect(await screen.findByText("Ready")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Session notes", { selector: "summary" }));
+    fireEvent.change(screen.getByLabelText("Session notes"), { target: { value: "Unsent draft" } });
+    stored = snapshotOf({ walking_sessions: [{ ...ACTIVE_SESSION, session_notes: "Other view's note" }] });
+    fireEvent.focus(window);
+    await waitFor(() => {
+      expect(screen.getByText("Session notes · saved", { selector: "summary" })).toBeInTheDocument();
+      expect(screen.getByLabelText("Session notes")).toHaveValue("Unsent draft");
+    });
   });
 });
 
@@ -785,5 +909,155 @@ describe("PAD-02 — application termination", () => {
     expect(screen.getByText("06:00")).toBeInTheDocument();
     expect(screen.queryByText(/Maximum reached/)).not.toBeInTheDocument();
     expect(screen.getByText("5.0 km/h · Incline 2.0% · Maximum bout 08:00")).toBeInTheDocument();
+  });
+});
+
+describe("PAD bout workflow", () => {
+  it("prepares an additional READY bout without starting its clock", async () => {
+    useFrozenClock("2026-09-18T10:10:00.000Z");
+    const repository = freshRepository();
+    await repository.commitAction({
+      actionId: "seed-ready-bout",
+      changes: [
+        { store: "walking_sessions", operation: "put", record: ACTIVE_SESSION },
+        { store: "walking_bouts", operation: "put", record: {
+          id: "bout-1", walking_session_id: "session-1", bout_number: 1,
+          started_at: "2026-09-18T10:00:00.000Z", ended_at: "2026-09-18T10:08:00.000Z",
+        } },
+      ],
+    });
+    renderPad(repository);
+    expect(await screen.findByText("Ready")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Start walking" })).not.toBeInTheDocument();
+    const outboxBefore = await repository.listPendingOutbox();
+    fireEvent.click(screen.getByRole("button", { name: /Add bout/i }));
+    expect(screen.getByRole("button", { name: "Start walking" })).toBeInTheDocument();
+    expect(await repository.listPendingOutbox()).toHaveLength(outboxBefore.length);
+    expect(await repository.listRecords("walking_bouts")).toHaveLength(1);
+  });
+
+  it("ignores rapid duplicate Finish bout and Start next bout taps", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    const repository = freshRepository();
+    renderPad(repository);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start walking" }));
+    await screen.findByText("Walking");
+    const finish = screen.getByRole("button", { name: "Finish bout" });
+    fireEvent.click(finish);
+    fireEvent.click(finish);
+    await screen.findByText("Resting");
+    expect(await repository.listRecords("walking_rests")).toHaveLength(1);
+    const next = screen.getByRole("button", { name: "Start next bout" });
+    fireEvent.click(next);
+    fireEvent.click(next);
+    await screen.findByText("Walking");
+    expect(await repository.listRecords("walking_bouts")).toHaveLength(2);
+    expect((await repository.listRecords("walking_rests"))[0]?.ended_at).not.toBeNull();
+  });
+
+  it("recovers a paused bout, excludes repeated pauses, then atomically starts the next bout", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    const databaseName = `pad-workflow-${crypto.randomUUID()}`;
+    const before = repositoryOver(databaseName);
+    const firstRender = renderPad(before);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start walking" }));
+    await screen.findByText("Walking");
+
+    vi.setSystemTime(Date.parse("2026-09-18T10:02:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    await screen.findByText("Paused");
+    firstRender.unmount();
+    before.close();
+
+    vi.setSystemTime(Date.parse("2026-09-18T10:04:00.000Z"));
+    const after = repositoryOver(databaseName);
+    const secondRender = renderPad(after);
+    expect(await screen.findByText("Paused")).toBeInTheDocument();
+    expect(screen.getByText("Walking 02:00")).toBeInTheDocument();
+    expect(screen.getByText("02:00")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+    await screen.findByText("Walking");
+    vi.setSystemTime(Date.parse("2026-09-18T10:07:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    await screen.findByText("Paused");
+    vi.setSystemTime(Date.parse("2026-09-18T10:08:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Finish bout" }));
+    expect(await screen.findByText("Resting")).toBeInTheDocument();
+    expect(screen.getByText("05:00")).toBeInTheDocument();
+    expect((await after.listRecords("walking_pauses"))).toHaveLength(2);
+    expect((await after.listRecords("walking_rests"))[0]).toEqual(expect.objectContaining({ ended_at: null }));
+
+    secondRender.unmount();
+    after.close();
+    const resting = repositoryOver(databaseName);
+    renderPad(resting);
+    expect(await screen.findByText("Resting")).toBeInTheDocument();
+    expect(screen.getByText("Rest after bout 1")).toBeInTheDocument();
+
+    vi.setSystemTime(Date.parse("2026-09-18T10:10:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Start next bout" }));
+    expect(await screen.findByText("Walking")).toBeInTheDocument();
+    expect(screen.getByText("Bout 2")).toBeInTheDocument();
+    expect((await resting.listRecords("walking_rests"))[0]).toEqual(expect.objectContaining({ ended_at: "2026-09-18T10:10:00.000Z" }));
+    expect((await resting.listRecords("walking_bouts"))).toHaveLength(2);
+    expect(await resting.listPendingOutbox()).toHaveLength(7);
+  });
+
+  it("records adjacent pain, infers a reason, and lets the user revise both afterward", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    const repository = freshRepository();
+    renderPad(repository);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start walking" }));
+    await screen.findByText("Walking");
+    const pain = within(screen.getByRole("group", { name: "Pain for bout 1" }));
+    fireEvent.click(pain.getByRole("button", { name: "3" }));
+    await waitFor(() => expect(pain.getByRole("button", { name: "3" })).toHaveAttribute("aria-pressed", "true"));
+    expect(pain.getByRole("button", { name: "1" })).toBeDisabled();
+    fireEvent.click(pain.getByRole("button", { name: "4" }));
+    await waitFor(() => expect(pain.getByRole("button", { name: "4" })).toHaveAttribute("aria-pressed", "true"));
+    expect(pain.getByRole("button", { name: "5" })).toBeDisabled();
+
+    vi.setSystemTime(Date.parse("2026-09-18T10:05:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Finish bout" }));
+    await screen.findByText("Resting");
+    expect(await repository.listRecords("walking_bouts")).toEqual([
+      expect.objectContaining({ pain_min: 3, pain_max: 4, stop_reason: "CLAUDICATION" }),
+    ]);
+    fireEvent.change(screen.getByLabelText("Stop reason for bout 1"), { target: { value: "FOOT_NUMBNESS" } });
+    await waitFor(async () => { expect((await repository.listRecords("walking_bouts"))[0]).toEqual(expect.objectContaining({ stop_reason: "FOOT_NUMBNESS" })); });
+    const completedPain = within(screen.getByRole("group", { name: "Pain for bout 1" }));
+    fireEvent.click(completedPain.getByRole("button", { name: "4" }));
+    await waitFor(async () => { expect((await repository.listRecords("walking_bouts"))[0]).toEqual(expect.objectContaining({ pain_min: 3, pain_max: 3 })); });
+  });
+
+  it("alerts at the maximum without ending the bout, and persists collapsed notes", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    const repository = freshRepository();
+    renderPad(repository);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start walking" }));
+    await screen.findByText("Walking");
+    vi.setSystemTime(Date.parse("2026-09-18T10:09:00.000Z"));
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      await Promise.resolve();
+    });
+    expect(screen.getByText(/Maximum reached/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Finish bout" })).toBeEnabled();
+    expect((await repository.listRecords("walking_bouts"))[0]).toEqual(expect.objectContaining({ ended_at: null }));
+    fireEvent.click(screen.getByRole("button", { name: "Finish bout" }));
+    await screen.findByText("Resting");
+    expect((await repository.listRecords("walking_bouts"))[0]).toEqual(expect.objectContaining({ stop_reason: "MAX_DURATION" }));
+    const summary = screen.getByText("Session notes", { selector: "summary" });
+    const details = summary.closest("details");
+    expect(details).not.toHaveAttribute("open");
+    fireEvent.click(summary);
+    fireEvent.change(screen.getByLabelText("Session notes"), { target: { value: "Felt steady" } });
+    fireEvent.click(within(details as HTMLElement).getByRole("button", { name: "Save notes" }));
+    await waitFor(async () => { expect((await repository.listRecords("walking_sessions"))[0]).toEqual(expect.objectContaining({ session_notes: "Felt steady" })); });
   });
 });

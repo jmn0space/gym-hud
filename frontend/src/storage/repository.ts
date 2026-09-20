@@ -293,6 +293,13 @@ function checkPrecondition(
       );
     }
   }
+  for (const field of precondition.absentFields ?? []) {
+    if (Object.prototype.hasOwnProperty.call(record, field)) {
+      throw new PreconditionFailedError(
+        `Precondition failed for ${precondition.store}/${precondition.id} field "${field}"`,
+      );
+    }
+  }
 }
 
 function makePersistedPut(
@@ -526,6 +533,81 @@ async function holderStillValid(
   return isOpen(holderRecord) && holderRecord[parentField] === scope.scopeKey;
 }
 
+/**
+ * An open PAD bout cannot coexist with an unfinished rest in its session. Read
+ * the affected sessions through the bout parent index and rest markers, then
+ * overlay this action's final changes. This catches a reopened old bout and a
+ * rest opened alongside a new bout, neither of which is visible in old markers.
+ * Closing the prior rest in this action remains the legal START NEXT BOUT path.
+ */
+async function checkNewWalkingBoutsAgainstRests(
+  transaction: IDBTransaction,
+  changes: readonly DomainChange[],
+): Promise<void> {
+  const finalBouts = new Map<string, DomainChange>();
+  const finalRests = new Map<string, DomainChange>();
+  for (const change of changes) {
+    if (change.store === "walking_bouts") finalBouts.set(changeIdentifier(change), change);
+    if (change.store === "walking_rests") finalRests.set(changeIdentifier(change), change);
+  }
+  const affectedSessionIds = new Set<string>();
+  for (const change of finalBouts.values()) {
+    if (change.operation !== "put" || !isOpen({ ...change.record, deleted_at: null })) continue;
+    const sessionId = change.record.walking_session_id;
+    if (typeof sessionId === "string" && sessionId.trim() !== "") affectedSessionIds.add(sessionId);
+  }
+  for (const change of finalRests.values()) {
+    if (change.operation !== "put" || !isOpen({ ...change.record, deleted_at: null })) continue;
+    const parentId = change.record.walking_bout_id;
+    if (typeof parentId !== "string") continue;
+    const submittedBout = finalBouts.get(parentId);
+    const parent = submittedBout === undefined
+      ? await requestResult(transaction.objectStore("walking_bouts").get(parentId) as IDBRequest<LocalRecord | undefined>)
+      : submittedBout.operation === "put" ? submittedBout.record : undefined;
+    const sessionId = parent?.walking_session_id;
+    if (typeof sessionId === "string" && sessionId.trim() !== "") affectedSessionIds.add(sessionId);
+  }
+  if (affectedSessionIds.size === 0) return;
+
+  const boutParentIndex = PARENT_INDEXES.walking_bouts;
+  if (boutParentIndex === undefined) throw new StorageCorruptionError("Missing walking bout parent index");
+  const boutIndex = transaction.objectStore("walking_bouts").index(boutParentIndex.name);
+  const markers = transaction.objectStore(DATABASE_STORES.activeMarkers);
+  for (const sessionId of affectedSessionIds) {
+    const effectiveBouts = new Map<string, LocalRecord>();
+    for (const bout of await requestResult(boutIndex.getAll(sessionId) as IDBRequest<LocalRecord[]>)) {
+      effectiveBouts.set(bout.id, bout);
+    }
+    for (const change of finalBouts.values()) {
+      const id = changeIdentifier(change);
+      effectiveBouts.delete(id);
+      if (change.operation === "put" && change.record.walking_session_id === sessionId) {
+        effectiveBouts.set(id, { ...change.record, deleted_at: null });
+      }
+    }
+    if (![...effectiveBouts.values()].some(isOpen)) continue;
+    for (const bout of effectiveBouts.values()) {
+      if (isDeleted(bout)) continue;
+      const marker = await requestResult(markers.get(markerId("walking_rests", bout.id)) as IDBRequest<ActiveMarkerRecord | undefined>);
+      if (marker !== undefined) {
+        const changed = finalRests.get(marker.recordId);
+        const remainsOpen = changed === undefined
+          ? await holderStillValid(transaction, { store: "walking_rests", scopeKey: bout.id, events: [] }, marker.recordId)
+          : changed.operation === "put" && isOpen({ ...changed.record, deleted_at: null }) && changed.record.walking_bout_id === bout.id;
+        if (remainsOpen) {
+          throw new InvalidActionError(`Cannot start a walking bout while rest ${marker.recordId} is open`);
+        }
+      }
+    }
+    for (const change of finalRests.values()) {
+      if (change.operation !== "put" || !isOpen({ ...change.record, deleted_at: null })) continue;
+      const parent = effectiveBouts.get(change.record.walking_bout_id as string);
+      if (parent === undefined || isDeleted(parent)) continue;
+      throw new InvalidActionError(`Cannot start a walking bout while rest ${change.record.id} is open`);
+    }
+  }
+}
+
 function maximumPersistedSequence(
   receipts: StoredReceipt[],
   outboxEntries: OutboxEntry[],
@@ -683,6 +765,8 @@ export function createLocalRepository(options: LocalRepositoryOptions = {}): Loc
         Promise.all(preconditionReads),
         Promise.all(existingReads),
       ]);
+
+      await checkNewWalkingBoutsAgainstRests(transaction, actionSnapshot.changes);
 
       const timestampDate = now();
       if (Number.isNaN(timestampDate.getTime())) {
