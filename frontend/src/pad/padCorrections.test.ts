@@ -245,6 +245,39 @@ describe("PAD time corrections (PAD-09)", () => {
       actionId: nextActionId(), view, boutId: "missing", startedAt: at(1).toISOString(),
     })).toThrow(InvalidActionError);
   });
+
+  it("re-derives an inferred MAX_DURATION stop reason when a correction moves the bout under the maximum again (issue #22 finding 6)", async () => {
+    const repo = open();
+    await start(repo);
+    await repo.commitAction(startWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-1", view: await live(repo), now: at(0) }));
+    // Runs to 30 minutes, well past the default 8-minute maximum: MAX_DURATION is inferred.
+    await repo.commitAction(finishWalkingBoutAction({ actionId: nextActionId(), restId: "rest-1", view: await live(repo), now: at(30) }));
+    expect((await live(repo)).bouts[0]?.stop_reason).toBe("MAX_DURATION");
+
+    // Corrected back under the maximum: the inferred reason no longer applies.
+    await repo.commitAction(correctWalkingBoutTimesAction({
+      actionId: nextActionId(), view: await live(repo), boutId: "bout-1", endedAt: at(5).toISOString(),
+    }));
+    expect((await live(repo)).bouts[0]?.stop_reason).toBeNull();
+  });
+
+  it("never overwrites a stop reason the user chose explicitly, even if a correction would change what inference now says", async () => {
+    const repo = open();
+    await start(repo);
+    await repo.commitAction(startWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-1", view: await live(repo), now: at(0) }));
+    await repo.commitAction(finishWalkingBoutAction({ actionId: nextActionId(), restId: "rest-1", view: await live(repo), now: at(30) }));
+    // The user overrides the inferred MAX_DURATION with what actually happened.
+    await repo.commitAction(updateWalkingBoutAction({
+      actionId: nextActionId(), view: await live(repo), boutId: "bout-1", stopReason: "FOOT_NUMBNESS",
+    }));
+    expect((await live(repo)).bouts[0]?.stop_reason).toBe("FOOT_NUMBNESS");
+
+    await repo.commitAction(correctWalkingBoutTimesAction({
+      actionId: nextActionId(), view: await live(repo), boutId: "bout-1", endedAt: at(5).toISOString(),
+    }));
+    // The user's own choice survives the correction untouched.
+    expect((await live(repo)).bouts[0]?.stop_reason).toBe("FOOT_NUMBNESS");
+  });
 });
 
 describe("PAD undo (confirmed, forward compensating mutation)", () => {
@@ -436,6 +469,140 @@ describe("PAD undo (confirmed, forward compensating mutation)", () => {
   });
 });
 
+describe("PAD undo targets the stamped record, not a same-instant collision (issue #22 finding 1)", () => {
+  it("reopens the rest START NEXT BOUT actually closed, when an earlier rest shares its ended_at after a clock step", async () => {
+    // The reviewer's exact repro: a device clock steps back mid-session, so
+    // `monotonicNow` collapses every later stamp to the same already-recorded
+    // instant. Two different rests end up sharing one `ended_at`, which a
+    // `rests.find(rest => rest.ended_at === currentBout.started_at)` (the old
+    // implementation) cannot tell apart -- `find` returns whichever comes
+    // first in `view.rests`' storage order, not time order.
+    const repo = open();
+    await start(repo);
+    await repo.commitAction(startWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-1", view: await live(repo), now: at(1) }));
+    await repo.commitAction(finishWalkingBoutAction({ actionId: nextActionId(), restId: "rest-1", view: await live(repo), now: at(20) }));
+    // The clock steps back: every following commit's `now` is earlier than
+    // minute 20, the latest instant already recorded, so all of it collapses
+    // to exactly that same instant.
+    await repo.commitAction(startNextWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-2", view: await live(repo), now: at(15) }));
+    await repo.commitAction(finishWalkingBoutAction({ actionId: nextActionId(), restId: "rest-2", view: await live(repo), now: at(16) }));
+    await repo.commitAction(startNextWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-3", view: await live(repo), now: at(17) }));
+
+    const view = await live(repo);
+    // The collision this finding fixes: rest-1 and rest-2 both now end
+    // exactly when bout-3 started.
+    expect(view.rests.filter((rest) => rest.ended_at === view.currentBout?.started_at)).toHaveLength(2);
+
+    // The correct target is rest-2 -- the rest START NEXT BOUT for bout-3
+    // actually closed -- never rest-1, which just happens to share the instant.
+    expect(detectUndoableWalkingTransition(view)).toEqual({
+      type: "next_bout_started", boutId: "bout-3", restId: "rest-2",
+    });
+
+    await repo.commitAction(undoLastWalkingTransitionAction({ actionId: nextActionId(), view }));
+    const after = await live(repo);
+    expect(after.state).toBe("RESTING");
+    expect(after.currentRest?.id).toBe("rest-2");
+    expect(after.currentRest?.ended_at).toBeNull();
+    expect(await repo.getRecord("walking_bouts", "bout-3")).toBeUndefined();
+    // rest-1's own recorded end is untouched: it was never part of this undo.
+    expect((await repo.getRecord("walking_rests", "rest-1"))?.ended_at).toBe(at(20).toISOString());
+  });
+
+  it("reopens the pause a bout finish actually closed, not an earlier resumed pause sharing the same instant", async () => {
+    // The second instance the reviewer flagged: `pauses.find(p => p.ended_at
+    // === currentBout.ended_at)` cannot distinguish a pause the user
+    // explicitly RESUMED from the one FINISH BOUT force-closed, once a clock
+    // step makes both land on the same instant.
+    const repo = open();
+    await start(repo);
+    await repo.commitAction(startWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-1", view: await live(repo), now: at(1) }));
+    await repo.commitAction(pauseWalkingBoutAction({ actionId: nextActionId(), pauseId: "pause-a", view: await live(repo), now: at(2) }));
+    await repo.commitAction(resumeWalkingBoutAction({ actionId: nextActionId(), view: await live(repo), now: at(50) }));
+    // The clock steps back before the bout is paused again and finished:
+    // both collapse to the same instant as the resume above.
+    await repo.commitAction(pauseWalkingBoutAction({ actionId: nextActionId(), pauseId: "pause-b", view: await live(repo), now: at(10) }));
+    await repo.commitAction(finishWalkingBoutAction({ actionId: nextActionId(), restId: "rest-1", view: await live(repo), now: at(5) }));
+
+    const view = await live(repo);
+    const pauseA = await repo.getRecord("walking_pauses", "pause-a");
+    const pauseB = await repo.getRecord("walking_pauses", "pause-b");
+    // The collision: both pauses, and the bout itself, now end at minute 50.
+    expect(pauseA?.ended_at).toBe(at(50).toISOString());
+    expect(pauseB?.ended_at).toBe(at(50).toISOString());
+    expect(view.bouts[0]?.ended_at).toBe(at(50).toISOString());
+
+    expect(detectUndoableWalkingTransition(view)).toEqual({
+      type: "bout_finished", boutId: "bout-1", restId: "rest-1", pauseId: "pause-b",
+    });
+
+    await repo.commitAction(undoLastWalkingTransitionAction({ actionId: nextActionId(), view }));
+    const after = await live(repo);
+    expect(after.state).toBe("PAUSED");
+    expect(after.currentPause?.id).toBe("pause-b");
+    // pause-a, the one the user actually resumed, is untouched.
+    expect((await repo.getRecord("walking_pauses", "pause-a"))?.ended_at).toBe(at(50).toISOString());
+  });
+});
+
+describe("PAD corrections, undo and delete after synchronization (issue #22 finding 8)", () => {
+  it("corrects, undoes and deletes against records that have round-tripped through applyServerRecords", async () => {
+    // Every other "after synchronization" test in this file simulates sync by
+    // acknowledging the outbox only. That never runs a correction, undo or
+    // delete against a record the server's own serialization has actually
+    // produced -- the one path where the server could in principle hand back
+    // a differently-formatted timestamp string.
+    const repo = open();
+    await start(repo);
+    await repo.commitAction(startWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-1", view: await live(repo), now: at(0) }));
+    await repo.commitAction(finishWalkingBoutAction({ actionId: nextActionId(), restId: "rest-1", view: await live(repo), now: at(8) }));
+    await repo.commitAction(startNextWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-2", view: await live(repo), now: at(10) }));
+    for (const entry of await repo.listPendingOutbox()) {
+      await repo.acknowledgeOutbox(entry.mutation_id);
+    }
+
+    const session = await repo.getRecord("walking_sessions", "session");
+    const bout1 = await repo.getRecord("walking_bouts", "bout-1");
+    const bout2 = await repo.getRecord("walking_bouts", "bout-2");
+    const rest1 = await repo.getRecord("walking_rests", "rest-1");
+    if (session === undefined || bout1 === undefined || bout2 === undefined || rest1 === undefined) {
+      throw new Error("Expected every record to exist before the server round-trip");
+    }
+    // The server's own serialization, round-tripped byte-identically for a
+    // `Date.toISOString()`-shaped timestamp (`backend/apps/sync/protocol.py`,
+    // `format_timestamp`) -- exactly what `applyServerRecords` merges in.
+    await repo.applyServerRecords(
+      [
+        { store: "walking_sessions", entity_id: "session", record: session },
+        { store: "walking_bouts", entity_id: "bout-1", record: bout1 },
+        { store: "walking_bouts", entity_id: "bout-2", record: bout2 },
+        { store: "walking_rests", entity_id: "rest-1", record: rest1 },
+      ],
+      1,
+    );
+
+    let view = await live(repo);
+    await repo.commitAction(correctWalkingBoutTimesAction({
+      actionId: nextActionId(), view, boutId: "bout-1", endedAt: at(7).toISOString(),
+    }));
+    view = await live(repo);
+    expect(view.bouts[0]?.ended_at).toBe(at(7).toISOString());
+
+    expect(detectUndoableWalkingTransition(view)).toEqual({
+      type: "next_bout_started", boutId: "bout-2", restId: "rest-1",
+    });
+    await repo.commitAction(undoLastWalkingTransitionAction({ actionId: nextActionId(), view }));
+    view = await live(repo);
+    expect(view.state).toBe("RESTING");
+    expect(await repo.getRecord("walking_bouts", "bout-2")).toBeUndefined();
+
+    await repo.commitAction(deleteWalkingBoutAction({ actionId: nextActionId(), view, boutId: "bout-1" }));
+    const after = await live(repo);
+    expect(after.bouts).toHaveLength(0);
+    expect(after.state).toBe("READY");
+  });
+});
+
 describe("PAD bout deletion", () => {
   it("deletes a finished bout with its pause and rest, and renumbers the surviving bouts contiguously", async () => {
     const repo = open();
@@ -494,6 +661,43 @@ describe("PAD bout deletion", () => {
 
     expect(() => deleteWalkingBoutAction({ actionId: nextActionId(), view, boutId: "bout-1" })).toThrow(InvalidActionError);
     expect(() => deleteWalkingBoutAction({ actionId: nextActionId(), view, boutId: "missing" })).toThrow(InvalidActionError);
+  });
+
+  it("renumbers from raw bout rows, so a sibling row the tolerant parser dropped cannot collide with a survivor's new number (issue #22 finding 7)", async () => {
+    const repo = open();
+    await start(repo);
+    await repo.commitAction(startWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-1", view: await live(repo), now: at(0) }));
+    await repo.commitAction(finishWalkingBoutAction({ actionId: nextActionId(), restId: "rest-1", view: await live(repo), now: at(1) }));
+    await repo.commitAction(startNextWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-2", view: await live(repo), now: at(2) }));
+    await repo.commitAction(finishWalkingBoutAction({ actionId: nextActionId(), restId: "rest-2", view: await live(repo), now: at(3) }));
+
+    // A sibling bout row the tolerant parser drops (an unparseable `ended_at`,
+    // per `records.ts`'s "corrupt end time must not be read as still open"),
+    // holding `bout_number: 1` -- the number bout-2 is about to be renumbered
+    // to once bout-1 is deleted.
+    await repo.commitAction({
+      actionId: "inject-unparseable-sibling",
+      changes: [{
+        store: "walking_bouts",
+        operation: "put",
+        record: {
+          id: "bout-unreadable", walking_session_id: "session", bout_number: 1,
+          started_at: at(0.5).toISOString(), ended_at: "not-a-timestamp",
+        },
+      }],
+    });
+
+    const view = await live(repo);
+    // The unreadable row is invisible to the parsed view...
+    expect(view.bouts.map((bout) => bout.id)).toEqual(["bout-1", "bout-2"]);
+    await repo.commitAction(deleteWalkingBoutAction({ actionId: nextActionId(), view, boutId: "bout-1" }));
+
+    // ...but its own stored bout_number was still bumped along with every
+    // other raw sibling row, so it never again collides with bout-2's.
+    const survivor = await repo.getRecord("walking_bouts", "bout-2");
+    const unreadable = await repo.getRecord("walking_bouts", "bout-unreadable");
+    expect(survivor?.bout_number).toBe(2);
+    expect(unreadable?.bout_number).toBe(1);
   });
 
   it("survives close/reopen: a deletion commits identically whether or not it has been pushed yet", async () => {

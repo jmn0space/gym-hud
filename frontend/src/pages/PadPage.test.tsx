@@ -1206,4 +1206,98 @@ describe("PAD corrections, undo and delete (issue #22)", () => {
     // No bouts remain, so the HUD returns straight to the Start-walking control.
     await screen.findByRole("button", { name: "Start walking" });
   });
+
+  it("does not lose recorded milliseconds on a save-without-editing (issue #22 finding 3)", async () => {
+    useFrozenClock("2026-09-18T10:00:00.237Z");
+    const repository = freshRepository();
+    renderPad(repository);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start walking" }));
+    await screen.findByText("Walking");
+
+    vi.setSystemTime(Date.parse("2026-09-18T10:08:00.237Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Finish bout" }));
+    await screen.findByText("Resting");
+
+    fireEvent.click(screen.getByText("Edit times for bout 1", { selector: "summary" }));
+    fireEvent.click(screen.getByRole("button", { name: /Bout 1 ended/ }));
+    // The field can only display whole seconds, but the draft still reads
+    // the same second as the stored value: Save must stay disabled rather
+    // than let a no-op save round the stored instant down by up to 999 ms.
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect((await repository.listRecords("walking_bouts"))[0]).toEqual(
+      expect.objectContaining({ ended_at: "2026-09-18T10:08:00.237Z" }),
+    );
+  });
+
+  it("shows and corrects each of a bout's own pauses in its Edit times disclosure (issue #22 finding 4)", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    const repository = freshRepository();
+    renderPad(repository);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start walking" }));
+    await screen.findByText("Walking");
+
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    await screen.findByText("Paused");
+    vi.setSystemTime(Date.parse("2026-09-18T10:02:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+    await screen.findByText("Walking");
+
+    vi.setSystemTime(Date.parse("2026-09-18T10:08:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Finish bout" }));
+    await screen.findByText("Resting");
+
+    fireEvent.click(screen.getByText("Edit times for bout 1", { selector: "summary" }));
+    fireEvent.click(screen.getByRole("button", { name: /Pause 1 of bout 1 started/ }));
+    const input = screen.getByLabelText("Pause 1 of bout 1 started");
+    const corrected = new Date(Date.parse("2026-09-18T10:00:30.000Z"));
+    fireEvent.change(input, { target: { value: toDatetimeLocalValue(corrected) } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(async () => {
+      expect((await repository.listRecords("walking_pauses"))[0]).toEqual(
+        expect.objectContaining({ started_at: "2026-09-18T10:00:30.000Z" }),
+      );
+    });
+  });
+
+  it("lets the running bout's own start be corrected before it finishes (issue #22 finding 5)", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    const repository = freshRepository();
+    renderPad(repository);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start walking" }));
+    await screen.findByText("Walking");
+
+    fireEvent.click(screen.getByText("Edit times for bout 1", { selector: "summary" }));
+    fireEvent.click(screen.getByRole("button", { name: /Bout 1 started/ }));
+    const input = screen.getByLabelText("Bout 1 started");
+    const corrected = new Date(Date.parse("2026-09-18T10:00:05.000Z"));
+    fireEvent.change(input, { target: { value: toDatetimeLocalValue(corrected) } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(async () => {
+      expect((await repository.listRecords("walking_bouts"))[0]).toEqual(
+        expect.objectContaining({ started_at: "2026-09-18T10:00:05.000Z" }),
+      );
+    });
+    // Still WALKING: correcting the open bout's start does not close it.
+    expect(screen.getByText("Walking")).toBeInTheDocument();
+  });
+
+  it("names what Undo would reverse in its confirmation (issue #22 finding 9)", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    const repository = freshRepository();
+    renderPad(repository);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start walking" }));
+    await screen.findByText("Walking");
+
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    const dialog = await screen.findByRole("alertdialog", { name: "Confirm undo" });
+    expect(within(dialog).getByText("Undo starting bout 1?")).toBeInTheDocument();
+  });
 });
