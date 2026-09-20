@@ -50,7 +50,7 @@ function isTimestamp(value: string): boolean {
  * `created_at`, so the fallback is what keeps a partially corrupted row resumable
  * instead of invisible.
  */
-function startTimestamp(record: LocalRecord): string | undefined {
+export function startTimestamp(record: LocalRecord): string | undefined {
   const started = recordText(record, "started_at");
   if (started !== undefined && isTimestamp(started)) {
     return started;

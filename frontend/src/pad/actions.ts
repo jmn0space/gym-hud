@@ -6,7 +6,7 @@ import type {
   RecordPrecondition,
   RecoverySnapshot,
 } from "../storage";
-import { isOpenRow, recordText, walkingBoutRecord, walkingSessionRecord } from "./records";
+import { isOpenRow, recordText, startTimestamp, walkingBoutRecord, walkingSessionRecord } from "./records";
 import { buildPadSessionView, findActiveWalkingSessionRecord, walkingElapsedMs, type PadSessionView } from "./session";
 import {
   WALKING_STOP_REASONS,
@@ -96,6 +96,112 @@ function amendedWorkflowChange(view: PadSessionView, fields: LocalRecord): Local
   const change = workflowChange(view);
   if (change.operation !== "put") throw new InvalidActionError("Expected session update");
   return { ...change, record: { ...change.record, ...fields } };
+}
+
+/**
+ * The five state-changing transitions undo can reverse (see
+ * `UndoableWalkingTransition` below), plus a record of which bout/pause/rest
+ * each one touched.
+ *
+ * Stamped explicitly onto the session record by every transition-producing
+ * action, alongside `workflow_revision` (issue #22, finding 1). Undo reads
+ * this instead of re-deriving "which record did this" by matching
+ * timestamps: `monotonicNow` deliberately collapses distinct instants
+ * whenever the device clock steps back, so two rests (or two pauses) of the
+ * same session can legitimately share an `ended_at`. Equality can no longer
+ * tell them apart once that happens; identity (a stamped id) still can.
+ *
+ * This is persisted domain data on the session record `workflowChange`
+ * already writes on every transition -- not a separate undo-stack store
+ * (owner decision, issue #22): it survives a reload and a second tab, and
+ * behaves identically before and after sync (`docs/data-sync.md` already
+ * says records may carry fields the server does not model, and
+ * `backend/apps/pad/records.py`'s `parse_walking_session` only reads the
+ * fields it knows, so these are ignored, not rejected, by the server).
+ */
+type WalkingTransitionKind =
+  | "bout_started"
+  | "bout_paused"
+  | "bout_resumed"
+  | "bout_finished"
+  | "next_bout_started";
+
+interface WalkingTransitionStamp {
+  kind: WalkingTransitionKind;
+  boutId: string | null;
+  pauseId: string | null;
+  restId: string | null;
+}
+
+/** The four raw fields a transition stamp occupies on the session record. */
+function transitionStampFields(stamp: WalkingTransitionStamp | null): Record<string, string | null> {
+  return {
+    transition_kind: stamp?.kind ?? null,
+    transition_bout_id: stamp?.boutId ?? null,
+    transition_pause_id: stamp?.pauseId ?? null,
+    transition_rest_id: stamp?.restId ?? null,
+  };
+}
+
+/**
+ * The session's current transition stamp, or `null` when there is none --
+ * either genuinely absent (a session that predates this field, or one on
+ * which nothing undoable has happened yet: the legacy/absent case degrades
+ * to "undo unavailable", the same pattern `workflowPrecondition` already
+ * uses for an absent `workflow_revision`) or holding a value this build does
+ * not recognize.
+ */
+const WALKING_TRANSITION_KINDS = [
+  "bout_started",
+  "bout_paused",
+  "bout_resumed",
+  "bout_finished",
+  "next_bout_started",
+] as const satisfies readonly WalkingTransitionKind[];
+
+function readTransitionStamp(sessionRecord: LocalRecord): WalkingTransitionStamp | null {
+  const rawKind = sessionRecord.transition_kind;
+  if (!(WALKING_TRANSITION_KINDS as readonly unknown[]).includes(rawKind)) {
+    return null;
+  }
+  const kind = rawKind as WalkingTransitionKind;
+  const asId = (value: unknown): string | null => (typeof value === "string" ? value : null);
+  return {
+    kind,
+    boutId: asId(sessionRecord.transition_bout_id),
+    pauseId: asId(sessionRecord.transition_pause_id),
+    restId: asId(sessionRecord.transition_rest_id),
+  };
+}
+
+/** The session change for one of the five undoable transitions: stamp it explicitly. */
+function stampedWorkflowChange(view: PadSessionView, stamp: WalkingTransitionStamp): LocalAction["changes"][number] {
+  return amendedWorkflowChange(view, { id: view.session.id, ...transitionStampFields(stamp) });
+}
+
+/**
+ * The session change for an action that is NOT one of the five undoable
+ * transitions (a correction, or a delete): the existing stamp survives
+ * untouched *unless* it is invalidated by clearing here -- so undo still
+ * finds the transition underneath an unrelated pain/notes edit (tested), but
+ * a correction or delete that touches the very record the stamp names is no
+ * longer an exact reversal of anything, and stops offering it (tested,
+ * `docs/pad-walking.md` "Editing, undo, and delete").
+ *
+ * `touchedIds` is checked by identity against the stamp's own ids, never by
+ * timestamp equality, so this carries none of the ambiguity the stamp itself
+ * was introduced to remove.
+ */
+function workflowChangeInvalidatingTransition(
+  view: PadSessionView,
+  touchedIds: readonly (string | null)[],
+): LocalAction["changes"][number] {
+  const stamp = readTransitionStamp(view.sessionRecord);
+  const stampIds: readonly (string | null)[] = stamp === null ? [] : [stamp.boutId, stamp.pauseId, stamp.restId];
+  const invalidated = stamp !== null && touchedIds.some((id) => id !== null && stampIds.includes(id));
+  return invalidated
+    ? amendedWorkflowChange(view, { id: view.session.id, ...transitionStampFields(null) })
+    : workflowChange(view);
 }
 
 function requireState(view: PadSessionView, ...states: PadSessionView["state"][]): void {
@@ -214,7 +320,7 @@ export function startWalkingBoutAction({
           notes: null,
         }),
       },
-      workflowChange(view),
+      stampedWorkflowChange(view, { kind: "bout_started", boutId, pauseId: null, restId: null }),
     ],
     preconditions: [
       workflowPrecondition(view),
@@ -240,7 +346,7 @@ export function pauseWalkingBoutAction({ actionId, pauseId, view, now }: PauseWa
       { store: "walking_pauses", operation: "put", record: {
         id: pauseId, walking_bout_id: bout.id, started_at: startedAt, ended_at: null,
       } },
-      workflowChange(view),
+      stampedWorkflowChange(view, { kind: "bout_paused", boutId: bout.id, pauseId, restId: null }),
     ],
     preconditions: [
       workflowPrecondition(view),
@@ -267,7 +373,7 @@ export function resumeWalkingBoutAction({ actionId, view, now }: ResumeWalkingBo
     actionId,
     changes: [
       { store: "walking_pauses", operation: "put", record: { ...carriedFields(rawPause), ended_at: endedAt } },
-      workflowChange(view),
+      stampedWorkflowChange(view, { kind: "bout_resumed", boutId: bout.id, pauseId: pause.id, restId: null }),
     ],
     preconditions: [
       workflowPrecondition(view),
@@ -326,7 +432,9 @@ export function finishWalkingBoutAction({ actionId, restId, view, now }: FinishW
   changes.push({ store: "walking_rests", operation: "put", record: {
     id: restId, walking_bout_id: bout.id, started_at: endedAt, ended_at: null,
   } });
-  changes.push(workflowChange(view));
+  changes.push(stampedWorkflowChange(view, {
+    kind: "bout_finished", boutId: bout.id, restId, pauseId: view.currentPause?.id ?? null,
+  }));
   return { actionId, changes, preconditions };
 }
 
@@ -347,7 +455,7 @@ export function startNextWalkingBoutAction({ actionId, boutId, view, now }: Star
         started_at: startedAt, ended_at: null, pain_min: null, pain_max: null,
         stop_reason: null, notes: null,
       }) },
-      workflowChange(view),
+      stampedWorkflowChange(view, { kind: "next_bout_started", boutId, restId: rest.id, pauseId: null }),
     ],
     preconditions: [
       workflowPrecondition(view),
@@ -752,6 +860,21 @@ export function correctWalkingBoutTimesAction(input: CorrectWalkingBoutTimesInpu
     started_at: startedAt ?? bout.started_at,
     ended_at: endedAt ?? bout.ended_at,
   };
+  // Re-derive `stop_reason` when it is still exactly the value that would
+  // have been inferred for the bout's ORIGINAL end -- never a reason the
+  // user picked explicitly (issue #22 finding 6). This cannot distinguish a
+  // user pick that coincidentally matches the inferred value from a value
+  // that truly is still inferred, which is the same ambiguity that makes an
+  // explicit provenance field the only fully reliable answer; re-deriving
+  // only on a match keeps the failure mode narrow (at worst, leaving a
+  // stale MAX_DURATION on a coincidentally-user-chosen one, never
+  // overwriting an obviously different user choice like FOOT_NUMBNESS).
+  if (endedAt !== undefined && bout.ended_at !== null && bout.stop_reason !== null) {
+    const wasInferred = bout.stop_reason === inferWalkingStopReason(view, bout, new Date(bout.ended_at));
+    if (wasInferred) {
+      correctedBout.stop_reason = inferWalkingStopReason(view, correctedBout, new Date(endedAt));
+    }
+  }
   const bouts = view.bouts.map((item) => (item.id === boutId ? correctedBout : item));
   assertContainedWalkingSession(view.session, bouts, view.pauses, view.rests);
 
@@ -760,9 +883,12 @@ export function correctWalkingBoutTimesAction(input: CorrectWalkingBoutTimesInpu
     actionId,
     changes: [
       { store: "walking_bouts", operation: "put", record: {
-        ...carriedFields(rawBout), started_at: correctedBout.started_at, ended_at: correctedBout.ended_at,
+        ...carriedFields(rawBout),
+        started_at: correctedBout.started_at,
+        ended_at: correctedBout.ended_at,
+        stop_reason: correctedBout.stop_reason,
       } },
-      workflowChange(view),
+      workflowChangeInvalidatingTransition(view, [boutId]),
     ],
     preconditions: [workflowPrecondition(view), unchangedRecordPrecondition("walking_bouts", rawBout)],
   };
@@ -812,7 +938,7 @@ export function correctWalkingPauseTimesAction(input: CorrectWalkingPauseTimesIn
       { store: "walking_pauses", operation: "put", record: {
         ...carriedFields(rawPause), started_at: correctedPause.started_at, ended_at: correctedPause.ended_at,
       } },
-      workflowChange(view),
+      workflowChangeInvalidatingTransition(view, [pauseId]),
     ],
     preconditions: [workflowPrecondition(view), unchangedRecordPrecondition("walking_pauses", rawPause)],
   };
@@ -862,7 +988,7 @@ export function correctWalkingRestTimesAction(input: CorrectWalkingRestTimesInpu
       { store: "walking_rests", operation: "put", record: {
         ...carriedFields(rawRest), started_at: correctedRest.started_at, ended_at: correctedRest.ended_at,
       } },
-      workflowChange(view),
+      workflowChangeInvalidatingTransition(view, [restId]),
     ],
     preconditions: [workflowPrecondition(view), unchangedRecordPrecondition("walking_rests", rawRest)],
   };
@@ -881,67 +1007,65 @@ export type UndoableWalkingTransition =
   | { type: "next_bout_started"; boutId: string; restId: string };
 
 /**
- * The most recent undoable transition of this session, or `null` when nothing
- * of the five listed above is currently reversible (a correction has moved
- * one side of a coupled pair since, the session has no history yet, or the
- * session is not `ACTIVE`).
+ * The most recent undoable transition of this session, or `null` when
+ * nothing of the five listed above is currently reversible (nothing has
+ * happened yet, the session is not `ACTIVE`, a correction has invalidated
+ * the stamp by touching the very record it names, or the stamp is absent --
+ * a session that predates this field).
  *
  * Derived purely from the persisted records, never a separate undo stack or
  * store (owner decision, issue #22), so it survives a reload and a second
- * tab. It deliberately does not use the repository's own `updated_at`
- * bookkeeping to find "the last write": that timestamp comes from the
- * injected wall clock (`commitAction`'s `now()`), which some tests -- and in
- * principle a real device with a broken or stepped-back clock -- hold fixed
- * or non-monotonic on purpose (`frontend/src/pad/padWorkflow.test.ts`, "A
- * fixed repository clock deliberately makes every updated_at identical").
- * Instead this reads the same *domain* coupling every transition itself
- * establishes -- a bout and the rest it closed share one `started_at`/
- * `ended_at` instant by construction (`startNextWalkingBoutAction`,
- * `finishWalkingBoutAction`) -- which stays correct however the wall clock
- * behaves, because those values come from `monotonicNow`, guaranteed
- * non-decreasing within one session.
+ * tab: the stamp `stampedWorkflowChange` writes is itself a field of the
+ * session record `workflowChange` already writes on every transition.
  *
- * Each of the three states with a running interval maps to exactly one kind
- * of undo, using the view's own `current*` fields (already unambiguous: the
- * repository's cardinality rules allow at most one open bout, pause and rest
- * per session/bout):
+ * Reads the explicit `WalkingTransitionStamp` rather than re-deriving "which
+ * record" by matching timestamps (issue #22 finding 1, a confirmed blocker):
+ * `monotonicNow` deliberately collapses distinct instants whenever the
+ * device clock steps back, so two rests (or two pauses) of the same session
+ * can legitimately share an `ended_at`/`started_at`. A device with a clock
+ * that steps back mid-session -- reachable in normal operation, not a
+ * contrived edge case -- could otherwise make this reopen a rest, or a
+ * pause, that the real last transition never touched
+ * (`frontend/src/pad/padCorrections.test.ts`, "PAD undo targets the stamped
+ * record, not a same-instant collision").
  *
- * - WALKING with pauses already recorded against the open bout: the bout was
- *   resumed -- reopen its most recently closed pause.
- * - WALKING with no pauses yet: the bout was just started. If some rest in
- *   the session closed at exactly this bout's `started_at`, it was the one
- *   `START NEXT BOUT` closed to open this bout (`next_bout_started`);
- *   otherwise this is a fresh start from READY (`bout_started`).
- * - PAUSED: the bout was just paused -- delete the open pause.
- * - RESTING, and the rest still starts exactly where the bout ended (no
- *   correction has moved either since): the bout was just finished -- reopen
- *   it, delete the rest, and reopen whichever pause (if any) closed at the
- *   same instant the bout did.
+ * Each state cross-checks the stamp against the view's own `current*` ids
+ * (never by timestamp) before trusting it, so a stamp that no longer
+ * matches what is actually open/resting now -- rather than being guessed at
+ * -- makes undo unavailable instead of wrong.
  */
 export function detectUndoableWalkingTransition(view: PadSessionView): UndoableWalkingTransition | null {
-  const { state, currentBout, currentPause, currentRest, pauses, rests } = view;
+  if (view.session.status !== "ACTIVE") {
+    return null;
+  }
+  const stamp = readTransitionStamp(view.sessionRecord);
+  if (stamp === null) {
+    return null;
+  }
+  const { state, currentBout, currentPause, currentRest } = view;
   switch (state) {
     case "WALKING": {
       if (currentBout === null) {
         return null;
       }
-      const closedBoutPauses = pauses.filter(
-        (pause) => pause.walking_bout_id === currentBout.id && pause.ended_at !== null,
-      );
-      if (closedBoutPauses.length > 0) {
-        const latestPause = closedBoutPauses.reduce((latest, pause) =>
-          Date.parse(pause.ended_at ?? "") > Date.parse(latest.ended_at ?? "") ? pause : latest);
-        return { type: "bout_resumed", pauseId: latestPause.id };
+      if (currentBout.id !== stamp.boutId) {
+        return null;
       }
-      const coupledRest = rests.find(
-        (rest) => rest.walking_bout_id !== currentBout.id && rest.ended_at === currentBout.started_at,
-      );
-      return coupledRest === undefined
-        ? { type: "bout_started", boutId: currentBout.id }
-        : { type: "next_bout_started", boutId: currentBout.id, restId: coupledRest.id };
+      switch (stamp.kind) {
+        case "bout_started":
+          return { type: "bout_started", boutId: currentBout.id };
+        case "bout_resumed":
+          return stamp.pauseId === null ? null : { type: "bout_resumed", pauseId: stamp.pauseId };
+        case "next_bout_started":
+          return stamp.restId === null
+            ? null
+            : { type: "next_bout_started", boutId: currentBout.id, restId: stamp.restId };
+        default:
+          return null;
+      }
     }
     case "PAUSED": {
-      if (currentPause === null) {
+      if (currentPause === null || stamp.kind !== "bout_paused" || stamp.pauseId !== currentPause.id) {
         return null;
       }
       return { type: "bout_paused", pauseId: currentPause.id };
@@ -950,18 +1074,10 @@ export function detectUndoableWalkingTransition(view: PadSessionView): UndoableW
       if (currentBout === null || currentRest === null) {
         return null;
       }
-      if (currentRest.started_at !== currentBout.ended_at) {
+      if (stamp.kind !== "bout_finished" || stamp.boutId !== currentBout.id || stamp.restId !== currentRest.id) {
         return null;
       }
-      const closedPause = pauses.find(
-        (pause) => pause.walking_bout_id === currentBout.id && pause.ended_at === currentBout.ended_at,
-      );
-      return {
-        type: "bout_finished",
-        boutId: currentBout.id,
-        restId: currentRest.id,
-        pauseId: closedPause?.id ?? null,
-      };
+      return { type: "bout_finished", boutId: currentBout.id, restId: currentRest.id, pauseId: stamp.pauseId };
     }
     case "READY":
     case "COMPLETED":
@@ -998,6 +1114,16 @@ export function undoLastWalkingTransitionAction({ actionId, view }: UndoLastWalk
   const changes: LocalAction["changes"] = [];
   const preconditions: RecordPrecondition[] = [workflowPrecondition(view)];
 
+  // The hypothetical resulting state, validated as a whole before anything is
+  // committed (issue #22 findings 1 and 2): even a stamp that named the right
+  // kind of transition but the wrong record -- which the cross-checks in
+  // `detectUndoableWalkingTransition` already make very hard to reach -- is
+  // refused here rather than committed, exactly the same guarantee a
+  // correction already gets from `assertContainedWalkingSession`.
+  let resultingBouts = view.bouts;
+  let resultingPauses = view.pauses;
+  let resultingRests = view.rests;
+
   switch (transition.type) {
     case "bout_started": {
       const rawBout = rawById(view.boutRecords, transition.boutId);
@@ -1006,6 +1132,7 @@ export function undoLastWalkingTransitionAction({ actionId, view }: UndoLastWalk
         { store: "walking_bouts", id: transition.boutId, expected: { ended_at: null } },
         unchangedRecordPrecondition("walking_bouts", rawBout),
       );
+      resultingBouts = view.bouts.filter((bout) => bout.id !== transition.boutId);
       break;
     }
     case "bout_paused": {
@@ -1015,12 +1142,15 @@ export function undoLastWalkingTransitionAction({ actionId, view }: UndoLastWalk
         { store: "walking_pauses", id: transition.pauseId, expected: { ended_at: null } },
         unchangedRecordPrecondition("walking_pauses", rawPause),
       );
+      resultingPauses = view.pauses.filter((pause) => pause.id !== transition.pauseId);
       break;
     }
     case "bout_resumed": {
       const rawPause = rawById(view.pauseRecords, transition.pauseId);
       changes.push({ store: "walking_pauses", operation: "put", record: { ...carriedFields(rawPause), ended_at: null } });
       preconditions.push(unchangedRecordPrecondition("walking_pauses", rawPause));
+      resultingPauses = view.pauses.map((pause) =>
+        pause.id === transition.pauseId ? { ...pause, ended_at: null } : pause);
       break;
     }
     case "bout_finished": {
@@ -1033,10 +1163,15 @@ export function undoLastWalkingTransitionAction({ actionId, view }: UndoLastWalk
         { store: "walking_rests", id: transition.restId, expected: { ended_at: null } },
         unchangedRecordPrecondition("walking_rests", rawRest),
       );
+      resultingBouts = view.bouts.map((bout) =>
+        bout.id === transition.boutId ? { ...bout, ended_at: null } : bout);
+      resultingRests = view.rests.filter((rest) => rest.id !== transition.restId);
       if (transition.pauseId !== null) {
-        const rawPause = rawById(view.pauseRecords, transition.pauseId);
+        const pauseId = transition.pauseId;
+        const rawPause = rawById(view.pauseRecords, pauseId);
         changes.push({ store: "walking_pauses", operation: "put", record: { ...carriedFields(rawPause), ended_at: null } });
         preconditions.push(unchangedRecordPrecondition("walking_pauses", rawPause));
+        resultingPauses = view.pauses.map((pause) => (pause.id === pauseId ? { ...pause, ended_at: null } : pause));
       }
       break;
     }
@@ -1050,11 +1185,21 @@ export function undoLastWalkingTransitionAction({ actionId, view }: UndoLastWalk
         unchangedRecordPrecondition("walking_bouts", rawBout),
         unchangedRecordPrecondition("walking_rests", rawRest),
       );
+      resultingBouts = view.bouts.filter((bout) => bout.id !== transition.boutId);
+      resultingRests = view.rests.map((rest) =>
+        rest.id === transition.restId ? { ...rest, ended_at: null } : rest);
       break;
     }
   }
 
-  changes.push(workflowChange(view));
+  assertContainedWalkingSession(view.session, resultingBouts, resultingPauses, resultingRests);
+
+  // Undo does not chain: it always clears the stamp rather than trying to
+  // reconstruct "the transition before the one just undone", which would
+  // need the same kind of guessing among sibling records that finding 1
+  // removed from detection in the first place (`docs/pad-walking.md`,
+  // "Editing, undo, and delete").
+  changes.push(amendedWorkflowChange(view, { id: view.session.id, ...transitionStampFields(null) }));
   return { actionId, changes, preconditions };
 }
 
@@ -1087,37 +1232,61 @@ export function deleteWalkingBoutAction({ actionId, view, boutId }: DeleteWalkin
   if (bout === undefined) throw new InvalidActionError("Bout does not belong to session");
   if (bout.ended_at === null) throw new InvalidActionError("Cannot delete a bout that has not finished");
 
+  // The resulting state, validated as a whole before anything is committed
+  // (issue #22 findings 1 and 2), the same guarantee a correction already
+  // gets from `assertContainedWalkingSession`.
+  assertContainedWalkingSession(
+    view.session,
+    view.bouts.filter((item) => item.id !== boutId),
+    view.pauses.filter((pause) => pause.walking_bout_id !== boutId),
+    view.rests.filter((rest) => rest.walking_bout_id !== boutId),
+  );
+
   const rawBout = rawById(view.boutRecords, boutId);
   const changes: LocalAction["changes"] = [];
   const preconditions: RecordPrecondition[] = [workflowPrecondition(view), unchangedRecordPrecondition("walking_bouts", rawBout)];
 
+  const deletedIds = new Set<string>([boutId]);
   for (const pause of view.pauseRecords) {
     if (recordText(pause, "walking_bout_id") === boutId) {
       changes.push({ store: "walking_pauses", operation: "delete", id: pause.id });
       preconditions.push(unchangedRecordPrecondition("walking_pauses", pause));
+      deletedIds.add(pause.id);
     }
   }
   for (const rest of view.restRecords) {
     if (recordText(rest, "walking_bout_id") === boutId) {
       changes.push({ store: "walking_rests", operation: "delete", id: rest.id });
       preconditions.push(unchangedRecordPrecondition("walking_rests", rest));
+      deletedIds.add(rest.id);
     }
   }
   changes.push({ store: "walking_bouts", operation: "delete", id: boutId });
 
-  const survivors = view.bouts
-    .filter((item) => item.id !== boutId)
+  // Raw rows, not `view.bouts`: a sibling bout row the tolerant parser
+  // dropped is invisible to `view.bouts`, but it still physically holds a
+  // `bout_number` a survivor could otherwise be assigned on top of (issue
+  // #22 finding 7). A row with no readable start time sorts after every
+  // readable one rather than being dropped from the renumbering, matching
+  // the "raw-row-careful" pattern `closeWalkingSessionAction` already uses.
+  const survivorRows = view.boutRecords
+    .filter((record) => recordText(record, "walking_session_id") === view.session.id && record.id !== boutId)
     .slice()
-    .sort((left, right) => Date.parse(left.started_at) - Date.parse(right.started_at));
-  survivors.forEach((survivor, index) => {
+    .sort((left, right) => {
+      const leftMs = Date.parse(startTimestamp(left) ?? "");
+      const rightMs = Date.parse(startTimestamp(right) ?? "");
+      const leftKey = Number.isFinite(leftMs) ? leftMs : Number.POSITIVE_INFINITY;
+      const rightKey = Number.isFinite(rightMs) ? rightMs : Number.POSITIVE_INFINITY;
+      return leftKey - rightKey || left.id.localeCompare(right.id);
+    });
+  survivorRows.forEach((record, index) => {
     const nextNumber = index + 1;
-    if (survivor.bout_number !== nextNumber) {
-      const rawSurvivor = rawById(view.boutRecords, survivor.id);
-      changes.push({ store: "walking_bouts", operation: "put", record: { ...carriedFields(rawSurvivor), bout_number: nextNumber } });
-      preconditions.push(unchangedRecordPrecondition("walking_bouts", rawSurvivor));
+    if (record.bout_number !== nextNumber) {
+      changes.push({ store: "walking_bouts", operation: "put", record: { ...carriedFields(record), bout_number: nextNumber } });
+      preconditions.push(unchangedRecordPrecondition("walking_bouts", record));
     }
   });
 
-  changes.push(workflowChange(view));
+  changes.push(workflowChangeInvalidatingTransition(view, [...deletedIds]));
   return { actionId, changes, preconditions };
 }
