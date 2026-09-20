@@ -6,8 +6,15 @@
 export {
   discardWalkingSessionAction,
   finishWalkingSessionAction,
+  finishWalkingBoutAction,
+  inferWalkingStopReason,
+  pauseWalkingBoutAction,
+  resumeWalkingBoutAction,
   startWalkingBoutAction,
+  startNextWalkingBoutAction,
   startWalkingSessionAction,
+  updateWalkingBoutAction,
+  updateWalkingSessionNotesAction,
 } from "./actions";
 export {
   buildPadSessionView,
@@ -31,4 +38,4 @@ export { DEFAULT_WALKING_SETTINGS } from "./types";
 export type { CloseWalkingSessionInput } from "./actions";
 export type { PadSessionView } from "./session";
 export type { PreviousWalkingSession } from "./settings";
-export type { WalkingSessionSettings, WalkingState } from "./types";
+export type { WalkingSessionSettings, WalkingState, WalkingStopReason } from "./types";

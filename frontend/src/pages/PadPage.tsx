@@ -14,21 +14,29 @@ import {
   hasReachedMaximum,
   hasUnreadableOpenRecords,
   inheritedWalkingSettings,
+  finishWalkingBoutAction,
   parseWalkingSessionSummary,
+  pauseWalkingBoutAction,
   PREVIOUS_WALKING_SESSION_KEY,
   readPadSession,
+  resumeWalkingBoutAction,
   startWalkingBoutAction,
+  startNextWalkingBoutAction,
   startWalkingSessionAction,
   summarizeWalkingSession,
   useNow,
+  updateWalkingBoutAction,
+  updateWalkingSessionNotesAction,
   walkingElapsedMs,
   walkingSessionSummaryValue,
   type PadSessionView,
   type PreviousWalkingSession,
   type WalkingSessionSettings,
   type WalkingState,
+  type WalkingStopReason,
 } from "../pad";
-import { createUuid, type LocalAction } from "../storage";
+import { createUuid, InvalidActionError, type LocalAction } from "../storage";
+import type { WalkingBout } from "../pad/types";
 
 /**
  * One attempt at a logical operation: the identifiers the action writes with, and
@@ -140,6 +148,21 @@ type PadScreen =
   | { kind: "unreadable" }
   | { kind: "start" };
 
+/** A queued write or Retry may run after another tab advanced the HUD. */
+function requireDisplayedInterval(displayed: PadSessionView, live: PadSessionView | null): PadSessionView {
+  if (
+    live?.session.id !== displayed.session.id ||
+    live.state !== displayed.state ||
+    live.currentBout?.id !== displayed.currentBout?.id ||
+    live.currentPause?.id !== displayed.currentPause?.id ||
+    live.currentRest?.id !== displayed.currentRest?.id ||
+    live.currentBoutNumber !== displayed.currentBoutNumber
+  ) {
+    throw new InvalidActionError("The walking session changed in another view. Review its current state and try again.");
+  }
+  return live;
+}
+
 export function PadPage() {
   const { readLiveSnapshot, setSyncMetadata, snapshot, status } = useLocalData();
   // The raw ACTIVE row is kept alongside the parsed view: a row the parser drops
@@ -184,15 +207,67 @@ export function PadPage() {
     if (view === null) {
       return;
     }
-    run(`start-bout-${view.session.id}-${view.currentBoutNumber.toString()}`, (attempt) =>
-      startWalkingBoutAction({
+    run(`start-bout-${view.session.id}-${view.currentBoutNumber.toString()}`, async (attempt) => {
+      const liveView = requireDisplayedInterval(view, readPadSession(await readLiveSnapshot()));
+      return startWalkingBoutAction({
         actionId: attempt.actionId,
         boutId: attempt.recordId,
-        view,
+        view: liveView,
         now: attempt.now,
-      }),
-    );
-  }, [run, view]);
+      });
+    });
+  }, [readLiveSnapshot, run, view]);
+
+  const changeBout = useCallback(
+    (
+      boutId: string,
+      values: { painMin?: number | null; painMax?: number | null; stopReason?: WalkingStopReason | null; notes?: string | null },
+    ) => {
+      if (view === null) return;
+      run(`edit-bout-${boutId}`, async (attempt) => {
+        const liveView = readPadSession(await readLiveSnapshot());
+        if (liveView?.session.id !== view.session.id) {
+          throw new InvalidActionError("This walking session is no longer active.");
+        }
+        return updateWalkingBoutAction({ actionId: attempt.actionId, view: liveView, boutId, ...values });
+      });
+    },
+    [readLiveSnapshot, run, view],
+  );
+
+  const changeSessionNotes = useCallback(
+    (notes: string) => {
+      if (view === null) return;
+      run(`session-notes-${view.session.id}`, async (attempt) => {
+        const liveView = readPadSession(await readLiveSnapshot());
+        if (liveView?.session.id !== view.session.id) {
+          throw new InvalidActionError("This walking session is no longer active.");
+        }
+        return updateWalkingSessionNotesAction({ actionId: attempt.actionId, view: liveView, notes });
+      });
+    },
+    [readLiveSnapshot, run, view],
+  );
+
+  const transitionBout = useCallback(
+    (kind: "pause" | "resume" | "finish" | "next") => {
+      if (view === null) return;
+      run(`${kind}-bout-${view.session.id}-${view.currentBout?.id ?? "ready"}`, async (attempt) => {
+        const liveView = requireDisplayedInterval(view, readPadSession(await readLiveSnapshot()));
+        switch (kind) {
+          case "pause":
+            return pauseWalkingBoutAction({ actionId: attempt.actionId, pauseId: attempt.recordId, view: liveView, now: attempt.now });
+          case "resume":
+            return resumeWalkingBoutAction({ actionId: attempt.actionId, view: liveView, now: attempt.now });
+          case "finish":
+            return finishWalkingBoutAction({ actionId: attempt.actionId, restId: attempt.recordId, view: liveView, now: attempt.now });
+          case "next":
+            return startNextWalkingBoutAction({ actionId: attempt.actionId, boutId: attempt.recordId, view: liveView, now: attempt.now });
+        }
+      });
+    },
+    [readLiveSnapshot, run, view],
+  );
 
   const finishSession = useCallback(() => {
     if (view === null) {
@@ -207,15 +282,14 @@ export function PadPage() {
       `finish-session-${sessionId}`,
       async (attempt) => {
         const live = await readLiveSnapshot();
+        const liveView = requireDisplayedInterval(view, readPadSession(live));
         const action = finishWalkingSessionAction({
           actionId: attempt.actionId,
           snapshot: live,
           sessionId,
           now: attempt.now,
         });
-        const liveView = readPadSession(live);
-        summary =
-          liveView === null ? null : summarizeWalkingSession(liveView, attempt.now.getTime());
+        summary = summarizeWalkingSession(liveView, attempt.now.getTime());
         return action;
       },
       () => {
@@ -276,6 +350,9 @@ export function PadPage() {
           busy={busy}
           now={now}
           onFinishSession={finishSession}
+          onTransitionBout={transitionBout}
+          onChangeBout={changeBout}
+          onChangeSessionNotes={changeSessionNotes}
           onStartBout={startBout}
           unreadable={screen.unreadable}
           view={screen.view}
@@ -624,8 +701,11 @@ function UnreadableSession({ busy, onDiscard }: UnreadableSessionProps) {
 interface WalkingHudProps {
   busy: boolean;
   now: number;
+  onChangeBout: (boutId: string, values: { painMin?: number | null; painMax?: number | null; stopReason?: WalkingStopReason | null; notes?: string | null }) => void;
+  onChangeSessionNotes: (notes: string) => void;
   onFinishSession: () => void;
   onStartBout: () => void;
+  onTransitionBout: (kind: "pause" | "resume" | "finish" | "next") => void;
   /** Whether this session has open records the parser dropped. */
   unreadable: boolean;
   view: PadSessionView;
@@ -634,8 +714,11 @@ interface WalkingHudProps {
 function WalkingHud({
   busy,
   now,
+  onChangeBout,
+  onChangeSessionNotes,
   onFinishSession,
   onStartBout,
+  onTransitionBout,
   unreadable,
   view,
 }: WalkingHudProps) {
@@ -644,6 +727,11 @@ function WalkingHud({
   const elapsedMs = derivePadElapsedMs(view, now);
   const maximumReached = hasReachedMaximum(view, now);
   const finishedBouts = view.bouts.filter((bout) => bout.ended_at !== null);
+  const currentBout = view.currentBout;
+  // READY has a derived next number but no persisted unstarted-bout row. In a
+  // session with prior bouts, Add Bout prepares that slot without starting time.
+  const [preparedBoutNumber, setPreparedBoutNumber] = useState<number | null>(null);
+  const nextBoutPrepared = preparedBoutNumber === view.currentBoutNumber;
 
   return (
     <>
@@ -656,7 +744,11 @@ function WalkingHud({
           {decimalText(view.session.incline_pct)}% · Maximum bout{" "}
           {formatDuration(view.session.max_bout_seconds * 1000)}
         </p>
-        <p className="pad-hud__bout">Bout {view.currentBoutNumber.toString()}</p>
+        <p className="pad-hud__bout">
+          {view.state === "RESTING" && currentBout !== null
+            ? `Rest after bout ${currentBout.bout_number.toString()}`
+            : `Bout ${view.currentBoutNumber.toString()}`}
+        </p>
         {/* Announced on transition; the timer below it is not a live region, or it
             would be read out every second. */}
         <p className="pad-hud__state" role="status">
@@ -679,20 +771,52 @@ function WalkingHud({
           </p>
         )}
 
-        {view.state === "READY" ? (
-          <button className="button button--primary" disabled={busy} onClick={onStartBout} type="button">
+        {(view.state === "WALKING" || view.state === "PAUSED") && currentBout !== null && (
+          <>
+            <PainSelector
+              busy={busy}
+              bout={currentBout}
+              onChange={(painMin, painMax) => { onChangeBout(currentBout.id, { painMin, painMax }); }}
+            />
+            <NoteEditor
+              key={currentBout.id}
+              busy={busy}
+              label={`Notes for bout ${currentBout.bout_number.toString()}`}
+              notes={currentBout.notes}
+              onSave={(notes) => { onChangeBout(currentBout.id, { notes }); }}
+            />
+          </>
+        )}
+        {view.state === "READY" && (view.bouts.length === 0 || nextBoutPrepared) && (
+          <button className="button button--primary" disabled={busy || unreadable} onClick={onStartBout} type="button">
             Start walking
           </button>
-        ) : (
-          <p className="muted">
-            {view.state === "WALKING"
-              ? "Pausing, pain and finishing a bout arrive in a later update. Finish the session to close this bout."
-              : "Resuming and starting the next bout arrive in a later update. Finish the session to close this interval."}
-          </p>
         )}
-        <button className="button" disabled={busy} onClick={onFinishSession} type="button">
-          Finish session
-        </button>
+        {view.state === "WALKING" && (
+          <button className="button" disabled={busy} onClick={() => { onTransitionBout("pause"); }} type="button">
+            Pause
+          </button>
+        )}
+        {view.state === "PAUSED" && (
+          <button className="button button--primary" disabled={busy} onClick={() => { onTransitionBout("resume"); }} type="button">
+            Resume
+          </button>
+        )}
+        {(view.state === "WALKING" || view.state === "PAUSED") && (
+          <button className="button" disabled={busy} onClick={() => { onTransitionBout("finish"); }} type="button">
+            Finish bout
+          </button>
+        )}
+        {view.state === "RESTING" && (
+          <button className="button button--primary" disabled={busy || unreadable} onClick={() => { onTransitionBout("next"); }} type="button">
+            Start next bout
+          </button>
+        )}
+        {view.state !== "WALKING" && (
+          <button className="button" disabled={busy} onClick={onFinishSession} type="button">
+            Finish session
+          </button>
+        )}
       </section>
 
       {finishedBouts.length > 0 && (
@@ -703,15 +827,187 @@ function WalkingHud({
           <ul className="pad-bouts">
             {finishedBouts.map((bout) => (
               <li key={bout.id}>
-                <span>Bout {bout.bout_number.toString()}</span>
-                <span className="timer timer--inline">
-                  {formatDuration(walkingElapsedMs(bout, view.pauses, now))}
-                </span>
+                <CompletedBout
+                  bout={bout}
+                  busy={busy}
+                  duration={walkingElapsedMs(bout, view.pauses, now)}
+                  onChange={(values) => { onChangeBout(bout.id, values); }}
+                  rest={view.rests.find((rest) => rest.walking_bout_id === bout.id) ?? null}
+                  now={now}
+                />
               </li>
             ))}
           </ul>
         </section>
       )}
+      {view.state === "READY" && view.bouts.length > 0 && !nextBoutPrepared && (
+        <button className="button" disabled={busy || unreadable} onClick={() => { setPreparedBoutNumber(view.currentBoutNumber); }} type="button">
+          + Add bout
+        </button>
+      )}
+      <NoteEditor
+        busy={busy}
+        label="Session notes"
+        notes={view.session.session_notes}
+        onSave={onChangeSessionNotes}
+      />
     </>
+  );
+}
+
+function selectedPain(bout: WalkingBout): number[] {
+  if (bout.pain_min === null || bout.pain_max === null) return [];
+  return bout.pain_min === bout.pain_max
+    ? [bout.pain_min]
+    : [bout.pain_min, bout.pain_max];
+}
+
+function PainSelector({
+  bout,
+  busy,
+  onChange,
+}: {
+  bout: WalkingBout;
+  busy: boolean;
+  onChange: (painMin: number | null, painMax: number | null) => void;
+}) {
+  const selected = selectedPain(bout);
+  return (
+    <fieldset className="pad-pain">
+      <legend>Pain for bout {bout.bout_number.toString()}</legend>
+      <div className="pad-pain__choices">
+        {[1, 2, 3, 4, 5].map((value) => {
+          const pressed = selected.includes(value);
+          // An attempted non-adjacent pair is unavailable. Deselect a current
+          // value first to move the range; this always keeps stored pain valid.
+          const adjacent = selected.length === 0 || selected.some((item) => Math.abs(item - value) === 1);
+          return (
+            <button
+              aria-pressed={pressed}
+              className={`pad-pain__choice${pressed ? " pad-pain__choice--selected" : ""}`}
+              disabled={busy || (!pressed && (selected.length === 2 || !adjacent))}
+              key={value}
+              onClick={() => {
+                const next = pressed
+                  ? selected.filter((item) => item !== value)
+                  : [...selected, value].sort((a, b) => a - b);
+                onChange(next[0] ?? null, next.at(-1) ?? null);
+              }}
+              type="button"
+            >
+              {value.toString()}
+            </button>
+          );
+        })}
+      </div>
+    </fieldset>
+  );
+}
+
+const STOP_REASON_OPTIONS: readonly { value: WalkingStopReason; label: string }[] = [
+  { value: "MAX_DURATION", label: "Maximum duration" },
+  { value: "CLAUDICATION", label: "Claudication" },
+  { value: "FOOT_NUMBNESS", label: "Foot numbness" },
+  { value: "SUDDEN_SWELLING", label: "Sudden swelling" },
+  { value: "OTHER", label: "Other" },
+];
+
+function CompletedBout({
+  bout,
+  busy,
+  duration,
+  now,
+  onChange,
+  rest,
+}: {
+  bout: WalkingBout;
+  busy: boolean;
+  duration: number;
+  now: number;
+  onChange: (values: { painMin?: number | null; painMax?: number | null; stopReason?: WalkingStopReason | null; notes?: string | null }) => void;
+  rest: PadSessionView["currentRest"];
+}) {
+  const reasonId = useId();
+  const selected = selectedPain(bout);
+  const restMs = rest === null ? null : Math.max(0, (rest.ended_at === null ? now : Date.parse(rest.ended_at)) - Date.parse(rest.started_at));
+  return (
+    <div className="pad-bout-record">
+      <div className="pad-bout-record__summary">
+        <strong>Bout {bout.bout_number.toString()}</strong>
+        <span className="timer timer--inline">{formatDuration(duration)}</span>
+      </div>
+      {restMs !== null && <p className="muted">Rest {formatDuration(restMs)}</p>}
+      <PainSelector
+        bout={bout}
+        busy={busy}
+        onChange={(painMin, painMax) => { onChange({ painMin, painMax }); }}
+      />
+      <p className="muted">{selected.length === 0 ? "No pain selected" : `Pain ${selected.join("–")}`}</p>
+      <div className="field">
+        <label htmlFor={reasonId}>Stop reason for bout {bout.bout_number.toString()}</label>
+        <select
+          className="text-input"
+          disabled={busy}
+          id={reasonId}
+          onChange={(event) => { onChange({ stopReason: event.target.value === "" ? null : event.target.value as WalkingStopReason }); }}
+          value={bout.stop_reason ?? ""}
+        >
+          <option value="">Select a reason</option>
+          {STOP_REASON_OPTIONS.map((option) => (
+            <option key={option.value} value={option.value}>{option.label}</option>
+          ))}
+        </select>
+      </div>
+      <NoteEditor
+        busy={busy}
+        label={`Notes for bout ${bout.bout_number.toString()}`}
+        notes={bout.notes}
+        onSave={(notes) => { onChange({ notes }); }}
+      />
+    </div>
+  );
+}
+
+function NoteEditor({
+  busy,
+  label,
+  notes,
+  onSave,
+}: {
+  busy: boolean;
+  label: string;
+  notes: string | null;
+  onSave: (notes: string) => void;
+}) {
+  const id = useId();
+  const [draft, setDraft] = useState(notes ?? "");
+  const previousSaved = useRef(notes ?? "");
+  useEffect(() => {
+    const saved = notes ?? "";
+    const prior = previousSaved.current;
+    if (saved !== prior) {
+      // Refresh pristine text from storage, but keep anything typed while a save
+      // was pending or while another tab changed the saved note.
+      setDraft((current) => current === prior ? saved : current);
+      previousSaved.current = saved;
+    }
+  }, [notes]);
+  return (
+    <details className="pad-notes">
+      <summary>{label}{notes ? " · saved" : ""}</summary>
+      <div className="field">
+        <label htmlFor={id}>{label}</label>
+        <textarea
+          className="text-input"
+          id={id}
+          onChange={(event) => { setDraft(event.target.value); }}
+          rows={3}
+          value={draft}
+        />
+      </div>
+      <button className="button" disabled={busy || draft === (notes ?? "")} onClick={() => { onSave(draft); }} type="button">
+        Save notes
+      </button>
+    </details>
   );
 }

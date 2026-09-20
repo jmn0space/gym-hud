@@ -50,6 +50,8 @@ export interface RecordPrecondition {
   store: DomainStore;
   id: string;
   expected: Record<string, JsonValue> | null;
+  /** Fields that must not exist on the record (for legacy schema upgrades). */
+  absentFields?: string[];
 }
 
 export interface LocalAction {

@@ -376,6 +376,7 @@ describe("PAD actions", () => {
         started_at: now.toISOString(),
         completed_at: null,
         session_notes: null,
+        workflow_revision: 0,
         ...DEFAULT_WALKING_SETTINGS,
       },
     });
@@ -408,6 +409,7 @@ describe("PAD actions", () => {
       store: "walking_sessions",
       id: "session-1",
       expected: { status: "ACTIVE" },
+      absentFields: ["workflow_revision"],
     });
   });
 
@@ -449,7 +451,7 @@ describe("PAD actions", () => {
     ]);
   });
 
-  it("closes an open rest even while a bout is open, which no 'current' record reaches", () => {
+  it("closes an anomalous open rest when finishing from PAUSED", () => {
     const action = finishWalkingSessionAction({
       actionId: "action-4",
       snapshot: padSnapshot({
@@ -466,12 +468,12 @@ describe("PAD actions", () => {
             ended_at: null,
           },
         ],
-        // The open pause of a bout that was finished while paused.
+        // The current bout is paused, so session completion is allowed.
         walking_pauses: [
           {
             id: "pause-1",
-            walking_bout_id: "bout-1",
-            started_at: "2026-09-18T10:04:00.000Z",
+            walking_bout_id: "bout-2",
+            started_at: "2026-09-18T10:09:00.000Z",
             ended_at: null,
           },
         ],
@@ -491,7 +493,7 @@ describe("PAD actions", () => {
     // Every close is guarded, so a record another view closed first is not
     // silently reopened-and-reclosed at the wrong time.
     expect(action.preconditions).toEqual([
-      { store: "walking_sessions", id: "session-1", expected: { status: "ACTIVE" } },
+      { store: "walking_sessions", id: "session-1", expected: { status: "ACTIVE" }, absentFields: ["workflow_revision"] },
       { store: "walking_pauses", id: "pause-1", expected: { ended_at: null } },
       { store: "walking_rests", id: "rest-1", expected: { ended_at: null } },
       { store: "walking_bouts", id: "bout-2", expected: { ended_at: null } },
@@ -530,7 +532,7 @@ describe("PAD actions", () => {
   });
 
   it("carries over fields it does not author instead of replacing the record", () => {
-    const action = finishWalkingSessionAction({
+    const action = discardWalkingSessionAction({
       actionId: "action-6",
       snapshot: padSnapshot({
         walking_bouts: [

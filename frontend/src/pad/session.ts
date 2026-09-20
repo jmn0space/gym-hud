@@ -23,6 +23,11 @@ import type {
  */
 export interface PadSessionView {
   session: WalkingSession;
+  /** Source rows retained for guarded, lossless full-record replacements. */
+  sessionRecord: LocalRecord;
+  boutRecords: readonly LocalRecord[];
+  pauseRecords: readonly LocalRecord[];
+  restRecords: readonly LocalRecord[];
   state: WalkingState;
   /** Bouts of this session, in start order. */
   bouts: readonly WalkingBout[];
@@ -117,6 +122,10 @@ export function buildPadSessionView(
 
   return {
     session,
+    sessionRecord,
+    boutRecords,
+    pauseRecords,
+    restRecords,
     state,
     bouts,
     currentBout,
