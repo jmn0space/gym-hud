@@ -5,8 +5,12 @@ import { formatDuration, TimerDisplay } from "../components/TimerDisplay";
 import { isRetryableWriteError, useLocalData } from "../local/LocalDataProvider";
 import {
   buildPadSessionView,
+  correctWalkingBoutTimesAction,
+  correctWalkingRestTimesAction,
   DEFAULT_WALKING_SETTINGS,
+  deleteWalkingBoutAction,
   derivePadElapsedMs,
+  detectUndoableWalkingTransition,
   discardWalkingSessionAction,
   findActiveWalkingSessionRecord,
   findPreviousWalkingSession,
@@ -24,6 +28,7 @@ import {
   startNextWalkingBoutAction,
   startWalkingSessionAction,
   summarizeWalkingSession,
+  undoLastWalkingTransitionAction,
   useNow,
   updateWalkingBoutAction,
   updateWalkingSessionNotesAction,
@@ -249,6 +254,59 @@ export function PadPage() {
     [readLiveSnapshot, run, view],
   );
 
+  const correctBoutTimes = useCallback(
+    (boutId: string, values: { startedAt?: string; endedAt?: string }) => {
+      if (view === null) return;
+      run(`correct-bout-times-${boutId}`, async (attempt) => {
+        const liveView = readPadSession(await readLiveSnapshot());
+        if (liveView?.session.id !== view.session.id) {
+          throw new InvalidActionError("This walking session is no longer active.");
+        }
+        return correctWalkingBoutTimesAction({ actionId: attempt.actionId, view: liveView, boutId, ...values });
+      });
+    },
+    [readLiveSnapshot, run, view],
+  );
+
+  const correctRestTimes = useCallback(
+    (restId: string, values: { startedAt?: string; endedAt?: string }) => {
+      if (view === null) return;
+      run(`correct-rest-times-${restId}`, async (attempt) => {
+        const liveView = readPadSession(await readLiveSnapshot());
+        if (liveView?.session.id !== view.session.id) {
+          throw new InvalidActionError("This walking session is no longer active.");
+        }
+        return correctWalkingRestTimesAction({ actionId: attempt.actionId, view: liveView, restId, ...values });
+      });
+    },
+    [readLiveSnapshot, run, view],
+  );
+
+  const deleteBout = useCallback(
+    (boutId: string) => {
+      if (view === null) return;
+      run(`delete-bout-${boutId}`, async (attempt) => {
+        const liveView = readPadSession(await readLiveSnapshot());
+        if (liveView?.session.id !== view.session.id) {
+          throw new InvalidActionError("This walking session is no longer active.");
+        }
+        return deleteWalkingBoutAction({ actionId: attempt.actionId, view: liveView, boutId });
+      });
+    },
+    [readLiveSnapshot, run, view],
+  );
+
+  const undoTransition = useCallback(() => {
+    if (view === null) return;
+    run(`undo-${view.session.id}`, async (attempt) => {
+      const liveView = readPadSession(await readLiveSnapshot());
+      if (liveView?.session.id !== view.session.id) {
+        throw new InvalidActionError("This walking session is no longer active.");
+      }
+      return undoLastWalkingTransitionAction({ actionId: attempt.actionId, view: liveView });
+    });
+  }, [readLiveSnapshot, run, view]);
+
   const transitionBout = useCallback(
     (kind: "pause" | "resume" | "finish" | "next") => {
       if (view === null) return;
@@ -349,11 +407,15 @@ export function PadPage() {
         <WalkingHud
           busy={busy}
           now={now}
-          onFinishSession={finishSession}
-          onTransitionBout={transitionBout}
           onChangeBout={changeBout}
           onChangeSessionNotes={changeSessionNotes}
+          onCorrectBoutTimes={correctBoutTimes}
+          onCorrectRestTimes={correctRestTimes}
+          onDeleteBout={deleteBout}
+          onFinishSession={finishSession}
           onStartBout={startBout}
+          onTransitionBout={transitionBout}
+          onUndo={undoTransition}
           unreadable={screen.unreadable}
           view={screen.view}
         />
@@ -698,14 +760,53 @@ function UnreadableSession({ busy, onDiscard }: UnreadableSessionProps) {
   );
 }
 
+/**
+ * Recorded times are stored in UTC ISO form but edited in the browser's own
+ * local time, through `<input type="datetime-local">`: a device-local
+ * correction is what the user actually observed ("it was about quarter past
+ * three"), and converting is cheaper and less error-prone than asking anyone
+ * to enter UTC by hand. Round-trips exactly for any second-resolution value,
+ * which is all these fields ever store.
+ */
+function isoToLocalInputValue(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const pad = (value: number) => value.toString().padStart(2, "0");
+  return (
+    `${date.getFullYear().toString()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+  );
+}
+
+/** The inverse of `isoToLocalInputValue`, or `null` for an unparseable/blank draft. */
+function localInputValueToIso(value: string): string | null {
+  if (value.trim() === "") {
+    return null;
+  }
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+/** How a recorded time reads in the collapsed (non-editing) view of a time field. */
+function formatClockTime(iso: string): string {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? iso : date.toLocaleTimeString();
+}
+
 interface WalkingHudProps {
   busy: boolean;
   now: number;
   onChangeBout: (boutId: string, values: { painMin?: number | null; painMax?: number | null; stopReason?: WalkingStopReason | null; notes?: string | null }) => void;
   onChangeSessionNotes: (notes: string) => void;
+  onCorrectBoutTimes: (boutId: string, values: { startedAt?: string; endedAt?: string }) => void;
+  onCorrectRestTimes: (restId: string, values: { startedAt?: string; endedAt?: string }) => void;
+  onDeleteBout: (boutId: string) => void;
   onFinishSession: () => void;
   onStartBout: () => void;
   onTransitionBout: (kind: "pause" | "resume" | "finish" | "next") => void;
+  onUndo: () => void;
   /** Whether this session has open records the parser dropped. */
   unreadable: boolean;
   view: PadSessionView;
@@ -716,9 +817,13 @@ function WalkingHud({
   now,
   onChangeBout,
   onChangeSessionNotes,
+  onCorrectBoutTimes,
+  onCorrectRestTimes,
+  onDeleteBout,
   onFinishSession,
   onStartBout,
   onTransitionBout,
+  onUndo,
   unreadable,
   view,
 }: WalkingHudProps) {
@@ -732,6 +837,7 @@ function WalkingHud({
   // session with prior bouts, Add Bout prepares that slot without starting time.
   const [preparedBoutNumber, setPreparedBoutNumber] = useState<number | null>(null);
   const nextBoutPrepared = preparedBoutNumber === view.currentBoutNumber;
+  const undoableTransition = detectUndoableWalkingTransition(view);
 
   return (
     <>
@@ -817,6 +923,9 @@ function WalkingHud({
             Finish session
           </button>
         )}
+        {undoableTransition !== null && (
+          <UndoControl busy={busy} onUndo={onUndo} />
+        )}
       </section>
 
       {finishedBouts.length > 0 && (
@@ -832,6 +941,9 @@ function WalkingHud({
                   busy={busy}
                   duration={walkingElapsedMs(bout, view.pauses, now)}
                   onChange={(values) => { onChangeBout(bout.id, values); }}
+                  onCorrectBoutTimes={(values) => { onCorrectBoutTimes(bout.id, values); }}
+                  onCorrectRestTimes={onCorrectRestTimes}
+                  onDelete={() => { onDeleteBout(bout.id); }}
                   rest={view.rests.find((rest) => rest.walking_bout_id === bout.id) ?? null}
                   now={now}
                 />
@@ -852,6 +964,48 @@ function WalkingHud({
         onSave={onChangeSessionNotes}
       />
     </>
+  );
+}
+
+/**
+ * Undo, with confirmation (docs/pad-walking.md: "Undo requires confirmation").
+ * What it undoes is not named here: `WalkingHud` only renders this control
+ * when `detectUndoableWalkingTransition` found something, and that function's
+ * own result is exactly "the most recent supported state-changing action" --
+ * there is never more than one candidate to describe.
+ */
+function UndoControl({ busy, onUndo }: { busy: boolean; onUndo: () => void }) {
+  const [confirming, setConfirming] = useState(false);
+  if (!confirming) {
+    return (
+      <button
+        className="button"
+        disabled={busy}
+        onClick={() => { setConfirming(true); }}
+        type="button"
+      >
+        Undo
+      </button>
+    );
+  }
+  return (
+    <div className="stack" role="alertdialog" aria-label="Confirm undo">
+      <p className="muted">Undo the last change to this session?</p>
+      <button
+        className="button button--primary"
+        disabled={busy}
+        onClick={() => {
+          setConfirming(false);
+          onUndo();
+        }}
+        type="button"
+      >
+        Undo
+      </button>
+      <button className="button" disabled={busy} onClick={() => { setConfirming(false); }} type="button">
+        Cancel
+      </button>
+    </div>
   );
 }
 
@@ -918,6 +1072,9 @@ function CompletedBout({
   duration,
   now,
   onChange,
+  onCorrectBoutTimes,
+  onCorrectRestTimes,
+  onDelete,
   rest,
 }: {
   bout: WalkingBout;
@@ -925,9 +1082,13 @@ function CompletedBout({
   duration: number;
   now: number;
   onChange: (values: { painMin?: number | null; painMax?: number | null; stopReason?: WalkingStopReason | null; notes?: string | null }) => void;
+  onCorrectBoutTimes: (values: { startedAt?: string; endedAt?: string }) => void;
+  onCorrectRestTimes: (restId: string, values: { startedAt?: string; endedAt?: string }) => void;
+  onDelete: () => void;
   rest: PadSessionView["currentRest"];
 }) {
   const reasonId = useId();
+  const timesHeadingId = useId();
   const selected = selectedPain(bout);
   const restMs = rest === null ? null : Math.max(0, (rest.ended_at === null ? now : Date.parse(rest.ended_at)) - Date.parse(rest.started_at));
   return (
@@ -964,6 +1125,154 @@ function CompletedBout({
         notes={bout.notes}
         onSave={(notes) => { onChange({ notes }); }}
       />
+      {/* Recorded times can be tapped and corrected (docs/pad-walking.md,
+          "Editing, undo, and delete"); collapsed by default, like the notes
+          editor above, so the normal read-only HUD stays uncluttered. */}
+      <details className="pad-times" aria-labelledby={timesHeadingId}>
+        <summary id={timesHeadingId}>Edit times for bout {bout.bout_number.toString()}</summary>
+        <RecordedTimeField
+          busy={busy}
+          label={`Bout ${bout.bout_number.toString()} started`}
+          onSave={(startedAt) => { onCorrectBoutTimes({ startedAt }); }}
+          value={bout.started_at}
+        />
+        {bout.ended_at !== null && (
+          <RecordedTimeField
+            busy={busy}
+            label={`Bout ${bout.bout_number.toString()} ended`}
+            onSave={(endedAt) => { onCorrectBoutTimes({ endedAt }); }}
+            value={bout.ended_at}
+          />
+        )}
+        {rest !== null && (
+          <RecordedTimeField
+            busy={busy}
+            label={`Rest after bout ${bout.bout_number.toString()} started`}
+            onSave={(startedAt) => { onCorrectRestTimes(rest.id, { startedAt }); }}
+            value={rest.started_at}
+          />
+        )}
+        {rest?.ended_at !== null && rest !== null && (
+          <RecordedTimeField
+            busy={busy}
+            label={`Rest after bout ${bout.bout_number.toString()} ended`}
+            onSave={(endedAt) => { onCorrectRestTimes(rest.id, { endedAt }); }}
+            value={rest.ended_at}
+          />
+        )}
+      </details>
+      <DeleteBoutControl boutNumber={bout.bout_number} busy={busy} onDelete={onDelete} />
+    </div>
+  );
+}
+
+/**
+ * One recorded timestamp, tapped to reveal a `datetime-local` editor
+ * (docs/pad-walking.md: "Recorded times can be tapped and corrected").
+ * Keyboard input is normally avoided in this HUD, but a correction is the
+ * documented exception -- typing an exact time is the point.
+ */
+function RecordedTimeField({
+  busy,
+  label,
+  onSave,
+  value,
+}: {
+  busy: boolean;
+  label: string;
+  onSave: (iso: string) => void;
+  value: string;
+}) {
+  const id = useId();
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(() => isoToLocalInputValue(value));
+  const parsed = localInputValueToIso(draft);
+  const unchanged = parsed !== null && new Date(parsed).getTime() === new Date(value).getTime();
+
+  if (!editing) {
+    return (
+      <button
+        className="pad-time-field"
+        disabled={busy}
+        onClick={() => {
+          setDraft(isoToLocalInputValue(value));
+          setEditing(true);
+        }}
+        type="button"
+      >
+        <span className="pad-time-field__label">{label}</span>
+        <span className="pad-time-field__value">{formatClockTime(value)}</span>
+      </button>
+    );
+  }
+  return (
+    <div className="field pad-time-field__editor">
+      <label htmlFor={id}>{label}</label>
+      <input
+        className="text-input"
+        id={id}
+        onChange={(event) => { setDraft(event.target.value); }}
+        step="1"
+        type="datetime-local"
+        value={draft}
+      />
+      <div className="pad-time-field__actions">
+        <button
+          className="button button--primary"
+          disabled={busy || parsed === null || unchanged}
+          onClick={() => {
+            if (parsed !== null) {
+              onSave(parsed);
+              setEditing(false);
+            }
+          }}
+          type="button"
+        >
+          Save
+        </button>
+        <button className="button" disabled={busy} onClick={() => { setEditing(false); }} type="button">
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Delete a bout, with confirmation (docs/pad-walking.md: "A bout may also be deleted with confirmation"). */
+function DeleteBoutControl({
+  boutNumber,
+  busy,
+  onDelete,
+}: {
+  boutNumber: number;
+  busy: boolean;
+  onDelete: () => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  if (!confirming) {
+    return (
+      <button className="button button--quiet" disabled={busy} onClick={() => { setConfirming(true); }} type="button">
+        Delete bout {boutNumber.toString()}
+      </button>
+    );
+  }
+  return (
+    <div className="stack" role="alertdialog" aria-label={`Confirm delete bout ${boutNumber.toString()}`}>
+      <p className="muted">Delete bout {boutNumber.toString()}? Its pause and rest intervals are removed with it.</p>
+      <button
+        className="button button--primary"
+        disabled={busy}
+        onClick={() => {
+          setConfirming(false);
+          onDelete();
+        }}
+        type="button"
+      >
+        Delete
+      </button>
+      <button className="button" disabled={busy} onClick={() => { setConfirming(false); }} type="button">
+        Cancel
+      </button>
     </div>
   );
 }

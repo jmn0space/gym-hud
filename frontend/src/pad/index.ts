@@ -4,6 +4,11 @@
  * narrowed to the surface screens actually use.
  */
 export {
+  correctWalkingBoutTimesAction,
+  correctWalkingPauseTimesAction,
+  correctWalkingRestTimesAction,
+  deleteWalkingBoutAction,
+  detectUndoableWalkingTransition,
   discardWalkingSessionAction,
   finishWalkingSessionAction,
   finishWalkingBoutAction,
@@ -13,6 +18,7 @@ export {
   startWalkingBoutAction,
   startNextWalkingBoutAction,
   startWalkingSessionAction,
+  undoLastWalkingTransitionAction,
   updateWalkingBoutAction,
   updateWalkingSessionNotesAction,
 } from "./actions";
@@ -35,7 +41,15 @@ export {
 } from "./settings";
 export { useNow } from "./useNow";
 export { DEFAULT_WALKING_SETTINGS } from "./types";
-export type { CloseWalkingSessionInput } from "./actions";
+export type {
+  CloseWalkingSessionInput,
+  CorrectWalkingBoutTimesInput,
+  CorrectWalkingPauseTimesInput,
+  CorrectWalkingRestTimesInput,
+  DeleteWalkingBoutInput,
+  UndoableWalkingTransition,
+  UndoLastWalkingTransitionInput,
+} from "./actions";
 export type { PadSessionView } from "./session";
 export type { PreviousWalkingSession } from "./settings";
-export type { WalkingSessionSettings, WalkingState, WalkingStopReason } from "./types";
+export type { WalkingBout, WalkingBoutPause, WalkingRest, WalkingSessionSettings, WalkingState, WalkingStopReason } from "./types";

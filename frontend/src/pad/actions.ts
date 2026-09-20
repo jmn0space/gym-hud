@@ -8,7 +8,15 @@ import type {
 } from "../storage";
 import { isOpenRow, recordText, walkingBoutRecord, walkingSessionRecord } from "./records";
 import { buildPadSessionView, findActiveWalkingSessionRecord, walkingElapsedMs, type PadSessionView } from "./session";
-import { WALKING_STOP_REASONS, type WalkingBout, type WalkingSessionSettings, type WalkingStopReason } from "./types";
+import {
+  WALKING_STOP_REASONS,
+  type WalkingBout,
+  type WalkingBoutPause,
+  type WalkingRest,
+  type WalkingSession,
+  type WalkingSessionSettings,
+  type WalkingStopReason,
+} from "./types";
 
 /**
  * Builders for the local actions this slice commits. One logical operation is
@@ -571,4 +579,545 @@ export function finishWalkingSessionAction(input: CloseWalkingSessionInput): Loc
  */
 export function discardWalkingSessionAction(input: CloseWalkingSessionInput): LocalAction {
   return closeWalkingSessionAction(input, "DISCARDED");
+}
+
+/*
+ * Corrections, undo and delete (issue #22). These extend the same one-action-
+ * per-operation contract as everything above: a correction, an undo or a
+ * delete is exactly one `LocalAction`, so the repository writes it as one
+ * transaction and one outbox envelope.
+ */
+
+function isValidTimestamp(value: string): boolean {
+  return Number.isFinite(Date.parse(value));
+}
+
+/**
+ * Session-wide containment and ordering rules a correction, undo or delete
+ * must leave true of the RESULTING state -- judged as a whole, exactly as the
+ * server judges the finished state of a mutation (docs/data-sync.md, "Settle
+ * the finished state" and "PAD validation"):
+ *
+ * - a bout starts at or after its session started;
+ * - an interval's end is not before its own start;
+ * - a pause lies within its bout, and cannot stay open once the bout has
+ *   ended;
+ * - pauses of the same bout do not overlap;
+ * - a rest belongs to a bout that has ended, and starts at or after that end;
+ * - PAD-06: the session never has an open bout while one of its rests is
+ *   open.
+ *
+ * Deliberately not checked, because neither the server nor a normal workflow
+ * checks it either: two bouts of the same session overlapping each other.
+ * `settle_session_tree` (`backend/apps/pad/sync.py`) clamps each interval
+ * into its own parent independently, never against its siblings, so adding
+ * that rule here would make the client stricter than the server it mirrors.
+ *
+ * A user-chosen correction is validated, never clamped (unlike a clock
+ * stamp): `InvalidActionError` refuses an edit that would break one of these
+ * rules rather than silently moving a value the user did not choose
+ * (docs/data-sync.md, "Clock steps are clamped" describes the server's
+ * separate, clock-only clamp).
+ */
+function assertContainedWalkingSession(
+  session: WalkingSession,
+  bouts: readonly WalkingBout[],
+  pauses: readonly WalkingBoutPause[],
+  rests: readonly WalkingRest[],
+): void {
+  const sessionStart = Date.parse(session.started_at);
+  for (const bout of bouts) {
+    if (Date.parse(bout.started_at) < sessionStart) {
+      throw new InvalidActionError(`Bout ${bout.bout_number.toString()} cannot start before the session started`);
+    }
+    if (bout.ended_at !== null && Date.parse(bout.ended_at) < Date.parse(bout.started_at)) {
+      throw new InvalidActionError(`Bout ${bout.bout_number.toString()} cannot end before it started`);
+    }
+  }
+
+  const boutById = new Map(bouts.map((bout) => [bout.id, bout] as const));
+  const pausesByBout = new Map<string, WalkingBoutPause[]>();
+  for (const pause of pauses) {
+    const bout = boutById.get(pause.walking_bout_id);
+    if (bout === undefined) {
+      continue;
+    }
+    if (pause.ended_at !== null && Date.parse(pause.ended_at) < Date.parse(pause.started_at)) {
+      throw new InvalidActionError("A pause cannot end before it started");
+    }
+    if (Date.parse(pause.started_at) < Date.parse(bout.started_at)) {
+      throw new InvalidActionError(`A pause cannot start before bout ${bout.bout_number.toString()} started`);
+    }
+    if (bout.ended_at !== null) {
+      if (pause.ended_at === null) {
+        throw new InvalidActionError(`A pause cannot stay open once bout ${bout.bout_number.toString()} has ended`);
+      }
+      if (Date.parse(pause.ended_at) > Date.parse(bout.ended_at)) {
+        throw new InvalidActionError(`A pause cannot end after bout ${bout.bout_number.toString()} ended`);
+      }
+    }
+    const list = pausesByBout.get(pause.walking_bout_id) ?? [];
+    list.push(pause);
+    pausesByBout.set(pause.walking_bout_id, list);
+  }
+  for (const list of pausesByBout.values()) {
+    const ordered = [...list].sort((left, right) => Date.parse(left.started_at) - Date.parse(right.started_at));
+    for (let index = 1; index < ordered.length; index += 1) {
+      const previous = ordered[index - 1];
+      const current = ordered[index];
+      if (previous === undefined || current === undefined) {
+        continue;
+      }
+      if (previous.ended_at === null || Date.parse(current.started_at) < Date.parse(previous.ended_at)) {
+        throw new InvalidActionError("Pauses of the same bout cannot overlap");
+      }
+    }
+  }
+
+  for (const rest of rests) {
+    const bout = boutById.get(rest.walking_bout_id);
+    if (bout === undefined) {
+      continue;
+    }
+    if (bout.ended_at === null) {
+      throw new InvalidActionError(`A rest cannot exist while bout ${bout.bout_number.toString()} is still open`);
+    }
+    if (Date.parse(rest.started_at) < Date.parse(bout.ended_at)) {
+      throw new InvalidActionError(`A rest cannot start before bout ${bout.bout_number.toString()} ended`);
+    }
+    if (rest.ended_at !== null && Date.parse(rest.ended_at) < Date.parse(rest.started_at)) {
+      throw new InvalidActionError("A rest cannot end before it started");
+    }
+  }
+
+  const hasOpenBout = bouts.some((bout) => bout.ended_at === null);
+  const hasOpenRest = rests.some((rest) => rest.ended_at === null);
+  if (hasOpenBout && hasOpenRest) {
+    throw new InvalidActionError(
+      "A bout cannot be open while a rest is open in the same session (PAD-06)",
+    );
+  }
+}
+
+export interface CorrectWalkingBoutTimesInput {
+  actionId: string;
+  view: PadSessionView;
+  boutId: string;
+  startedAt?: string;
+  endedAt?: string;
+}
+
+/**
+ * Correct a bout's recorded `started_at` and/or `ended_at` (docs/pad-walking.md,
+ * "Editing, undo, and delete"; PAD-09).
+ *
+ * `ended_at` may only be corrected once the bout has actually finished: a
+ * correction changes an already-recorded value, it does not open or close an
+ * interval -- that stays the job of PAUSE/RESUME/FINISH BOUT.
+ *
+ * A bout's `ended_at` and its rest's `started_at` are the same instant when
+ * `FINISH BOUT` creates them (docs/pad-walking.md, "Rest handling"), but a
+ * correction does not force them to move together: it is validated against
+ * the rest's current, unmoved value and refused if that would break
+ * containment (the rest would then start before the bout ended). Matches the
+ * server's own behaviour for the same correction
+ * (`test_a_time_correction_is_judged_on_the_finished_state`,
+ * `backend/apps/sync/tests/test_mutations_api.py`, which corrects a bout's end
+ * without touching its rest and only checks the result still holds). Moving a
+ * bout's end past its rest's current start requires a second correction of
+ * the rest's own `started_at` first.
+ */
+export function correctWalkingBoutTimesAction(input: CorrectWalkingBoutTimesInput): LocalAction {
+  const { actionId, view, boutId, startedAt, endedAt } = input;
+  if (view.session.status !== "ACTIVE") throw new InvalidActionError("Session is no longer active");
+  const bout = view.bouts.find((item) => item.id === boutId);
+  if (bout === undefined) throw new InvalidActionError("Bout does not belong to session");
+  if (startedAt === undefined && endedAt === undefined) {
+    throw new InvalidActionError("Bout time correction has no changes");
+  }
+  if (startedAt !== undefined && !isValidTimestamp(startedAt)) {
+    throw new InvalidActionError("Corrected start time is not a valid timestamp");
+  }
+  if (endedAt !== undefined) {
+    if (bout.ended_at === null) {
+      throw new InvalidActionError("Cannot correct the end time of a bout that has not finished");
+    }
+    if (!isValidTimestamp(endedAt)) {
+      throw new InvalidActionError("Corrected end time is not a valid timestamp");
+    }
+  }
+
+  const correctedBout: WalkingBout = {
+    ...bout,
+    started_at: startedAt ?? bout.started_at,
+    ended_at: endedAt ?? bout.ended_at,
+  };
+  const bouts = view.bouts.map((item) => (item.id === boutId ? correctedBout : item));
+  assertContainedWalkingSession(view.session, bouts, view.pauses, view.rests);
+
+  const rawBout = rawById(view.boutRecords, boutId);
+  return {
+    actionId,
+    changes: [
+      { store: "walking_bouts", operation: "put", record: {
+        ...carriedFields(rawBout), started_at: correctedBout.started_at, ended_at: correctedBout.ended_at,
+      } },
+      workflowChange(view),
+    ],
+    preconditions: [workflowPrecondition(view), unchangedRecordPrecondition("walking_bouts", rawBout)],
+  };
+}
+
+export interface CorrectWalkingPauseTimesInput {
+  actionId: string;
+  view: PadSessionView;
+  pauseId: string;
+  startedAt?: string;
+  endedAt?: string;
+}
+
+/** Correct a pause's recorded `started_at` and/or `ended_at`. See `correctWalkingBoutTimesAction`. */
+export function correctWalkingPauseTimesAction(input: CorrectWalkingPauseTimesInput): LocalAction {
+  const { actionId, view, pauseId, startedAt, endedAt } = input;
+  if (view.session.status !== "ACTIVE") throw new InvalidActionError("Session is no longer active");
+  const pause = view.pauses.find((item) => item.id === pauseId);
+  if (pause === undefined) throw new InvalidActionError("Pause does not belong to session");
+  if (startedAt === undefined && endedAt === undefined) {
+    throw new InvalidActionError("Pause time correction has no changes");
+  }
+  if (startedAt !== undefined && !isValidTimestamp(startedAt)) {
+    throw new InvalidActionError("Corrected start time is not a valid timestamp");
+  }
+  if (endedAt !== undefined) {
+    if (pause.ended_at === null) {
+      throw new InvalidActionError("Cannot correct the end time of a pause that has not finished");
+    }
+    if (!isValidTimestamp(endedAt)) {
+      throw new InvalidActionError("Corrected end time is not a valid timestamp");
+    }
+  }
+
+  const correctedPause: WalkingBoutPause = {
+    ...pause,
+    started_at: startedAt ?? pause.started_at,
+    ended_at: endedAt ?? pause.ended_at,
+  };
+  const pauses = view.pauses.map((item) => (item.id === pauseId ? correctedPause : item));
+  assertContainedWalkingSession(view.session, view.bouts, pauses, view.rests);
+
+  const rawPause = rawById(view.pauseRecords, pauseId);
+  return {
+    actionId,
+    changes: [
+      { store: "walking_pauses", operation: "put", record: {
+        ...carriedFields(rawPause), started_at: correctedPause.started_at, ended_at: correctedPause.ended_at,
+      } },
+      workflowChange(view),
+    ],
+    preconditions: [workflowPrecondition(view), unchangedRecordPrecondition("walking_pauses", rawPause)],
+  };
+}
+
+export interface CorrectWalkingRestTimesInput {
+  actionId: string;
+  view: PadSessionView;
+  restId: string;
+  startedAt?: string;
+  endedAt?: string;
+}
+
+/** Correct a rest's recorded `started_at` and/or `ended_at`. See `correctWalkingBoutTimesAction`. */
+export function correctWalkingRestTimesAction(input: CorrectWalkingRestTimesInput): LocalAction {
+  const { actionId, view, restId, startedAt, endedAt } = input;
+  if (view.session.status !== "ACTIVE") throw new InvalidActionError("Session is no longer active");
+  const rest = view.rests.find((item) => item.id === restId);
+  if (rest === undefined) throw new InvalidActionError("Rest does not belong to session");
+  if (startedAt === undefined && endedAt === undefined) {
+    throw new InvalidActionError("Rest time correction has no changes");
+  }
+  if (startedAt !== undefined && !isValidTimestamp(startedAt)) {
+    throw new InvalidActionError("Corrected start time is not a valid timestamp");
+  }
+  if (endedAt !== undefined) {
+    if (rest.ended_at === null) {
+      throw new InvalidActionError("Cannot correct the end time of a rest that has not finished");
+    }
+    if (!isValidTimestamp(endedAt)) {
+      throw new InvalidActionError("Corrected end time is not a valid timestamp");
+    }
+  }
+
+  const correctedRest: WalkingRest = {
+    ...rest,
+    started_at: startedAt ?? rest.started_at,
+    ended_at: endedAt ?? rest.ended_at,
+  };
+  const rests = view.rests.map((item) => (item.id === restId ? correctedRest : item));
+  assertContainedWalkingSession(view.session, view.bouts, view.pauses, rests);
+
+  const rawRest = rawById(view.restRecords, restId);
+  return {
+    actionId,
+    changes: [
+      { store: "walking_rests", operation: "put", record: {
+        ...carriedFields(rawRest), started_at: correctedRest.started_at, ended_at: correctedRest.ended_at,
+      } },
+      workflowChange(view),
+    ],
+    preconditions: [workflowPrecondition(view), unchangedRecordPrecondition("walking_rests", rawRest)],
+  };
+}
+
+/**
+ * The five state-changing transitions `docs/pad-walking.md` ("Editing, undo,
+ * and delete") allows undoing, plus the ids `undoLastWalkingTransitionAction`
+ * needs to reverse each one.
+ */
+export type UndoableWalkingTransition =
+  | { type: "bout_started"; boutId: string }
+  | { type: "bout_paused"; pauseId: string }
+  | { type: "bout_resumed"; pauseId: string }
+  | { type: "bout_finished"; boutId: string; restId: string; pauseId: string | null }
+  | { type: "next_bout_started"; boutId: string; restId: string };
+
+/**
+ * The most recent undoable transition of this session, or `null` when nothing
+ * of the five listed above is currently reversible (a correction has moved
+ * one side of a coupled pair since, the session has no history yet, or the
+ * session is not `ACTIVE`).
+ *
+ * Derived purely from the persisted records, never a separate undo stack or
+ * store (owner decision, issue #22), so it survives a reload and a second
+ * tab. It deliberately does not use the repository's own `updated_at`
+ * bookkeeping to find "the last write": that timestamp comes from the
+ * injected wall clock (`commitAction`'s `now()`), which some tests -- and in
+ * principle a real device with a broken or stepped-back clock -- hold fixed
+ * or non-monotonic on purpose (`frontend/src/pad/padWorkflow.test.ts`, "A
+ * fixed repository clock deliberately makes every updated_at identical").
+ * Instead this reads the same *domain* coupling every transition itself
+ * establishes -- a bout and the rest it closed share one `started_at`/
+ * `ended_at` instant by construction (`startNextWalkingBoutAction`,
+ * `finishWalkingBoutAction`) -- which stays correct however the wall clock
+ * behaves, because those values come from `monotonicNow`, guaranteed
+ * non-decreasing within one session.
+ *
+ * Each of the three states with a running interval maps to exactly one kind
+ * of undo, using the view's own `current*` fields (already unambiguous: the
+ * repository's cardinality rules allow at most one open bout, pause and rest
+ * per session/bout):
+ *
+ * - WALKING with pauses already recorded against the open bout: the bout was
+ *   resumed -- reopen its most recently closed pause.
+ * - WALKING with no pauses yet: the bout was just started. If some rest in
+ *   the session closed at exactly this bout's `started_at`, it was the one
+ *   `START NEXT BOUT` closed to open this bout (`next_bout_started`);
+ *   otherwise this is a fresh start from READY (`bout_started`).
+ * - PAUSED: the bout was just paused -- delete the open pause.
+ * - RESTING, and the rest still starts exactly where the bout ended (no
+ *   correction has moved either since): the bout was just finished -- reopen
+ *   it, delete the rest, and reopen whichever pause (if any) closed at the
+ *   same instant the bout did.
+ */
+export function detectUndoableWalkingTransition(view: PadSessionView): UndoableWalkingTransition | null {
+  const { state, currentBout, currentPause, currentRest, pauses, rests } = view;
+  switch (state) {
+    case "WALKING": {
+      if (currentBout === null) {
+        return null;
+      }
+      const closedBoutPauses = pauses.filter(
+        (pause) => pause.walking_bout_id === currentBout.id && pause.ended_at !== null,
+      );
+      if (closedBoutPauses.length > 0) {
+        const latestPause = closedBoutPauses.reduce((latest, pause) =>
+          Date.parse(pause.ended_at ?? "") > Date.parse(latest.ended_at ?? "") ? pause : latest);
+        return { type: "bout_resumed", pauseId: latestPause.id };
+      }
+      const coupledRest = rests.find(
+        (rest) => rest.walking_bout_id !== currentBout.id && rest.ended_at === currentBout.started_at,
+      );
+      return coupledRest === undefined
+        ? { type: "bout_started", boutId: currentBout.id }
+        : { type: "next_bout_started", boutId: currentBout.id, restId: coupledRest.id };
+    }
+    case "PAUSED": {
+      if (currentPause === null) {
+        return null;
+      }
+      return { type: "bout_paused", pauseId: currentPause.id };
+    }
+    case "RESTING": {
+      if (currentBout === null || currentRest === null) {
+        return null;
+      }
+      if (currentRest.started_at !== currentBout.ended_at) {
+        return null;
+      }
+      const closedPause = pauses.find(
+        (pause) => pause.walking_bout_id === currentBout.id && pause.ended_at === currentBout.ended_at,
+      );
+      return {
+        type: "bout_finished",
+        boutId: currentBout.id,
+        restId: currentRest.id,
+        pauseId: closedPause?.id ?? null,
+      };
+    }
+    case "READY":
+    case "COMPLETED":
+      return null;
+  }
+}
+
+export interface UndoLastWalkingTransitionInput {
+  actionId: string;
+  view: PadSessionView;
+}
+
+/**
+ * Undo the most recent supported state-changing action, as a forward
+ * compensating mutation (owner decision, issue #22): this commits a NEW
+ * `LocalAction` with a higher sequence that reverses the last transition's
+ * effect. Nothing is ever removed from or rewritten in the outbox -- the
+ * original action's envelope stays exactly as it was, pushed or not; undo
+ * works identically either way, because the server applies this action's
+ * tombstones and reopenings the same way it applies any other put/delete.
+ *
+ * Reviving a just-tombstoned bout is only legal for the device that deleted
+ * it (docs/data-sync.md, "A tombstone wins"), which undo always is: it runs
+ * on the same device, immediately after, before any other device could have
+ * touched the record.
+ */
+export function undoLastWalkingTransitionAction({ actionId, view }: UndoLastWalkingTransitionInput): LocalAction {
+  if (view.session.status !== "ACTIVE") throw new InvalidActionError("Session is no longer active");
+  const transition = detectUndoableWalkingTransition(view);
+  if (transition === null) {
+    throw new InvalidActionError("There is nothing to undo");
+  }
+
+  const changes: LocalAction["changes"] = [];
+  const preconditions: RecordPrecondition[] = [workflowPrecondition(view)];
+
+  switch (transition.type) {
+    case "bout_started": {
+      const rawBout = rawById(view.boutRecords, transition.boutId);
+      changes.push({ store: "walking_bouts", operation: "delete", id: transition.boutId });
+      preconditions.push(
+        { store: "walking_bouts", id: transition.boutId, expected: { ended_at: null } },
+        unchangedRecordPrecondition("walking_bouts", rawBout),
+      );
+      break;
+    }
+    case "bout_paused": {
+      const rawPause = rawById(view.pauseRecords, transition.pauseId);
+      changes.push({ store: "walking_pauses", operation: "delete", id: transition.pauseId });
+      preconditions.push(
+        { store: "walking_pauses", id: transition.pauseId, expected: { ended_at: null } },
+        unchangedRecordPrecondition("walking_pauses", rawPause),
+      );
+      break;
+    }
+    case "bout_resumed": {
+      const rawPause = rawById(view.pauseRecords, transition.pauseId);
+      changes.push({ store: "walking_pauses", operation: "put", record: { ...carriedFields(rawPause), ended_at: null } });
+      preconditions.push(unchangedRecordPrecondition("walking_pauses", rawPause));
+      break;
+    }
+    case "bout_finished": {
+      const rawBout = rawById(view.boutRecords, transition.boutId);
+      const rawRest = rawById(view.restRecords, transition.restId);
+      changes.push({ store: "walking_bouts", operation: "put", record: { ...carriedFields(rawBout), ended_at: null } });
+      changes.push({ store: "walking_rests", operation: "delete", id: transition.restId });
+      preconditions.push(
+        unchangedRecordPrecondition("walking_bouts", rawBout),
+        { store: "walking_rests", id: transition.restId, expected: { ended_at: null } },
+        unchangedRecordPrecondition("walking_rests", rawRest),
+      );
+      if (transition.pauseId !== null) {
+        const rawPause = rawById(view.pauseRecords, transition.pauseId);
+        changes.push({ store: "walking_pauses", operation: "put", record: { ...carriedFields(rawPause), ended_at: null } });
+        preconditions.push(unchangedRecordPrecondition("walking_pauses", rawPause));
+      }
+      break;
+    }
+    case "next_bout_started": {
+      const rawBout = rawById(view.boutRecords, transition.boutId);
+      const rawRest = rawById(view.restRecords, transition.restId);
+      changes.push({ store: "walking_bouts", operation: "delete", id: transition.boutId });
+      changes.push({ store: "walking_rests", operation: "put", record: { ...carriedFields(rawRest), ended_at: null } });
+      preconditions.push(
+        { store: "walking_bouts", id: transition.boutId, expected: { ended_at: null } },
+        unchangedRecordPrecondition("walking_bouts", rawBout),
+        unchangedRecordPrecondition("walking_rests", rawRest),
+      );
+      break;
+    }
+  }
+
+  changes.push(workflowChange(view));
+  return { actionId, changes, preconditions };
+}
+
+export interface DeleteWalkingBoutInput {
+  actionId: string;
+  view: PadSessionView;
+  boutId: string;
+}
+
+/**
+ * Delete a finished bout and its pauses and rest, and renumber the surviving
+ * bouts of the session contiguously in start order -- all in one action, one
+ * transaction, one outbox envelope (owner decision, issue #22). UUIDs never
+ * change; only `bout_number` (a display field, not identity -- see
+ * `backend/apps/pad/models.py`'s `WalkingBout.bout_number` docstring) moves.
+ *
+ * Restricted to a bout that has already finished: an in-progress bout is
+ * removed through undo (if it was just started) or finished first, not
+ * deleted out from under a running timer. The server's own delete cascades
+ * to any live child this action does not list (another device's late pause,
+ * say -- docs/data-sync.md, "A delete cascades"), but this device deletes
+ * every pause and rest it currently knows about explicitly: unlike the
+ * server, the local repository's `commitAction` does not cascade a delete on
+ * its own (docs/data-sync.md, "The frontend mirrors these rules": "delete
+ * children with their parent").
+ */
+export function deleteWalkingBoutAction({ actionId, view, boutId }: DeleteWalkingBoutInput): LocalAction {
+  if (view.session.status !== "ACTIVE") throw new InvalidActionError("Session is no longer active");
+  const bout = view.bouts.find((item) => item.id === boutId);
+  if (bout === undefined) throw new InvalidActionError("Bout does not belong to session");
+  if (bout.ended_at === null) throw new InvalidActionError("Cannot delete a bout that has not finished");
+
+  const rawBout = rawById(view.boutRecords, boutId);
+  const changes: LocalAction["changes"] = [];
+  const preconditions: RecordPrecondition[] = [workflowPrecondition(view), unchangedRecordPrecondition("walking_bouts", rawBout)];
+
+  for (const pause of view.pauseRecords) {
+    if (recordText(pause, "walking_bout_id") === boutId) {
+      changes.push({ store: "walking_pauses", operation: "delete", id: pause.id });
+      preconditions.push(unchangedRecordPrecondition("walking_pauses", pause));
+    }
+  }
+  for (const rest of view.restRecords) {
+    if (recordText(rest, "walking_bout_id") === boutId) {
+      changes.push({ store: "walking_rests", operation: "delete", id: rest.id });
+      preconditions.push(unchangedRecordPrecondition("walking_rests", rest));
+    }
+  }
+  changes.push({ store: "walking_bouts", operation: "delete", id: boutId });
+
+  const survivors = view.bouts
+    .filter((item) => item.id !== boutId)
+    .slice()
+    .sort((left, right) => Date.parse(left.started_at) - Date.parse(right.started_at));
+  survivors.forEach((survivor, index) => {
+    const nextNumber = index + 1;
+    if (survivor.bout_number !== nextNumber) {
+      const rawSurvivor = rawById(view.boutRecords, survivor.id);
+      changes.push({ store: "walking_bouts", operation: "put", record: { ...carriedFields(rawSurvivor), bout_number: nextNumber } });
+      preconditions.push(unchangedRecordPrecondition("walking_bouts", rawSurvivor));
+    }
+  });
+
+  changes.push(workflowChange(view));
+  return { actionId, changes, preconditions };
 }
