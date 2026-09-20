@@ -1061,3 +1061,149 @@ describe("PAD bout workflow", () => {
     await waitFor(async () => { expect((await repository.listRecords("walking_sessions"))[0]).toEqual(expect.objectContaining({ session_notes: "Felt steady" })); });
   });
 });
+
+/**
+ * `<input type="datetime-local">` values have no time zone: the browser reads
+ * and writes them in whatever zone it is running in, and so does
+ * `PadPage.tsx`'s own `isoToLocalInputValue`/`localInputValueToIso`. Building
+ * the target string this same way -- from a `Date`, in the test's own local
+ * zone -- is what keeps this test's expectations correct wherever it runs,
+ * instead of assuming UTC.
+ */
+function toDatetimeLocalValue(date: Date): string {
+  const pad = (value: number) => value.toString().padStart(2, "0");
+  return (
+    `${date.getFullYear().toString()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+  );
+}
+
+describe("PAD corrections, undo and delete (issue #22)", () => {
+  it("corrects a completed bout's recorded end time and recalculates the displayed duration (PAD-09)", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    const repository = freshRepository();
+    renderPad(repository);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start walking" }));
+    await screen.findByText("Walking");
+
+    // The bout accidentally runs on to 20 minutes instead of the intended 8.
+    vi.setSystemTime(Date.parse("2026-09-18T10:20:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Finish bout" }));
+    await screen.findByText("Resting");
+    expect(screen.getByText("20:00")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("Edit times for bout 1", { selector: "summary" }));
+    fireEvent.click(screen.getByRole("button", { name: /Bout 1 ended/ }));
+    const input = screen.getByLabelText("Bout 1 ended");
+    const corrected = new Date(Date.parse("2026-09-18T10:08:00.000Z"));
+    fireEvent.change(input, { target: { value: toDatetimeLocalValue(corrected) } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(async () => {
+      expect((await repository.listRecords("walking_bouts"))[0]).toEqual(
+        expect.objectContaining({ ended_at: "2026-09-18T10:08:00.000Z" }),
+      );
+    });
+    expect(await screen.findByText("08:00")).toBeInTheDocument();
+  });
+
+  it("refuses an invalid time correction and leaves the recorded time unchanged", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    const repository = freshRepository();
+    renderPad(repository);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start walking" }));
+    await screen.findByText("Walking");
+    vi.setSystemTime(Date.parse("2026-09-18T10:08:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Finish bout" }));
+    await screen.findByText("Resting");
+
+    fireEvent.click(screen.getByText("Edit times for bout 1", { selector: "summary" }));
+    fireEvent.click(screen.getByRole("button", { name: /Bout 1 ended/ }));
+    const input = screen.getByLabelText("Bout 1 ended");
+    // Before the bout's own start: the containment rule refuses it.
+    const invalid = new Date(Date.parse("2026-09-18T09:00:00.000Z"));
+    fireEvent.change(input, { target: { value: toDatetimeLocalValue(invalid) } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await screen.findByRole("alert");
+    expect((await repository.listRecords("walking_bouts"))[0]).toEqual(
+      expect.objectContaining({ ended_at: "2026-09-18T10:08:00.000Z" }),
+    );
+  });
+
+  it("requires confirming Undo, and a cancelled confirmation commits nothing", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    const repository = freshRepository();
+    renderPad(repository);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start walking" }));
+    await screen.findByText("Walking");
+
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    const dialog = await screen.findByRole("alertdialog", { name: "Confirm undo" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    // Nothing committed: the bout is exactly as it was, still WALKING.
+    expect(screen.getByText("Walking")).toBeInTheDocument();
+    expect(await repository.listRecords("walking_bouts")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    const secondDialog = await screen.findByRole("alertdialog", { name: "Confirm undo" });
+    fireEvent.click(within(secondDialog).getByRole("button", { name: "Undo" }));
+
+    await screen.findByRole("button", { name: "Start walking" });
+    expect(await repository.listRecords("walking_bouts")).toHaveLength(0);
+  });
+
+  it("offers Undo again for the transition underneath an unrelated pain edit", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    const repository = freshRepository();
+    renderPad(repository);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start walking" }));
+    await screen.findByText("Walking");
+    const pain = within(screen.getByRole("group", { name: "Pain for bout 1" }));
+    fireEvent.click(pain.getByRole("button", { name: "2" }));
+    await waitFor(async () => {
+      expect((await repository.listRecords("walking_bouts"))[0]).toEqual(
+        expect.objectContaining({ pain_min: 2 }),
+      );
+    });
+
+    expect(screen.getByRole("button", { name: "Undo" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    const dialog = await screen.findByRole("alertdialog", { name: "Confirm undo" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Undo" }));
+    await screen.findByRole("button", { name: "Start walking" });
+    expect(await repository.listRecords("walking_bouts")).toHaveLength(0);
+  });
+
+  it("requires confirming a bout deletion, and a cancelled confirmation commits nothing", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    const repository = freshRepository();
+    renderPad(repository);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start walking" }));
+    await screen.findByText("Walking");
+    vi.setSystemTime(Date.parse("2026-09-18T10:08:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Finish bout" }));
+    await screen.findByText("Resting");
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete bout 1" }));
+    const dialog = await screen.findByRole("alertdialog", { name: "Confirm delete bout 1" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(await repository.listRecords("walking_bouts")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete bout 1" }));
+    const secondDialog = await screen.findByRole("alertdialog", { name: "Confirm delete bout 1" });
+    fireEvent.click(within(secondDialog).getByRole("button", { name: "Delete" }));
+
+    await waitFor(async () => { expect(await repository.listRecords("walking_bouts")).toHaveLength(0); });
+    await waitFor(async () => { expect(await repository.listRecords("walking_rests")).toHaveLength(0); });
+    // No bouts remain, so the HUD returns straight to the Start-walking control.
+    await screen.findByRole("button", { name: "Start walking" });
+  });
+});

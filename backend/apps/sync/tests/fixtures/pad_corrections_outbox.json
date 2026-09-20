@@ -1,0 +1,785 @@
+{
+  "client_id": "00000000-0000-4000-8000-000000000301",
+  "mutations": [
+    {
+      "version": 1,
+      "mutation_id": "00000000-0000-4000-8000-000000000401",
+      "sequence": 1,
+      "created_at": "2026-09-20T10:00:00.000Z",
+      "changes": [
+        {
+          "store": "walking_sessions",
+          "entity_type": "walking_session",
+          "entity_id": "00000000-0000-4000-8000-000000000302",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000302",
+            "status": "ACTIVE",
+            "started_at": "2026-09-20T10:00:00.000Z",
+            "completed_at": null,
+            "speed_kmh": 5,
+            "incline_pct": 2,
+            "max_bout_seconds": 480,
+            "session_notes": null,
+            "workflow_revision": 0,
+            "created_at": "2026-09-20T10:00:00.000Z",
+            "updated_at": "2026-09-20T10:00:00.000Z",
+            "deleted_at": null
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "mutation_id": "00000000-0000-4000-8000-000000000402",
+      "sequence": 2,
+      "created_at": "2026-09-20T10:01:00.000Z",
+      "changes": [
+        {
+          "store": "walking_sessions",
+          "entity_type": "walking_session",
+          "entity_id": "00000000-0000-4000-8000-000000000302",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000302",
+            "status": "ACTIVE",
+            "started_at": "2026-09-20T10:00:00.000Z",
+            "completed_at": null,
+            "speed_kmh": 5,
+            "incline_pct": 2,
+            "max_bout_seconds": 480,
+            "session_notes": null,
+            "workflow_revision": 1,
+            "created_at": "2026-09-20T10:00:00.000Z",
+            "updated_at": "2026-09-20T10:01:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_bouts",
+          "entity_type": "walking_bout",
+          "entity_id": "00000000-0000-4000-8000-000000000303",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000303",
+            "walking_session_id": "00000000-0000-4000-8000-000000000302",
+            "bout_number": 1,
+            "started_at": "2026-09-20T10:01:00.000Z",
+            "ended_at": null,
+            "pain_min": null,
+            "pain_max": null,
+            "stop_reason": null,
+            "notes": null,
+            "created_at": "2026-09-20T10:01:00.000Z",
+            "updated_at": "2026-09-20T10:01:00.000Z",
+            "deleted_at": null
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "mutation_id": "00000000-0000-4000-8000-000000000403",
+      "sequence": 3,
+      "created_at": "2026-09-20T10:02:00.000Z",
+      "changes": [
+        {
+          "store": "walking_sessions",
+          "entity_type": "walking_session",
+          "entity_id": "00000000-0000-4000-8000-000000000302",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000302",
+            "status": "ACTIVE",
+            "started_at": "2026-09-20T10:00:00.000Z",
+            "completed_at": null,
+            "speed_kmh": 5,
+            "incline_pct": 2,
+            "max_bout_seconds": 480,
+            "session_notes": null,
+            "workflow_revision": 2,
+            "created_at": "2026-09-20T10:00:00.000Z",
+            "updated_at": "2026-09-20T10:02:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_pauses",
+          "entity_type": "walking_pause",
+          "entity_id": "00000000-0000-4000-8000-000000000310",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000310",
+            "walking_bout_id": "00000000-0000-4000-8000-000000000303",
+            "started_at": "2026-09-20T10:02:00.000Z",
+            "ended_at": null,
+            "created_at": "2026-09-20T10:02:00.000Z",
+            "updated_at": "2026-09-20T10:02:00.000Z",
+            "deleted_at": null
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "mutation_id": "00000000-0000-4000-8000-000000000404",
+      "sequence": 4,
+      "created_at": "2026-09-20T10:03:00.000Z",
+      "changes": [
+        {
+          "store": "walking_sessions",
+          "entity_type": "walking_session",
+          "entity_id": "00000000-0000-4000-8000-000000000302",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000302",
+            "status": "ACTIVE",
+            "started_at": "2026-09-20T10:00:00.000Z",
+            "completed_at": null,
+            "speed_kmh": 5,
+            "incline_pct": 2,
+            "max_bout_seconds": 480,
+            "session_notes": null,
+            "workflow_revision": 3,
+            "created_at": "2026-09-20T10:00:00.000Z",
+            "updated_at": "2026-09-20T10:03:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_pauses",
+          "entity_type": "walking_pause",
+          "entity_id": "00000000-0000-4000-8000-000000000310",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000310",
+            "walking_bout_id": "00000000-0000-4000-8000-000000000303",
+            "started_at": "2026-09-20T10:02:00.000Z",
+            "ended_at": "2026-09-20T10:03:00.000Z",
+            "created_at": "2026-09-20T10:02:00.000Z",
+            "updated_at": "2026-09-20T10:03:00.000Z",
+            "deleted_at": null
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "mutation_id": "00000000-0000-4000-8000-000000000405",
+      "sequence": 5,
+      "created_at": "2026-09-20T10:20:00.000Z",
+      "changes": [
+        {
+          "store": "walking_sessions",
+          "entity_type": "walking_session",
+          "entity_id": "00000000-0000-4000-8000-000000000302",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000302",
+            "status": "ACTIVE",
+            "started_at": "2026-09-20T10:00:00.000Z",
+            "completed_at": null,
+            "speed_kmh": 5,
+            "incline_pct": 2,
+            "max_bout_seconds": 480,
+            "session_notes": null,
+            "workflow_revision": 4,
+            "created_at": "2026-09-20T10:00:00.000Z",
+            "updated_at": "2026-09-20T10:20:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_bouts",
+          "entity_type": "walking_bout",
+          "entity_id": "00000000-0000-4000-8000-000000000303",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000303",
+            "walking_session_id": "00000000-0000-4000-8000-000000000302",
+            "bout_number": 1,
+            "started_at": "2026-09-20T10:01:00.000Z",
+            "ended_at": "2026-09-20T10:20:00.000Z",
+            "pain_min": null,
+            "pain_max": null,
+            "stop_reason": "MAX_DURATION",
+            "notes": null,
+            "created_at": "2026-09-20T10:01:00.000Z",
+            "updated_at": "2026-09-20T10:20:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_rests",
+          "entity_type": "walking_rest",
+          "entity_id": "00000000-0000-4000-8000-000000000306",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000306",
+            "walking_bout_id": "00000000-0000-4000-8000-000000000303",
+            "started_at": "2026-09-20T10:20:00.000Z",
+            "ended_at": null,
+            "created_at": "2026-09-20T10:20:00.000Z",
+            "updated_at": "2026-09-20T10:20:00.000Z",
+            "deleted_at": null
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "mutation_id": "00000000-0000-4000-8000-000000000406",
+      "sequence": 6,
+      "created_at": "2026-09-20T10:21:00.000Z",
+      "changes": [
+        {
+          "store": "walking_sessions",
+          "entity_type": "walking_session",
+          "entity_id": "00000000-0000-4000-8000-000000000302",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000302",
+            "status": "ACTIVE",
+            "started_at": "2026-09-20T10:00:00.000Z",
+            "completed_at": null,
+            "speed_kmh": 5,
+            "incline_pct": 2,
+            "max_bout_seconds": 480,
+            "session_notes": null,
+            "workflow_revision": 5,
+            "created_at": "2026-09-20T10:00:00.000Z",
+            "updated_at": "2026-09-20T10:21:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_bouts",
+          "entity_type": "walking_bout",
+          "entity_id": "00000000-0000-4000-8000-000000000303",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000303",
+            "walking_session_id": "00000000-0000-4000-8000-000000000302",
+            "bout_number": 1,
+            "started_at": "2026-09-20T10:01:00.000Z",
+            "ended_at": "2026-09-20T10:08:00.000Z",
+            "pain_min": null,
+            "pain_max": null,
+            "stop_reason": "MAX_DURATION",
+            "notes": null,
+            "created_at": "2026-09-20T10:01:00.000Z",
+            "updated_at": "2026-09-20T10:21:00.000Z",
+            "deleted_at": null
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "mutation_id": "00000000-0000-4000-8000-000000000407",
+      "sequence": 7,
+      "created_at": "2026-09-20T10:10:00.000Z",
+      "changes": [
+        {
+          "store": "walking_sessions",
+          "entity_type": "walking_session",
+          "entity_id": "00000000-0000-4000-8000-000000000302",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000302",
+            "status": "ACTIVE",
+            "started_at": "2026-09-20T10:00:00.000Z",
+            "completed_at": null,
+            "speed_kmh": 5,
+            "incline_pct": 2,
+            "max_bout_seconds": 480,
+            "session_notes": null,
+            "workflow_revision": 6,
+            "created_at": "2026-09-20T10:00:00.000Z",
+            "updated_at": "2026-09-20T10:10:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_bouts",
+          "entity_type": "walking_bout",
+          "entity_id": "00000000-0000-4000-8000-000000000304",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000304",
+            "walking_session_id": "00000000-0000-4000-8000-000000000302",
+            "bout_number": 2,
+            "started_at": "2026-09-20T10:20:00.000Z",
+            "ended_at": null,
+            "pain_min": null,
+            "pain_max": null,
+            "stop_reason": null,
+            "notes": null,
+            "created_at": "2026-09-20T10:10:00.000Z",
+            "updated_at": "2026-09-20T10:10:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_rests",
+          "entity_type": "walking_rest",
+          "entity_id": "00000000-0000-4000-8000-000000000306",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000306",
+            "walking_bout_id": "00000000-0000-4000-8000-000000000303",
+            "started_at": "2026-09-20T10:20:00.000Z",
+            "ended_at": "2026-09-20T10:20:00.000Z",
+            "created_at": "2026-09-20T10:20:00.000Z",
+            "updated_at": "2026-09-20T10:10:00.000Z",
+            "deleted_at": null
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "mutation_id": "00000000-0000-4000-8000-000000000408",
+      "sequence": 8,
+      "created_at": "2026-09-20T10:14:00.000Z",
+      "changes": [
+        {
+          "store": "walking_sessions",
+          "entity_type": "walking_session",
+          "entity_id": "00000000-0000-4000-8000-000000000302",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000302",
+            "status": "ACTIVE",
+            "started_at": "2026-09-20T10:00:00.000Z",
+            "completed_at": null,
+            "speed_kmh": 5,
+            "incline_pct": 2,
+            "max_bout_seconds": 480,
+            "session_notes": null,
+            "workflow_revision": 7,
+            "created_at": "2026-09-20T10:00:00.000Z",
+            "updated_at": "2026-09-20T10:14:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_bouts",
+          "entity_type": "walking_bout",
+          "entity_id": "00000000-0000-4000-8000-000000000304",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000304",
+            "walking_session_id": "00000000-0000-4000-8000-000000000302",
+            "bout_number": 2,
+            "started_at": "2026-09-20T10:20:00.000Z",
+            "ended_at": "2026-09-20T10:20:00.000Z",
+            "pain_min": null,
+            "pain_max": null,
+            "stop_reason": null,
+            "notes": null,
+            "created_at": "2026-09-20T10:10:00.000Z",
+            "updated_at": "2026-09-20T10:14:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_rests",
+          "entity_type": "walking_rest",
+          "entity_id": "00000000-0000-4000-8000-000000000307",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000307",
+            "walking_bout_id": "00000000-0000-4000-8000-000000000304",
+            "started_at": "2026-09-20T10:20:00.000Z",
+            "ended_at": null,
+            "created_at": "2026-09-20T10:14:00.000Z",
+            "updated_at": "2026-09-20T10:14:00.000Z",
+            "deleted_at": null
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "mutation_id": "00000000-0000-4000-8000-000000000409",
+      "sequence": 9,
+      "created_at": "2026-09-20T10:15:00.000Z",
+      "changes": [
+        {
+          "store": "walking_sessions",
+          "entity_type": "walking_session",
+          "entity_id": "00000000-0000-4000-8000-000000000302",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000302",
+            "status": "ACTIVE",
+            "started_at": "2026-09-20T10:00:00.000Z",
+            "completed_at": null,
+            "speed_kmh": 5,
+            "incline_pct": 2,
+            "max_bout_seconds": 480,
+            "session_notes": null,
+            "workflow_revision": 8,
+            "created_at": "2026-09-20T10:00:00.000Z",
+            "updated_at": "2026-09-20T10:15:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_bouts",
+          "entity_type": "walking_bout",
+          "entity_id": "00000000-0000-4000-8000-000000000304",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000304",
+            "walking_session_id": "00000000-0000-4000-8000-000000000302",
+            "bout_number": 2,
+            "started_at": "2026-09-20T10:20:00.000Z",
+            "ended_at": null,
+            "pain_min": null,
+            "pain_max": null,
+            "stop_reason": null,
+            "notes": null,
+            "created_at": "2026-09-20T10:10:00.000Z",
+            "updated_at": "2026-09-20T10:15:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_rests",
+          "entity_type": "walking_rest",
+          "entity_id": "00000000-0000-4000-8000-000000000307",
+          "operation": "delete",
+          "id": "00000000-0000-4000-8000-000000000307",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000307",
+            "walking_bout_id": "00000000-0000-4000-8000-000000000304",
+            "started_at": "2026-09-20T10:20:00.000Z",
+            "ended_at": null,
+            "created_at": "2026-09-20T10:14:00.000Z",
+            "updated_at": "2026-09-20T10:15:00.000Z",
+            "deleted_at": "2026-09-20T10:15:00.000Z"
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "mutation_id": "00000000-0000-4000-8000-000000000410",
+      "sequence": 10,
+      "created_at": "2026-09-20T10:16:00.000Z",
+      "changes": [
+        {
+          "store": "walking_sessions",
+          "entity_type": "walking_session",
+          "entity_id": "00000000-0000-4000-8000-000000000302",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000302",
+            "status": "ACTIVE",
+            "started_at": "2026-09-20T10:00:00.000Z",
+            "completed_at": null,
+            "speed_kmh": 5,
+            "incline_pct": 2,
+            "max_bout_seconds": 480,
+            "session_notes": null,
+            "workflow_revision": 9,
+            "created_at": "2026-09-20T10:00:00.000Z",
+            "updated_at": "2026-09-20T10:16:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_bouts",
+          "entity_type": "walking_bout",
+          "entity_id": "00000000-0000-4000-8000-000000000304",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000304",
+            "walking_session_id": "00000000-0000-4000-8000-000000000302",
+            "bout_number": 2,
+            "started_at": "2026-09-20T10:20:00.000Z",
+            "ended_at": "2026-09-20T10:20:00.000Z",
+            "pain_min": null,
+            "pain_max": null,
+            "stop_reason": null,
+            "notes": null,
+            "created_at": "2026-09-20T10:10:00.000Z",
+            "updated_at": "2026-09-20T10:16:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_rests",
+          "entity_type": "walking_rest",
+          "entity_id": "00000000-0000-4000-8000-000000000308",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000308",
+            "walking_bout_id": "00000000-0000-4000-8000-000000000304",
+            "started_at": "2026-09-20T10:20:00.000Z",
+            "ended_at": null,
+            "created_at": "2026-09-20T10:16:00.000Z",
+            "updated_at": "2026-09-20T10:16:00.000Z",
+            "deleted_at": null
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "mutation_id": "00000000-0000-4000-8000-000000000411",
+      "sequence": 11,
+      "created_at": "2026-09-20T10:17:00.000Z",
+      "changes": [
+        {
+          "store": "walking_sessions",
+          "entity_type": "walking_session",
+          "entity_id": "00000000-0000-4000-8000-000000000302",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000302",
+            "status": "ACTIVE",
+            "started_at": "2026-09-20T10:00:00.000Z",
+            "completed_at": null,
+            "speed_kmh": 5,
+            "incline_pct": 2,
+            "max_bout_seconds": 480,
+            "session_notes": null,
+            "workflow_revision": 10,
+            "created_at": "2026-09-20T10:00:00.000Z",
+            "updated_at": "2026-09-20T10:17:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_bouts",
+          "entity_type": "walking_bout",
+          "entity_id": "00000000-0000-4000-8000-000000000305",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000305",
+            "walking_session_id": "00000000-0000-4000-8000-000000000302",
+            "bout_number": 3,
+            "started_at": "2026-09-20T10:20:00.000Z",
+            "ended_at": null,
+            "pain_min": null,
+            "pain_max": null,
+            "stop_reason": null,
+            "notes": null,
+            "created_at": "2026-09-20T10:17:00.000Z",
+            "updated_at": "2026-09-20T10:17:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_rests",
+          "entity_type": "walking_rest",
+          "entity_id": "00000000-0000-4000-8000-000000000308",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000308",
+            "walking_bout_id": "00000000-0000-4000-8000-000000000304",
+            "started_at": "2026-09-20T10:20:00.000Z",
+            "ended_at": "2026-09-20T10:20:00.000Z",
+            "created_at": "2026-09-20T10:16:00.000Z",
+            "updated_at": "2026-09-20T10:17:00.000Z",
+            "deleted_at": null
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "mutation_id": "00000000-0000-4000-8000-000000000412",
+      "sequence": 12,
+      "created_at": "2026-09-20T10:22:00.000Z",
+      "changes": [
+        {
+          "store": "walking_sessions",
+          "entity_type": "walking_session",
+          "entity_id": "00000000-0000-4000-8000-000000000302",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000302",
+            "status": "ACTIVE",
+            "started_at": "2026-09-20T10:00:00.000Z",
+            "completed_at": null,
+            "speed_kmh": 5,
+            "incline_pct": 2,
+            "max_bout_seconds": 480,
+            "session_notes": null,
+            "workflow_revision": 11,
+            "created_at": "2026-09-20T10:00:00.000Z",
+            "updated_at": "2026-09-20T10:22:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_bouts",
+          "entity_type": "walking_bout",
+          "entity_id": "00000000-0000-4000-8000-000000000305",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000305",
+            "walking_session_id": "00000000-0000-4000-8000-000000000302",
+            "bout_number": 3,
+            "started_at": "2026-09-20T10:20:00.000Z",
+            "ended_at": "2026-09-20T10:22:00.000Z",
+            "pain_min": null,
+            "pain_max": null,
+            "stop_reason": null,
+            "notes": null,
+            "created_at": "2026-09-20T10:17:00.000Z",
+            "updated_at": "2026-09-20T10:22:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_rests",
+          "entity_type": "walking_rest",
+          "entity_id": "00000000-0000-4000-8000-000000000309",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000309",
+            "walking_bout_id": "00000000-0000-4000-8000-000000000305",
+            "started_at": "2026-09-20T10:22:00.000Z",
+            "ended_at": null,
+            "created_at": "2026-09-20T10:22:00.000Z",
+            "updated_at": "2026-09-20T10:22:00.000Z",
+            "deleted_at": null
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "mutation_id": "00000000-0000-4000-8000-000000000413",
+      "sequence": 13,
+      "created_at": "2026-09-20T10:23:00.000Z",
+      "changes": [
+        {
+          "store": "walking_sessions",
+          "entity_type": "walking_session",
+          "entity_id": "00000000-0000-4000-8000-000000000302",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000302",
+            "status": "ACTIVE",
+            "started_at": "2026-09-20T10:00:00.000Z",
+            "completed_at": null,
+            "speed_kmh": 5,
+            "incline_pct": 2,
+            "max_bout_seconds": 480,
+            "session_notes": null,
+            "workflow_revision": 12,
+            "created_at": "2026-09-20T10:00:00.000Z",
+            "updated_at": "2026-09-20T10:23:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_bouts",
+          "entity_type": "walking_bout",
+          "entity_id": "00000000-0000-4000-8000-000000000305",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000305",
+            "walking_session_id": "00000000-0000-4000-8000-000000000302",
+            "bout_number": 2,
+            "started_at": "2026-09-20T10:20:00.000Z",
+            "ended_at": "2026-09-20T10:22:00.000Z",
+            "pain_min": null,
+            "pain_max": null,
+            "stop_reason": null,
+            "notes": null,
+            "created_at": "2026-09-20T10:17:00.000Z",
+            "updated_at": "2026-09-20T10:23:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_rests",
+          "entity_type": "walking_rest",
+          "entity_id": "00000000-0000-4000-8000-000000000308",
+          "operation": "delete",
+          "id": "00000000-0000-4000-8000-000000000308",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000308",
+            "walking_bout_id": "00000000-0000-4000-8000-000000000304",
+            "started_at": "2026-09-20T10:20:00.000Z",
+            "ended_at": "2026-09-20T10:20:00.000Z",
+            "created_at": "2026-09-20T10:16:00.000Z",
+            "updated_at": "2026-09-20T10:23:00.000Z",
+            "deleted_at": "2026-09-20T10:23:00.000Z"
+          }
+        },
+        {
+          "store": "walking_bouts",
+          "entity_type": "walking_bout",
+          "entity_id": "00000000-0000-4000-8000-000000000304",
+          "operation": "delete",
+          "id": "00000000-0000-4000-8000-000000000304",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000304",
+            "walking_session_id": "00000000-0000-4000-8000-000000000302",
+            "bout_number": 2,
+            "started_at": "2026-09-20T10:20:00.000Z",
+            "ended_at": "2026-09-20T10:20:00.000Z",
+            "pain_min": null,
+            "pain_max": null,
+            "stop_reason": null,
+            "notes": null,
+            "created_at": "2026-09-20T10:10:00.000Z",
+            "updated_at": "2026-09-20T10:23:00.000Z",
+            "deleted_at": "2026-09-20T10:23:00.000Z"
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "mutation_id": "00000000-0000-4000-8000-000000000414",
+      "sequence": 14,
+      "created_at": "2026-09-20T10:24:00.000Z",
+      "changes": [
+        {
+          "store": "walking_sessions",
+          "entity_type": "walking_session",
+          "entity_id": "00000000-0000-4000-8000-000000000302",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000302",
+            "status": "COMPLETED",
+            "started_at": "2026-09-20T10:00:00.000Z",
+            "completed_at": "2026-09-20T10:24:00.000Z",
+            "speed_kmh": 5,
+            "incline_pct": 2,
+            "max_bout_seconds": 480,
+            "session_notes": null,
+            "workflow_revision": 12,
+            "created_at": "2026-09-20T10:00:00.000Z",
+            "updated_at": "2026-09-20T10:24:00.000Z",
+            "deleted_at": null
+          }
+        },
+        {
+          "store": "walking_rests",
+          "entity_type": "walking_rest",
+          "entity_id": "00000000-0000-4000-8000-000000000309",
+          "operation": "put",
+          "record": {
+            "id": "00000000-0000-4000-8000-000000000309",
+            "walking_bout_id": "00000000-0000-4000-8000-000000000305",
+            "started_at": "2026-09-20T10:22:00.000Z",
+            "ended_at": "2026-09-20T10:24:00.000Z",
+            "created_at": "2026-09-20T10:22:00.000Z",
+            "updated_at": "2026-09-20T10:24:00.000Z",
+            "deleted_at": null
+          }
+        }
+      ]
+    }
+  ]
+}
