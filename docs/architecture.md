@@ -589,6 +589,18 @@ Django Admin is the v1 configuration surface for infrequently changed values suc
 Domain-specific details are documented in [PAD walking](pad-walking.md) and [Resistance & cardio](training.md).
 
 Synchronized workout records (PAD sessions, bouts, pauses, rests) and the
-processed-mutation ledger are shown in the admin **read-only**: every change to
-them must arrive as a device mutation, so that it is recorded in the ledger and
-reaches other devices through the changes feed.
+processed-mutation ledger are shown in the admin **read-only** in the generic
+change form: every change to them must arrive as a device mutation (or a
+dedicated engine-backed admin action, such as "Discard stuck session"), so
+that it is recorded in the ledger and reaches other devices through the
+changes feed. The same design applies to `Exercise` and `RoutineExercise`
+once they synchronize: their admin-only fields are edited normally in the
+change form, but the fields a device can also write are changed only
+through an engine-backed admin action, never the generic change form -- see
+[Data & synchronization: Server-admin configuration
+precedence](data-sync.md#server-admin-configuration-precedence) and [Server
+model and administration](data-sync.md#server-model-and-administration).
+This is the specified design; it is not implemented yet, since resistance
+and routine stores don't synchronize (see [Data & synchronization:
+Unsupported stores and
+versions](data-sync.md#unsupported-stores-and-versions)).

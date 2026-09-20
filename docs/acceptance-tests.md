@@ -110,7 +110,7 @@ waiting on.
   clock-controlled coverage of the same derivation exists (see PAD-01 below);
   it is not a substitute for this box, which is about a real locked phone.
 - [ ] Force-stop the installed PWA/browser process, reopen it, and confirm Home shows
-  `Resume PAD Walking` with the correct WALKING, PAUSED, or RESTING state.
+  `Resume PAD Walking` with the correct READY, WALKING, PAUSED, or RESTING state.
   **Runnable for WALKING; PAUSED and RESTING still blocked; not yet run.** The
   "installed," "force-stop," and "cold-start reopen while offline" mechanics
   are a concrete procedure in
@@ -141,6 +141,45 @@ These boxes record manual device work only. Automated browser and repository tes
 do not mark them complete. See the Overall v1 continuity criterion at the end of
 this document for the acceptance-level statement these checks, PAD-02, and
 `docs/device-smoke-tests.md` all serve.
+
+## Home screen and session cardinality
+
+See [Product overview: Active-session cardinality and Home Resume
+cards](product-overview.md#active-session-cardinality-and-home-resume-cards)
+for the settled combination table this section exercises.
+
+### HOME-01 — Resume cards per combination of active types
+
+For each combination of active session types (PAD, resistance, cardio — all
+eight subsets, including none), seed the corresponding `ACTIVE` sessions
+through the local repository and load Home.
+
+Expected, per the product-overview table:
+
+- Home shows exactly one Resume card per active type, always ordered PAD,
+  then resistance, then cardio when more than one is active.
+- `START NEW` is offered only for types that are *not* currently active.
+
+This extends LOCAL-05 (concurrent connections enforcing at most one
+same-type `ACTIVE` session) and LOCAL-07 (Home reads Resume cards back from
+IndexedDB after a reload) to every combination, not just the single- and
+all-active cases those already cover.
+
+### HOME-02 — Starting an already-active type is blocked
+
+With a PAD session `ACTIVE`, attempt `START NEW` for PAD from Home.
+
+Expected: the PAD start action is not offered; its Resume card is the only
+PAD action available, and it must be used to resume, finish, or discard the
+existing session before another PAD session can start (and similarly for
+resistance and cardio). Starting resistance or cardio from the same screen
+remains unaffected.
+
+Target behaviour; the Home start gating is not implemented yet.
+`frontend/src/pages/HomePage.tsx` always links to PAD, resistance, and
+cardio regardless of which types are already active (per its own comment,
+this becomes "Start new" gating once those screens can actually start a
+session), so this test cannot pass against the app as it stands today.
 
 ## PAD
 
@@ -337,6 +376,80 @@ After a working weight is established, request a progression suggestion.
 
 Expected: the calculation uses `current_working_weight_kg` and muscle-group progression percentage, not `estimated_1rm_kg`.
 
+### LOAD-04 — Assessment input validation
+
+See [Resistance & cardio: Assessment input
+validation](training.md#assessment-input-validation).
+
+Boundary values for assessment repetitions:
+
+| Input | Expected |
+| --- | --- |
+| 0 | refused, nothing stored |
+| 1 | accepted |
+| 12 | accepted |
+| 13 | refused, plain message, nothing stored |
+| 10.5 | refused, nothing stored |
+| empty or non-numeric | refused, nothing stored |
+
+Boundary values for assessment weight (kg):
+
+| Input | Expected |
+| --- | --- |
+| 0 | refused (must be > 0), nothing stored |
+| 0.5 | accepted |
+| 500 | accepted |
+| 500.5 | refused (must be <= 500), nothing stored |
+| 50.25 | refused (not a 0.5 kg step), nothing stored |
+
+Expected rounding: `50 kg` × `10 reps` → `estimated_1rm_kg = 66.7` (one
+decimal place; see the worked example in training.md). At `estimated_1rm_kg
+= 66.7`, the 65% preview asserts `43.4` (`66.7 × 0.65 = 43.355`, rounded
+half up to one decimal; see [Resistance & cardio: Starting-load
+preview](training.md#starting-load-preview)).
+
+## Server-admin configuration precedence
+
+See [Data & synchronization: Server-admin configuration
+precedence](data-sync.md#server-admin-configuration-precedence). These run
+once the `exercise_registry` and `routine_exercises` stores sync; until then
+those mutations stay queued (`retry`).
+
+### ADMIN-01 — Device commit after admin edit wins
+
+1. An administrator sets `Exercise.current_working_weight_kg` in Django Admin.
+2. A device, offline since before that edit, later completes the same
+   exercise row and its queued mutation reaches the server after the admin's
+   edit.
+
+Expected: the device's value is the one stored on the server (the later
+commit wins); the admin's earlier edit is not silently reapplied or merged.
+
+### ADMIN-02 — Admin edit after device commit wins
+
+1. A device's mutation changing `RoutineExercise` targets (`SAVE TO ROUTINE`)
+   reaches the server first.
+2. An administrator then edits the same `RoutineExercise` field in Django
+   Admin.
+
+Expected: the admin's value is stored; the device's earlier committed value
+is replaced, and the device receives the admin's value through the changes
+feed.
+
+### ADMIN-03 — Snapshot and history immutability
+
+1. Start a resistance session (its `ResistanceSessionExercise` rows snapshot
+   the routine's target weight/sets/reps at that moment).
+2. While the session is `ACTIVE`, an administrator edits the source
+   `Exercise` or `RoutineExercise`.
+3. Complete the session.
+
+Expected: the already-taken `ResistanceSessionExercise` snapshot and the
+finished historical session are unchanged by the admin edit; only the next
+session copied from the routine reflects it. Pending session edits already
+sitting in the device's outbox are never dropped or rewritten by a bootstrap
+refresh of cached reference data.
+
 ## Cardio
 
 ### CARDIO-01 — Machine selection
@@ -366,6 +479,17 @@ Run the production Docker Compose deployment.
 Expected: Django is reachable from `cloudflared` through `http://web:8000`, but port 8000 is not published directly to the VPS host.
 
 ### AUTH-01 — Unauthenticated access and offline continuation
+
+Covers the settled state machine in [Data & synchronization: Authentication
+and offline continuation](data-sync.md#authentication-and-offline-continuation)
+(confirmed 2026-09-19), local-data retention, and the always-authenticated
+rule for server access. Cases (a)–(c) below cover unauthenticated and
+offline access to the API and to local data. The remaining two lifecycle
+cases from that section's summary table — explicit logout and
+different-user protection — are covered by automated tests in
+`frontend/src/auth/AuthProvider.test.tsx` (the `AuthProvider logout` and
+`AuthProvider account-mismatch (finding #2)` describe blocks) rather than
+restated here.
 
 **(a) No valid session, protected API endpoint**
 
@@ -418,7 +542,7 @@ become case (a)'s counterexample.
 After closing and reopening the app, it must correctly restore:
 
 - active-session presence;
-- current PAD walking/pause/rest state;
+- current PAD ready/walking/pause/rest state;
 - next suggested resistance routine;
 - remembered working weights;
 - pending unsynchronized mutations.

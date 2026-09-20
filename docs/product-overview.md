@@ -8,8 +8,8 @@ Gym HUD is a private, mobile-first Progressive Web Application for tracking:
 
 1. PAD walking bouts and recovery intervals.
 2. A rotating five-day resistance-training routine.
-3. Current working weights, sets, and repetitions per exercise.
-4. A one-time 10RM-based starting-load assessment.
+3. Current working weight per exercise, and target sets/reps per routine exercise.
+4. A one-time, per-exercise [Initial 10RM setup](training.md#initial-10rm-setup) (assessment weight and repetitions) that establishes the starting working load.
 5. Cardio-machine sessions such as arm crank, stationary bike, step climber, or rowing machine.
 6. Historical sessions and incomplete exercises.
 
@@ -67,6 +67,18 @@ Workout Session Snapshot
 
 See [Resistance & cardio](training.md) for routine snapshot behaviour.
 
+### Authenticated, offline-tolerant
+
+Server access always requires an authenticated Django session; there is no
+anonymous or public access to workout data. A device that has signed in
+before still opens its local data and lets the user keep working while
+offline or while the server session cannot be reached, without losing
+unsynchronized work. **Settled 2026-09-19**: see [Data & synchronization:
+Authentication and offline
+continuation](data-sync.md#authentication-and-offline-continuation) for the
+full state machine (first login, offline reopen, session expiry, explicit
+logout, and different-user protection).
+
 ## Main application domains
 
 V1 contains five domains:
@@ -87,7 +99,10 @@ This allows multiple sessions on the same date without forcing them into a paren
 
 The home screen prioritizes resumable work.
 
-If an active session exists, expose a clear `RESUME` action with a compact state summary, for example:
+If one or more active sessions exist, expose a clear `RESUME` action for
+each active type (up to three; see [Active-session
+cardinality](#active-session-cardinality-and-home-resume-cards)) with a
+compact state summary, for example:
 
 ```text
 RESUME
@@ -126,11 +141,40 @@ Suggested resistance:
 [ HISTORY ]
 ```
 
-The local persistence baseline permits at most one active PAD session, one active
-resistance session, and one active cardio session. Different types may run at the
-same time, so Home can show up to three Resume cards. Starting another session of
-an already-active type requires the existing session to be resumed or ended first.
-This local rule is provisional pending the backend contract in issue #13.
+### Active-session cardinality and Home Resume cards
+
+**Settled 2026-09-19.** At most one `ACTIVE` session per type: PAD, resistance,
+cardio. Different types may run at the same time, so Home can show up to three
+Resume cards at once, always in this fixed order when more than one is active:
+**PAD, then resistance, then cardio** (the order the three domains are listed
+throughout this document). Starting a new session of a type that already has an
+active one requires resuming or finishing/discarding the existing one first;
+this holds regardless of how many *other* types are also active.
+
+| Active types | Home Resume cards (in order) | Allowed `START NEW` actions |
+| --- | --- | --- |
+| none | none | PAD, resistance, cardio |
+| PAD | PAD | resistance, cardio |
+| resistance | resistance | PAD, cardio |
+| cardio | cardio | PAD, resistance |
+| PAD + resistance | PAD, resistance | cardio |
+| PAD + cardio | PAD, cardio | resistance |
+| resistance + cardio | resistance, cardio | PAD |
+| PAD + resistance + cardio | PAD, resistance, cardio | none |
+
+This is a local persistence rule (enforced per session-type store, per
+device; see [Data & synchronization: Active-session
+recovery](data-sync.md#active-session-recovery)). Because it is per device,
+an offline cross-device start can briefly leave two same-type `ACTIVE`
+sessions until synchronization reaches the server and supersedes one (PAD
+today; see [Data & synchronization: Stuck ACTIVE
+sessions](data-sync.md#stuck-active-sessions)) -- draining the outbox is
+issue #20. The server enforces the same one-`ACTIVE`-per-type rule for PAD
+today, as a database constraint, resolving a stuck one the same way;
+resistance and cardio mutations are answered `retry` until the server
+supports those stores (see [Data & synchronization: Unsupported stores and
+versions](data-sync.md#unsupported-stores-and-versions)); their server-side
+rule is specified when those stores ship.
 
 ## V1 non-goals
 
@@ -173,9 +217,9 @@ or
 → Finish PAD session
 
 → Open suggested resistance day
-→ See exercises, weights and targets
+→ See exercises, weights, and target sets/reps
 → Check exercises off
-→ Adjust weight / sets / repetitions when needed
+→ Adjust weight / target sets / target reps when needed
 → Optionally save structural changes to routine
 → Finish resistance session
 
@@ -185,8 +229,8 @@ or
 
 On next launch, the application must know:
 
-- whether a session is still active;
-- the current PAD bout/rest state;
+- whether a session is still active, per type (see [Active-session cardinality](#active-session-cardinality-and-home-resume-cards));
+- the current PAD state (`READY`, `WALKING`, `PAUSED`, or `RESTING`; see [PAD walking: state machine](pad-walking.md#state-machine));
 - the next suggested resistance routine;
 - remembered working weights;
 - pending unsynchronized changes.

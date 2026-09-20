@@ -62,9 +62,10 @@ type checking, ESLint (including accessibility rules), Vitest, and a production 
 Workout actions are written to IndexedDB together with one pending synchronization
 envelope in a single transaction. The UI reports success only after that transaction
 completes, and reload recovery reads persisted records and the pending queue back
-from IndexedDB. The versioned local envelope is provisional while the backend sync
-contract in issue #13 remains open. See [Data & synchronization](docs/data-sync.md)
-for the record, ordering, retry, and active-session rules.
+from IndexedDB. The envelope format is settled; see [Data & synchronization:
+Server synchronization
+protocol](docs/data-sync.md#server-synchronization-protocol) for the record,
+ordering, retry, and active-session rules.
 
 ## Backend quick start
 

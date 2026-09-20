@@ -9,7 +9,7 @@ This directory contains the v0.1 functional and technical specification for Gym 
 - [Resistance & cardio](training.md) — five-day resistance rotation, exercise setup, load assessment/progression, and generic cardio-machine sessions.
 - [Architecture & deployment](architecture.md) — frontend/backend stack, Django authentication, Docker, Cloudflare Tunnel, Neon PostgreSQL, and production layout.
 - [Data & synchronization](data-sync.md) — entity summary, IndexedDB, mutation outbox, offline behaviour, conflict rules, history, and backups.
-- [Acceptance criteria](acceptance-tests.md) — critical behavioural tests for PAD, resistance training, cardio, authentication, deployment, and offline recovery.
+- [Acceptance criteria](acceptance-tests.md) — critical behavioural tests for PAD, resistance training, cardio, authentication, deployment, offline recovery, Home screen session cardinality, and server-admin configuration precedence.
 - [Device smoke tests](device-smoke-tests.md) — real-device evidence log for the Android PWA: installation and offline reopen (issue #17), and the PAD-01/PAD-02 walking-recovery procedure (issue #18).
 
 ## Reading order
