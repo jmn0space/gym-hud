@@ -37,10 +37,12 @@ This procedure has two parts.
     the correct state". Pause and finish-bout controls are the deferred
     pause/rest/pain/completion story, so the UI cannot produce those states
     yet. Only WALKING can be exercised on a device today;
-  - confirming cached reference data survives an offline reopen, which needs
-    something to have written that cache — the backend synchronization
-    contract (issue #13); there is no sync engine yet (see [Data &
-    synchronization: sync gate](data-sync.md#sync-gate)).
+  - confirming cached reference data survives an offline reopen. The client
+    sync engine (issue #20) now writes `pad_defaults`/`pad_next_session_settings`
+    to `reference_data` on every successful pull (see [Data & synchronization:
+    client obligations](data-sync.md#client-obligations)), but nothing in the
+    UI reads them back yet, so there is still no on-device way to confirm this
+    end to end.
 
   Re-run the blocked items once their blocking issue ships.
 

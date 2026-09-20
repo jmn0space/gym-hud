@@ -15,6 +15,7 @@ export {
   DATABASE_VERSION,
   DEFAULT_DATABASE_NAME,
   OUTBOX_SEQUENCE_INDEX,
+  SYNC_CURSOR_KEY,
 } from "./schema";
 export { DOMAIN_STORES } from "./types";
 export type {
@@ -34,7 +35,10 @@ export type {
   OutboxEntry,
   OutboxOwner,
   OutboxPutChange,
+  OutboxRejection,
   PutDomainChange,
   RecordPrecondition,
   RecoverySnapshot,
+  RejectedOutboxEntry,
+  ServerChangeRecord,
 } from "./types";

@@ -214,6 +214,21 @@ caller synchronization metadata cannot overwrite those values. `active_markers`
 is described below. These three stores are repository internals rather than
 domain data exposed to the UI.
 
+**Since issue #20**, `outbox` rows may also carry a `rejection` field
+(`{code, detail, rejectedAt}`), written by `markOutboxRejected` when the
+server permanently refuses a mutation (see [Client
+obligations](#client-obligations)). The row and its domain data are never
+deleted -- only `acknowledgeOutbox` removes an outbox row, for a confirmed
+`applied`/`duplicate`. `listPendingOutbox()` and `readSnapshot()`'s
+`pendingOutbox` field both **exclude** rejected rows: they are never retried,
+so leaving them in the drain queue would block every entry behind them
+forever, and -- because `hasLiveWork` in `pwa/updateSafety.ts` treats a
+non-empty pending outbox as live work -- would also wedge service-worker
+updates permanently. `listRejectedOutbox()` is the needs-attention view the
+sync engine's UI reads instead. `sync_metadata` additionally holds the changes-
+feed cursor under `SYNC_CURSOR_KEY`, written atomically with each page's
+records by `applyServerRecords`.
+
 ### Indexes
 
 `outbox` has a unique `by_sequence` index for ordered replay. Since v3, these
@@ -304,14 +319,23 @@ Attempt synchronization:
 4. when connectivity returns;
 5. optionally through service-worker background synchronization.
 
-The application must never depend on step 5.
+The application must never depend on step 5, and does not implement it:
+`frontend/src/sync/SyncProvider.tsx` drives triggers 1-4 only (owner decision,
+issue #20). Trigger 1 is a `useEffect` on `LocalDataProvider`'s own
+post-commit `pendingOutbox` length growing, not a hook into `commitAction`
+itself -- a commit must never await the network. Trigger 3 is
+`visibilitychange` (to `visible`) plus window `focus`. Trigger 4 is the
+`online` event and the sync gate (below) transitioning to true (in particular,
+authentication succeeding). Overlapping triggers coalesce into at most one
+queued follow-up drain, never a second concurrent one (see [Client
+obligations](#client-obligations)).
 
 A successfully acknowledged mutation is removed from the pending local outbox.
 Its action receipt remains durable for retry deduplication. Failed mutations remain
 queued, and permanently rejected ones are kept for attention rather than discarded
 (see [Client obligations](#client-obligations)). The acknowledgement exchange is
 defined under [Server synchronization protocol](#server-synchronization-protocol);
-the client engine that performs it is issue #20.
+the client engine that performs it is `frontend/src/sync/engine.ts` (issue #20).
 
 ## Server synchronization protocol
 
@@ -709,13 +733,16 @@ envelope `version` newer than 1 is handled the same way (`unsupported_version`).
 
 ### Client obligations
 
-Implemented by the sync engine (issue #20), not here:
+Implemented by the sync engine, `frontend/src/sync/engine.ts` (issue #20):
 
 - **One drainer per device, in ascending sequence.** Only one tab or worker at a time
   may send a device's outbox (for example under a Web Locks API lock), and it sends
   pending entries in ascending `sequence`, never skipping ahead of one still queued.
   The server relies on this for the same-device staleness rule and does not enforce
-  it; it only logs a lapse.
+  it; it only logs a lapse. Implemented with `navigator.locks.request("gym-hud-sync",
+  ...)` when available, an in-process promise chain otherwise (jsdom, older
+  browsers); overlapping triggers coalesce into at most one queued follow-up
+  drain rather than a second concurrent one.
 - On `applied` or `duplicate`, acknowledge the outbox entry (the action receipt
   stays).
 - On `retry` (including `server_error`), keep the mutation and every later one
@@ -726,9 +753,15 @@ Implemented by the sync engine (issue #20), not here:
   user's workout data did not reach the server, and the user (or the owner, through
   the ledger's `detail` in Django Admin) has to decide what happens next. Resending
   the same mutation always returns the same rejection; a corrected version is a new
-  mutation with a new `mutation_id`.
+  mutation with a new `mutation_id`. `markOutboxRejected` (see [IndexedDB
+  stores](#indexeddb-stores)) records it locally; the app shell's
+  needs-attention banner (`SyncRejectionBanner`) surfaces it.
 - On a request-level error, a network failure or a lost response, keep everything
-  queued and resend later; duplicates are answered `duplicate`.
+  queued and resend later with bounded exponential backoff (jittered, ~5s initial,
+  capped ~5 minutes, reset by any successful drain or an explicit "Sync now");
+  duplicates are answered `duplicate`. A `401` specifically stops the drain and
+  leaves it paused -- `apiFetch` has already flipped auth to `expired` -- with
+  nothing acknowledged.
 - **Apply changes-feed records as server-authoritative**, without the local parent
   and precondition checks an action goes through (or buffer them until the whole
   feed is read): a parent can arrive on a later page than its child. The server may
@@ -737,11 +770,19 @@ Implemented by the sync engine (issue #20), not here:
   Exception: for a record with a pending outbox mutation, this does not
   replace that record's device-writable fields (see [Server-admin
   configuration precedence](#server-admin-configuration-precedence)) -- the
-  pending mutation commits later and wins.
+  pending mutation commits later and wins, **except** a server-side closure
+  (a tombstone, a session closed by supersede/admin-discard, a child closed
+  because its parent closed) it must not lose, so `active_markers` stays
+  consistent with what the feed writes. Implemented by
+  `applyServerClosureOnly` in `frontend/src/storage/repository.ts`.
 - **Merge, do not overwrite, local-only fields.** A feed record carries exactly the
   fields the server models (see [Pull: changes feed](#pull-changes-feed)); fields a
   device keeps locally beyond those must be carried forward when it stores the
   record, not dropped.
+- **Drain before pull.** A pull (bootstrap and the changes feed) is only
+  attempted once the drain has genuinely reached the server for this cycle
+  (fully drained, or stopped on a `rejected`/`retry` result) -- never after a
+  request-level failure, which skips the pull entirely and backs off instead.
 
 ### Pull: bootstrap
 
@@ -1055,10 +1096,11 @@ Behavior by scenario:
 
 ### Sync gate
 
-There is no client sync engine yet (issue #20; the server side of the protocol
-exists, see [Server synchronization protocol](#server-synchronization-protocol)).
-The frontend exposes one gate that engine must consult before attempting network
-synchronization:
+The client sync engine, `frontend/src/sync/engine.ts` (issue #20), consults
+one gate (`frontend/src/auth/syncGate.ts`) before attempting network
+synchronization, every time it checks -- at the start of a drain, again before
+a pull, and again before each page of the changes feed -- never a value
+captured once:
 
 ```text
 canSync(authStatus, online) := authStatus == "authenticated" AND online

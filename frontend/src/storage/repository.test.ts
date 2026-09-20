@@ -12,6 +12,7 @@ import {
   type LocalRepository,
   PreconditionFailedError,
   StorageQuotaExceededError,
+  SYNC_CURSOR_KEY,
 } from "./index";
 
 const openRepositories: LocalRepository[] = [];
@@ -1360,5 +1361,263 @@ describe("LocalRepository active-marker self-healing", () => {
         ],
       }),
     ).resolves.toMatchObject({ sequence: 2 });
+  });
+});
+
+describe("LocalRepository sync-engine support (issue #20)", () => {
+  it("creates a client id on first call, persists it, and never changes it", async () => {
+    let calls = 0;
+    const repo = repository(new IDBFactory(), { uuid: () => `generated-${(calls++).toString()}` });
+
+    const first = await repo.getClientId();
+    const second = await repo.getClientId();
+    expect(first).toBe("generated-0");
+    expect(second).toBe(first);
+
+    // A commit's own client-id bootstrap (see `commitAction`) must see the
+    // same value `getClientId` already created, not mint a second one.
+    await repo.commitAction({
+      actionId: "after-get-client-id",
+      changes: [{ store: "exercise_registry", operation: "put", record: { id: "ex-1" } }],
+    });
+    await expect(repo.getClientId()).resolves.toBe(first);
+  });
+
+  it("commitAction's own client-id bootstrap is seen by a later getClientId call", async () => {
+    let calls = 0;
+    const repo = repository(new IDBFactory(), { uuid: () => `generated-${(calls++).toString()}` });
+
+    await repo.commitAction({
+      actionId: "creates-client-id",
+      changes: [{ store: "exercise_registry", operation: "put", record: { id: "ex-1" } }],
+    });
+    await expect(repo.getClientId()).resolves.toBe("generated-0");
+    await expect(repo.getClientId()).resolves.toBe("generated-0");
+  });
+
+  it("markOutboxRejected excludes the entry from listPendingOutbox and readSnapshot, without removing it", async () => {
+    const repo = repository(new IDBFactory());
+    await repo.commitAction({
+      actionId: "mutation-a",
+      changes: [{ store: "exercise_registry", operation: "put", record: { id: "ex-a" } }],
+    });
+    await repo.commitAction({
+      actionId: "mutation-b",
+      changes: [{ store: "exercise_registry", operation: "put", record: { id: "ex-b" } }],
+    });
+
+    const rejection = { code: "invalid_record", detail: "ex-a is unusable", rejectedAt: "2026-09-20T00:00:00.000Z" };
+    await repo.markOutboxRejected("mutation-a", rejection);
+
+    await expect(repo.listPendingOutbox()).resolves.toEqual([
+      expect.objectContaining({ mutation_id: "mutation-b" }),
+    ]);
+    const snapshot = await repo.readSnapshot();
+    expect(snapshot.pendingOutbox).toEqual([expect.objectContaining({ mutation_id: "mutation-b" })]);
+
+    const rejected = await repo.listRejectedOutbox();
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toMatchObject({ mutation_id: "mutation-a", rejection });
+    // The domain data itself is untouched -- a rejection never deletes anything.
+    await expect(repo.getRecord("exercise_registry", "ex-a")).resolves.toMatchObject({ id: "ex-a" });
+  });
+
+  it("markOutboxRejected is a no-op once the entry is already acknowledged", async () => {
+    const repo = repository(new IDBFactory());
+    await repo.commitAction({
+      actionId: "mutation-a",
+      changes: [{ store: "exercise_registry", operation: "put", record: { id: "ex-a" } }],
+    });
+    await repo.acknowledgeOutbox("mutation-a");
+
+    await expect(
+      repo.markOutboxRejected("mutation-a", { code: "invalid_record", detail: "late", rejectedAt: "2026-09-20T00:00:00.000Z" }),
+    ).resolves.toBeUndefined();
+    await expect(repo.listRejectedOutbox()).resolves.toEqual([]);
+  });
+
+  it("rejected and unacknowledged outbox entries both survive closing and reopening the repository", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "outbox-restart-durability";
+    const first = repository(factory, { databaseName });
+    await first.commitAction({
+      actionId: "mutation-a",
+      changes: [{ store: "exercise_registry", operation: "put", record: { id: "ex-a" } }],
+    });
+    await first.commitAction({
+      actionId: "mutation-b",
+      changes: [{ store: "exercise_registry", operation: "put", record: { id: "ex-b" } }],
+    });
+    await first.markOutboxRejected("mutation-a", {
+      code: "invalid_record",
+      detail: "bad",
+      rejectedAt: "2026-09-20T00:00:00.000Z",
+    });
+    first.close();
+
+    const second = repository(factory, { databaseName });
+    await expect(second.listPendingOutbox()).resolves.toEqual([
+      expect.objectContaining({ mutation_id: "mutation-b" }),
+    ]);
+    await expect(second.listRejectedOutbox()).resolves.toEqual([
+      expect.objectContaining({ mutation_id: "mutation-a" }),
+    ]);
+  });
+
+  it("applyServerRecords creates a record with no local history from the feed alone", async () => {
+    const repo = repository(new IDBFactory());
+    await repo.applyServerRecords(
+      [
+        {
+          store: "walking_sessions",
+          entity_id: "session-1",
+          record: { id: "session-1", status: "COMPLETED", started_at: "2026-09-14T10:00:00.000Z", completed_at: "2026-09-14T11:00:00.000Z", created_at: "2026-09-14T10:00:00.000Z", updated_at: "2026-09-14T11:00:00.000Z", deleted_at: null },
+        },
+      ],
+      41,
+    );
+    await expect(repo.getRecord("walking_sessions", "session-1")).resolves.toMatchObject({
+      id: "session-1",
+      status: "COMPLETED",
+    });
+    await expect(repo.getSyncMetadata(SYNC_CURSOR_KEY)).resolves.toBe(41);
+  });
+
+  it("applyServerRecords merges feed fields into an existing record without dropping local-only fields", async () => {
+    const repo = repository(new IDBFactory());
+    // A field the server does not model (per docs/data-sync.md, "Pull: changes
+    // feed" the feed only carries the fields it validates) -- must survive the merge.
+    await repo.commitAction({
+      actionId: "local-only-field",
+      changes: [
+        {
+          store: "walking_bouts",
+          operation: "put",
+          record: { id: "bout-1", walking_session_id: "session-1", started_at: "2026-09-14T10:00:00.000Z", local_only_hint: "keep-me" },
+        },
+      ],
+    });
+    await repo.acknowledgeOutbox("local-only-field");
+
+    await repo.applyServerRecords(
+      [
+        {
+          store: "walking_bouts",
+          entity_id: "bout-1",
+          record: {
+            id: "bout-1",
+            walking_session_id: "session-1",
+            started_at: "2026-09-14T10:00:00.000Z",
+            ended_at: "2026-09-14T10:30:00.000Z",
+            created_at: "2026-09-14T10:00:00.000Z",
+            updated_at: "2026-09-14T10:30:00.000Z",
+            deleted_at: null,
+          },
+        },
+      ],
+      1,
+    );
+
+    await expect(repo.getRecord("walking_bouts", "bout-1")).resolves.toMatchObject({
+      ended_at: "2026-09-14T10:30:00.000Z",
+      local_only_hint: "keep-me",
+    });
+  });
+
+  it("applyServerRecords leaves a record with a pending outbox mutation alone except for a server-side closure", async () => {
+    const repo = repository(new IDBFactory());
+    await repo.commitAction({
+      actionId: "start-session",
+      changes: [
+        {
+          store: "walking_sessions",
+          operation: "put",
+          record: { id: "session-1", status: "ACTIVE", started_at: "2026-09-14T10:00:00.000Z", speed_kmh: 5 },
+        },
+      ],
+    });
+    // The mutation is still pending (never acknowledged): the feed must not
+    // clobber its device-writable fields with a stale value...
+    await repo.applyServerRecords(
+      [
+        {
+          store: "walking_sessions",
+          entity_id: "session-1",
+          record: {
+            id: "session-1",
+            status: "COMPLETED",
+            started_at: "2026-09-14T10:00:00.000Z",
+            completed_at: "2026-09-14T10:45:00.000Z",
+            speed_kmh: 999,
+            created_at: "2026-09-14T10:00:00.000Z",
+            updated_at: "2026-09-14T10:45:00.000Z",
+            deleted_at: null,
+          },
+        },
+      ],
+      1,
+    );
+
+    const record = await repo.getRecord("walking_sessions", "session-1");
+    // ...but a server-side closure (here: a supersede) must not be lost, so
+    // the device does not keep believing the session is still ACTIVE.
+    expect(record).toMatchObject({ status: "COMPLETED", completed_at: "2026-09-14T10:45:00.000Z" });
+    // The pending mutation's own field value wins over the feed's.
+    expect(record?.speed_kmh).toBe(5);
+  });
+
+  it("applyServerRecords keeps active_markers consistent so a later local commit is not falsely blocked", async () => {
+    const repo = repository(new IDBFactory());
+    await repo.commitAction({
+      actionId: "start-session",
+      changes: [
+        { store: "walking_sessions", operation: "put", record: { id: "session-1", status: "ACTIVE" } },
+      ],
+    });
+    await repo.acknowledgeOutbox("start-session");
+
+    // Another device's session superseded this one; the feed reports it closed.
+    await repo.applyServerRecords(
+      [
+        {
+          store: "walking_sessions",
+          entity_id: "session-1",
+          record: { id: "session-1", status: "COMPLETED", completed_at: "2026-09-14T10:45:00.000Z" },
+        },
+      ],
+      2,
+    );
+
+    // A new local ACTIVE session must not be rejected as a conflict against a
+    // now-stale marker still pointing at session-1.
+    await expect(
+      repo.commitAction({
+        actionId: "start-new-session",
+        preconditions: [{ store: "walking_sessions", id: "session-2", expected: null }],
+        changes: [
+          { store: "walking_sessions", operation: "put", record: { id: "session-2", status: "ACTIVE" } },
+        ],
+      }),
+    ).resolves.toBeDefined();
+  });
+
+  it("applyServerRecords rejects a non-integer or negative cursor", async () => {
+    const repo = repository(new IDBFactory());
+    await expect(repo.applyServerRecords([], -1)).rejects.toThrow();
+    await expect(repo.applyServerRecords([], 1.5)).rejects.toThrow();
+  });
+
+  it("applyServerRecords persists the cursor durably, resuming an interrupted pull after a restart", async () => {
+    const factory = new IDBFactory();
+    const databaseName = "cursor-restart-durability";
+    const first = repository(factory, { databaseName });
+    await first.applyServerRecords(
+      [{ store: "walking_sessions", entity_id: "session-1", record: { id: "session-1", status: "ACTIVE" } }],
+      7,
+    );
+    first.close();
+
+    const second = repository(factory, { databaseName });
+    await expect(second.getSyncMetadata(SYNC_CURSOR_KEY)).resolves.toBe(7);
   });
 });

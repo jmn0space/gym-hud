@@ -53,7 +53,7 @@ export function HomePage() {
           <p className="muted">
             {snapshot.pendingOutbox.length === 0
               ? "No saved changes waiting to sync."
-              : `${snapshot.pendingOutbox.length.toString()} saved ${snapshot.pendingOutbox.length === 1 ? "change" : "changes"} waiting to sync. Server sync is not available yet.`}
+              : `${snapshot.pendingOutbox.length.toString()} saved ${snapshot.pendingOutbox.length === 1 ? "change" : "changes"} waiting to sync.`}
           </p>
         </section>
       )}

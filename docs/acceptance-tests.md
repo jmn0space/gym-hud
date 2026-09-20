@@ -91,10 +91,11 @@ items below (Part B of `docs/device-smoke-tests.md` is now a runnable
 procedure). Issue #19 delivered the server side of synchronization (the push
 protocol, the processed-mutation ledger and the PAD models; see [Data &
 synchronization: server synchronization
-protocol](data-sync.md#server-synchronization-protocol)). Pause, finish-bout and
-rest controls, and the client sync engine that drains the outbox (issue #20), are
-still outstanding; each item is annotated below with exactly what it is still
-waiting on.
+protocol](data-sync.md#server-synchronization-protocol)). Issue #20 delivered the
+client sync engine that drains the outbox and pulls reference data (see [Data &
+synchronization: client obligations](data-sync.md#client-obligations)). Pause,
+finish-bout and rest controls are still outstanding; each item is annotated
+below with exactly what it is still waiting on.
 
 - [ ] Start a PAD bout while offline and confirm the saved state is visible.
   **No longer blocked; not yet run.** Issue #18 added the start-session and
@@ -130,12 +131,12 @@ waiting on.
   still needs the deferred finish-bout control.
 - [ ] Restore connectivity and confirm a failed synchronization attempt remains
   pending for retry.
-  **Blocked on the client sync engine (issue #20)**: the server protocol exists
-  since issue #19, and its retryable outcomes are defined (see [Data &
-  synchronization: push response](data-sync.md#push-response)), but nothing on
-  the device sends the outbox yet (see [Data & synchronization: sync
-  gate](data-sync.md#sync-gate)), so there is still no synchronization attempt
-  to fail or retry on a device.
+  **No longer blocked; not yet run.** The client sync engine (issue #20,
+  `frontend/src/sync/engine.ts`) now drains the outbox and retries with
+  bounded backoff; see PAD-04 below for the automated coverage of the same
+  offline-queue-then-drain behaviour and [Data & synchronization: sync
+  gate](data-sync.md#sync-gate). This box is the real-device run: a genuine
+  network toggle, not a mocked one, has not been performed.
 
 These boxes record manual device work only. Automated browser and repository tests
 do not mark them complete. See the Overall v1 continuity criterion at the end of
@@ -237,9 +238,19 @@ After PAD-03, restore connectivity.
 
 Expected: queued data synchronizes without manual re-entry.
 
-The server accepts and acknowledges queued PAD mutations since issue #19; sending
-them on reconnection is the client sync engine (issue #20), so this is not yet
-runnable.
+Automated coverage (issue #20): `"sends queued mutations in ascending sequence
+once the gate turns true (PAD-03 -> PAD-04)"` in
+`frontend/src/sync/engine.test.ts` queues mutations against a `canSync` gate
+held false, confirms nothing is sent while it is false, then flips it true and
+asserts the whole queue is sent in one batch in ascending `sequence`,
+acknowledged, and the pending outbox ends empty -- with no manual re-entry,
+against a real `createLocalRepository`. The whole path is also exercised
+end-to-end (real `fetch`, real `SyncProvider`) in `"drains a pending mutation
+through the real sync engine once authenticated and online"` in
+`frontend/src/App.test.tsx`. That covers the drain itself, not the device:
+the real airplane-mode-then-restore run is the checklist box above and Part B
+of [`docs/device-smoke-tests.md`](device-smoke-tests.md), neither of which has
+been performed.
 
 ### PAD-05 — Duplicate mutation
 
@@ -257,8 +268,20 @@ response was lost. `backend/apps/sync/tests/test_concurrency_pg.py` delivers the
 mutation from six concurrent PostgreSQL connections (one `applied`, five
 `duplicate`), races a retry against the original batch, and races two accounts on
 one `mutation_id`. The mutations are built the way the frontend repository builds
-them, but no device sends them yet: the transmit-twice-from-the-phone run needs the
-client sync engine (issue #20) and has not been performed.
+them.
+
+Automated coverage (issue #20), client side: `"resends a batch whose
+acknowledgement was lost; the resend comes back duplicate and is acknowledged
+exactly once (PAD-05)"` in `frontend/src/sync/engine.test.ts` makes the first
+push fail at the network level (an indistinguishable-from-lost-response
+failure), confirms the mutation is still queued and untouched, then lets the
+resend succeed and come back `duplicate`, asserting it is acknowledged exactly
+once and the pending outbox ends empty. Together with the server-side coverage
+above this proves "only one logical server-side event exists" end to end
+through the client's own retry path. Not verified here: the
+transmit-twice-from-the-phone real-device run (radio toggled mid-request,
+genuine duplicate delivery) — see
+[`docs/device-smoke-tests.md`](device-smoke-tests.md).
 
 ### PAD-06 — Rest integrity
 

@@ -24,13 +24,50 @@ async function primaryNav() {
   return within(await screen.findByRole("navigation", { name: "Primary" }));
 }
 
+/** A well-formed, empty bootstrap/changes pair so the sync engine settles
+ * cleanly (no pending mutations, no dangling retry timers) instead of
+ * treating this suite's unrelated `fetch` stub as a malformed response. */
 function stubAuthenticatedFetch() {
   vi.stubGlobal(
     "fetch",
-    vi.fn((input: RequestInfo | URL) => {
+    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       if (url.includes("/auth/session/")) {
         return Promise.resolve(Response.json({ authenticated: true, username: "tester" }));
+      }
+      if (url.includes("/sync/bootstrap/")) {
+        return Promise.resolve(
+          Response.json({
+            cursor: 0,
+            limits: { max_mutations_per_request: 50, max_changes_per_mutation: 500 },
+            pad: {
+              defaults: { speed_kmh: 5, incline_pct: 2, max_bout_seconds: 480 },
+              next_session_settings: {
+                source: "defaults",
+                walking_session_id: null,
+                speed_kmh: 5,
+                incline_pct: 2,
+                max_bout_seconds: 480,
+              },
+            },
+          }),
+        );
+      }
+      if (url.includes("/sync/changes/")) {
+        return Promise.resolve(Response.json({ changes: [], cursor: 0, has_more: false }));
+      }
+      if (url.includes("/sync/mutations/")) {
+        // Echoes back "applied" for whatever was actually sent, so the drain
+        // settles instead of leaving a mutation queued against this stub.
+        const body: unknown = typeof init?.body === "string" ? JSON.parse(init.body) : {};
+        const mutations = Array.isArray((body as { mutations?: unknown }).mutations)
+          ? ((body as { mutations: { mutation_id: string }[] }).mutations)
+          : [];
+        return Promise.resolve(
+          Response.json({
+            results: mutations.map((mutation) => ({ mutation_id: mutation.mutation_id, status: "applied" })),
+          }),
+        );
       }
       return Promise.resolve(Response.json({ status: "ok", database: { connected: true } }));
     }),
@@ -201,8 +238,10 @@ describe("navigation smoke test", () => {
     );
     expect(screen.getByText("Paused · Bout 1")).toBeInTheDocument();
     expect(screen.getByText("02:00")).toBeInTheDocument();
-    expect(screen.getByText("1 saved change waiting to sync. Server sync is not available yet."))
-      .toBeInTheDocument();
+    // Was "...Server sync is not available yet." before issue #20 built the
+    // client sync engine; that claim is no longer true, so the copy (and this
+    // assertion) dropped it.
+    expect(screen.getByText("1 saved change waiting to sync.")).toBeInTheDocument();
 
     view.unmount();
     repository.close();
@@ -431,6 +470,98 @@ describe("authentication gate", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent(/unsynced workouts for "juan"/);
     expect(screen.queryByRole("navigation", { name: "Primary" })).not.toBeInTheDocument();
+    repository.close();
+  });
+});
+
+describe("sync engine (issue #20)", () => {
+  it("drains a pending mutation through the real sync engine once authenticated and online", async () => {
+    const repository = createLocalRepository({
+      databaseName: `gym-hud-sync-drain-${crypto.randomUUID()}`,
+    });
+    await repository.commitAction({
+      actionId: "pending-drain",
+      changes: [{ store: "exercise_registry", operation: "put", record: { id: "exercise-1", name: "Row" } }],
+    });
+
+    const view = renderApp("/", repository);
+
+    expect(await screen.findByText("All changes synced")).toBeInTheDocument();
+    await waitFor(async () => {
+      await expect(repository.listPendingOutbox()).resolves.toEqual([]);
+    });
+
+    view.unmount();
+    repository.close();
+  });
+
+  it("shows the rejection banner when the server permanently rejects a mutation, and keeps the data on the device", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        if (url.includes("/auth/session/")) {
+          return Promise.resolve(Response.json({ authenticated: true, username: "tester" }));
+        }
+        if (url.includes("/sync/bootstrap/")) {
+          return Promise.resolve(
+            Response.json({
+              cursor: 0,
+              limits: { max_mutations_per_request: 50, max_changes_per_mutation: 500 },
+              pad: {
+                defaults: { speed_kmh: 5, incline_pct: 2, max_bout_seconds: 480 },
+                next_session_settings: {
+                  source: "defaults",
+                  walking_session_id: null,
+                  speed_kmh: 5,
+                  incline_pct: 2,
+                  max_bout_seconds: 480,
+                },
+              },
+            }),
+          );
+        }
+        if (url.includes("/sync/changes/")) {
+          return Promise.resolve(Response.json({ changes: [], cursor: 0, has_more: false }));
+        }
+        if (url.includes("/sync/mutations/")) {
+          const body: unknown = typeof init?.body === "string" ? JSON.parse(init.body) : {};
+          const mutations = Array.isArray((body as { mutations?: unknown }).mutations)
+            ? ((body as { mutations: { mutation_id: string }[] }).mutations)
+            : [];
+          return Promise.resolve(
+            Response.json({
+              results: mutations.map((mutation) => ({
+                mutation_id: mutation.mutation_id,
+                status: "rejected",
+                code: "invalid_record",
+                retryable: false,
+                detail: "exercise-1 is unusable",
+              })),
+            }),
+          );
+        }
+        return Promise.resolve(Response.json({ status: "ok", database: { connected: true } }));
+      }),
+    );
+
+    const repository = createLocalRepository({
+      databaseName: `gym-hud-sync-rejected-${crypto.randomUUID()}`,
+    });
+    await repository.commitAction({
+      actionId: "will-be-rejected",
+      changes: [{ store: "exercise_registry", operation: "put", record: { id: "exercise-1", name: "Row" } }],
+    });
+
+    const view = renderApp("/", repository);
+
+    expect(await screen.findByText(/could not be saved to your account/)).toBeInTheDocument();
+    expect(await screen.findByText("exercise-1 is unusable")).toBeInTheDocument();
+    await expect(repository.getRecord("exercise_registry", "exercise-1")).resolves.toMatchObject({
+      id: "exercise-1",
+    });
+
+    view.unmount();
     repository.close();
   });
 });
