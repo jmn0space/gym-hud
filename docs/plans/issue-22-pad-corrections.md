@@ -17,15 +17,17 @@ Source: https://github.com/jmn0space/gym-hud/issues/22
 - `detectUndoableWalkingTransition` -- a pure function of the current
   `PadSessionView` that identifies which of the five undoable transitions
   (bout started/paused/resumed/finished, rest finished / next bout started),
-  if any, is currently reversible, using only the view's own `current*`
-  fields and the domain-timestamp coupling each transition itself
-  establishes (a bout and the rest it closed share one instant; a bout and
-  the pause it force-closed on finish share one instant). Deliberately does
-  **not** use the repository's `updated_at` bookkeeping, because that
-  timestamp comes from the injected wall clock, which a test -- and in
-  principle a device with a stepped-back clock -- can hold fixed or
-  non-monotonic on purpose (see the comment in
-  `frontend/src/pad/padWorkflow.test.ts`).
+  if any, is currently reversible. It reads the explicit
+  `WalkingTransitionStamp` (`transition_kind` plus the touched record ids)
+  that `stampedWorkflowChange` writes onto the session record as part of
+  every transition, so the target is recorded rather than inferred. It
+  deliberately uses neither the repository's `updated_at` bookkeeping -- that
+  timestamp comes from the injected wall clock, which a test, or a device
+  whose clock steps back, can hold fixed or non-monotonic (see the comment in
+  `frontend/src/pad/padWorkflow.test.ts`) -- nor timestamp coupling between
+  records, which an earlier draft of this branch used and which the code
+  review found could match the wrong record outright (finding 1 under
+  "Code review fixes" below).
 - `undoLastWalkingTransitionAction` -- builds the forward compensating
   mutation for whatever `detectUndoableWalkingTransition` found: tombstone or
   reopen exactly the records the original transition touched. Undo is a new,
