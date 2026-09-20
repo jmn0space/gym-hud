@@ -478,6 +478,58 @@ describe("sync engine: backoff", () => {
 
     engine.dispose();
   });
+
+  it("does not reset the backoff when the outbox is empty but the pull keeps failing, so repeated cycles climb toward the cap (M4 completion)", async () => {
+    // The other half of M4: `drainOutbox` returns `kind: "clear"` trivially
+    // whenever nothing is queued, so resetting backoff before attempting the
+    // pull reset it on *every* cycle regardless of whether the pull itself
+    // was succeeding -- the same flat ~5s retry loop the partial-drain case
+    // above reproduces, just reached through the pull path instead of the
+    // drain path (a bootstrap + a changes request every ~5s indefinitely on
+    // a phone against a 120/min throttle).
+    const repository = repo(); // nothing committed: the outbox is empty
+
+    const fetchChanges = vi.fn(() => Promise.reject(new ApiError(0, "network", "down")));
+    const FIXED_NOW = Date.UTC(2026, 0, 1);
+    const engine = createSyncEngine({
+      repository,
+      pushMutations: () => Promise.resolve([]),
+      fetchBootstrap: () => Promise.resolve(emptyBootstrap()),
+      fetchChanges,
+      canSync: () => true,
+      random: () => 0.5,
+      clock: { now: () => FIXED_NOW },
+      initialBackoffMs: 40,
+      maxBackoffMs: 160,
+    });
+
+    function nextDelayMs(): number {
+      const nextRetryAt = engine.getSnapshot().nextRetryAt;
+      expect(nextRetryAt).not.toBeNull();
+      return Date.parse(nextRetryAt ?? "") - FIXED_NOW;
+    }
+
+    async function waitOutScheduledRetry(): Promise<void> {
+      const delay = nextDelayMs();
+      await new Promise((resolve) => setTimeout(resolve, delay + 40));
+      await flushAsync(20);
+    }
+
+    await engine.syncNow();
+    expect(engine.getSnapshot().state).toBe("retrying");
+    expect(nextDelayMs()).toBe(40);
+
+    await waitOutScheduledRetry();
+    // Before this fix, `drainOutbox` trivially returning `kind: "clear"`
+    // (nothing queued) reset the backoff before every pull attempt, so this
+    // stayed 40 forever no matter how many times the pull itself failed.
+    expect(nextDelayMs()).toBe(80);
+
+    await waitOutScheduledRetry();
+    expect(nextDelayMs()).toBe(160); // capped
+
+    engine.dispose();
+  });
 });
 
 describe("sync engine: changes feed", () => {

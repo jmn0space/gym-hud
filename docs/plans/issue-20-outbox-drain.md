@@ -301,9 +301,20 @@ lived. All were fixed except where noted below as disagreed-with.
   `runCycle` called `resetBackoff()` unconditionally before every pull,
   regardless of whether the drain actually cleared, so a blocked queue
   retried at a flat ~5s forever instead of climbing toward the cap.
-  **Fixed**: the reset is now conditional on `drain.kind === "clear"`. See
-  `frontend/src/sync/engine.ts` and the new `"does not reset the backoff on a
-  partial drain"` test in `frontend/src/sync/engine.test.ts`.
+  **Fixed**, in two passes: the first made the reset conditional on
+  `drain.kind === "clear"`, which closed the partial-drain case but left a
+  narrower sibling open -- an *empty* outbox (`drainOutbox` trivially returns
+  `kind: "clear"` when nothing is queued) whose *pull* kept failing still
+  reset the backoff every cycle before the pull ran, so a persistently
+  failing pull never actually backed off either. The completing pass moved
+  the reset to run only once the whole cycle succeeds -- `drain.kind ===
+  "clear"` *and* `pull === "success"` -- by relocating it after the pull's
+  own failure/paused checks, just before `lastSyncedAt` publishes. See
+  `frontend/src/sync/engine.ts` and the two regression tests in
+  `frontend/src/sync/engine.test.ts` (`"does not reset the backoff on a
+  partial drain..."` and `"does not reset the backoff when the outbox is
+  empty but the pull keeps failing..."`); both were verified to fail against
+  their respective pre-fix code and pass after.
 
 **Minors (M5-M9) and hardening**, all applied: `dispose()` now sets a
 `disposed` flag checked at the top of `runCycle` and inside `scheduleRetry`

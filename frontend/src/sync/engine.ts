@@ -420,17 +420,6 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       // succeeded), so a pull is safe: drain before pull, and a record with a
       // still-pending mutation is protected inside `applyServerRecords`
       // (docs/data-sync.md, "Conflict strategy").
-      //
-      // Backoff resets only on a *genuinely* successful drain (`kind ===
-      // "clear"`: nothing left blocked), not on `partial` (a `retry` ack
-      // stopped the batch, or an unsupported_store/unsupported_version
-      // deferral): resetting unconditionally here made the delay always
-      // `initialBackoffMs` on the blocked path -- a push + a bootstrap + a
-      // changes request every ~5s indefinitely instead of climbing toward the
-      // cap (docs/data-sync.md, "reset by any successful drain").
-      if (drain.kind === "clear") {
-        resetBackoff();
-      }
       clearScheduledRetry();
 
       const pull = await pullChanges();
@@ -445,6 +434,29 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
         return;
       }
 
+      // Backoff resets only when the *whole cycle* succeeded -- the drain
+      // genuinely cleared (`kind === "clear"`, nothing left blocked) *and*
+      // the pull that followed it succeeded -- never merely because this
+      // particular attempt reached the server. Two failure modes share this
+      // guard:
+      //  - `drain.kind === "partial"` (a `retry` ack stopped the batch, or an
+      //    unsupported_store/unsupported_version deferral): resetting here
+      //    unconditionally made the delay always `initialBackoffMs` on the
+      //    blocked path -- a push + a bootstrap + a changes request every
+      //    ~5s indefinitely instead of climbing toward the cap (the
+      //    original M4 finding).
+      //  - An empty outbox with a *failing* pull: `drainOutbox` returns
+      //    `kind: "clear"` trivially when there is nothing queued, so
+      //    resetting backoff before attempting the pull (the position this
+      //    used to run in) reset it on every cycle regardless of whether the
+      //    pull itself was succeeding -- the same flat ~5s retry loop, just
+      //    reached through the pull path instead of the drain path. Placing
+      //    the reset after a successful pull, on the success path only,
+      //    closes both at once (docs/data-sync.md, "reset by any successful
+      //    drain").
+      if (drain.kind === "clear") {
+        resetBackoff();
+      }
       publish({ lastSyncedAt: nowIso(clock.now()) });
 
       if (drain.kind === "partial") {

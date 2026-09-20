@@ -779,14 +779,17 @@ Implemented by the sync engine, `frontend/src/sync/engine.ts` (issue #20):
   needs-attention banner (`SyncRejectionBanner`) surfaces it.
 - On a request-level error, a network failure or a lost response, keep everything
   queued and resend later with bounded exponential backoff (jittered, ~5s initial,
-  capped ~5 minutes). The backoff resets only when a drain reaches the server
-  and finds nothing left blocked -- the whole outbox cleared, not merely
-  stopped partway on a `retry`/`unsupported_store` result -- or on an explicit
-  "Sync now"; a drain that stops partway keeps climbing toward the cap on
-  each subsequent blocked cycle instead of retrying at the initial delay
-  forever (issue #20's review, finding M4, fixed a bug where the delay reset
-  unconditionally before every pull regardless of whether anything was still
-  blocked). Duplicates are answered `duplicate`. A `401` specifically stops
+  capped ~5 minutes). The backoff resets only when the whole cycle succeeds --
+  the drain reaches the server and finds nothing left blocked (the whole
+  outbox cleared, not merely stopped partway on a `retry`/`unsupported_store`
+  result) *and* the pull that follows it succeeds -- or on an explicit "Sync
+  now". Either half failing keeps climbing toward the cap on each subsequent
+  cycle instead of retrying at the initial delay forever: a drain that stops
+  partway (issue #20's review, finding M4), and, separately, an empty outbox
+  whose pull itself keeps failing (the same finding's completion -- an empty
+  outbox trivially "clears", so resetting on that alone masked a failing pull
+  retrying at the initial delay forever too). Duplicates are answered
+  `duplicate`. A `401` specifically stops
   the drain and leaves it paused -- `apiFetch` has already flipped auth to
   `expired` -- with nothing acknowledged.
 - **Apply changes-feed records as server-authoritative**, without the local parent
