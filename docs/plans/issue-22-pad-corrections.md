@@ -203,29 +203,20 @@ unrelated to this issue); `manage.py check` clean.
   fake-indexeddb (frontend) or Django's test client (backend); none of it
   exercises a real IndexedDB implementation, a real touch screen, or a real
   network. See the device procedure below.
-- **Pause time correction has no dedicated UI control.** The HUD does not
-  currently list a bout's individual pauses anywhere (only the bout's own
-  and its rest's start/end are shown), so there is nothing in the UI to tap
-  to reveal a pause-time editor. `correctWalkingPauseTimesAction` and its
-  validation refusals are fully implemented and unit-tested
-  (`padCorrections.test.ts`), ready for a future pause-list UI; this is a
-  scope interpretation, not an omission of the action layer.
-- **Undo does not chain arbitrarily.** `detectUndoableWalkingTransition` is
-  purely a function of the current persisted state, so undoing "bout
-  resumed" leaves a state that structurally matches "bout paused" and a
-  second undo is offered for it (reopening the bout further); this is a
-  deliberate, tested consequence of deriving undo from records rather than a
-  stack (see `padCorrections.test.ts`), not a general "undo history" feature.
-  There is no redo.
-- **Two corrections that coincidentally land two different rests' `ended_at`
-  on the exact same instant as a bout's `started_at`** could make
-  `detectUndoableWalkingTransition` couple the wrong one. This requires two
-  separate, deliberate corrections to construct and is not reachable through
-  normal use (a rest's `ended_at` is otherwise only ever set once, by
-  `START NEXT BOUT`, always paired with the bout it opens); documented here
-  rather than guarded against, given how narrow and inconsequential a
-  misfire would be (the compensating action's own preconditions still catch
-  a genuinely stale target).
+- **Undo does not chain.** Undoing one transition always clears the
+  transition stamp (see "Code review fixes" below), even when the resulting
+  state happens to look structurally like an earlier one (undoing "bout
+  resumed" leaves the bout PAUSED, for instance) -- a second Undo is not
+  offered for it. This is a deliberate simplification made during the code
+  review fix below, not an oversight: reconstructing "the transition before
+  the one just undone" would need the same kind of guessing among sibling
+  records that finding 1 removed from detection in the first place. There is
+  no redo.
+- **Concurrent-device races on a correction/undo/delete** beyond what the
+  existing generic `_is_stale`/tombstone-revive/cascade-delete server tests
+  already cover (this issue added no new server code, so no new race
+  surface). Issue #13's "Android phone is the primary workout-entry device"
+  scoping (see `docs/data-sync.md`, "Conflict strategy") still applies.
 - **Concurrent-device races on a correction/undo/delete** beyond what the
   existing generic `_is_stale`/tombstone-revive/cascade-delete server tests
   already cover (this issue added no new server code, so no new race
@@ -276,3 +267,116 @@ observed server mutation responses -- in the same style as
 
 This is a concrete, runnable procedure once a device is available; no part of
 it is blocked on further implementation work.
+
+## Code review fixes (2026-09-20)
+
+A rigorous review of the branch above found one blocker and eight further
+findings. All nine are fixed on `claude/issue-22-pad-corrections`, on top of
+the three commits this plan otherwise describes.
+
+1. **BLOCKER -- undo could reopen the wrong rest/pause under a clock-step
+   collision.** `detectUndoableWalkingTransition` (`frontend/src/pad/actions.ts`)
+   used to infer its target by matching timestamps -- "the rest whose
+   `ended_at` equals this bout's `started_at`" -- which `Array#find` resolves
+   against whichever record comes first in storage order when two records
+   share that instant (reachable in normal operation, since `monotonicNow`
+   deliberately collapses recorded time whenever the device clock steps
+   back). Fixed by stamping the transition explicitly: every one of the five
+   undoable transitions now writes its own kind plus the bout/pause/rest ids
+   it touched onto the session record (`transition_kind`,
+   `transition_bout_id`, `transition_pause_id`, `transition_rest_id` --
+   ordinary fields the server does not model, ignored rather than rejected,
+   same as `workflow_revision`), in the same write `workflowChange` already
+   makes on every transition. Undo reads that stamp instead of guessing.
+   `assertContainedWalkingSession` -- previously only called from the three
+   `correct*` builders -- is now also called from `undoLastWalkingTransitionAction`
+   and `deleteWalkingBoutAction`, against the hypothetical resulting state,
+   so even a stamp that no longer matches what is actually open is refused
+   rather than committed (this is also finding 2's fix). A legacy/absent
+   stamp (a session predating this field) makes undo unavailable rather than
+   guessed at, the same pattern `workflowPrecondition` already uses for an
+   absent `workflow_revision`. Undo no longer chains (see "What is
+   explicitly NOT proven" above) -- a deliberate simplification, since
+   reconstructing a second level of undo would need the same guessing this
+   fix removed. Regression tests reproducing the reviewer's exact clock-step
+   scenario, and the analogous resumed-pause collision, are in
+   `frontend/src/pad/padCorrections.test.ts`
+   ("PAD undo targets the stamped record, not a same-instant collision
+   (issue #22 finding 1)").
+2. **`docs/data-sync.md`'s validation claim.** Corrected to state that undo
+   and delete are validated too (see finding 1); see the "Correction (issue
+   #22, finding 2)" note at that paragraph.
+3. **Milliseconds silently dropped by the time editor.** `RecordedTimeField`
+   (`frontend/src/pages/PadPage.tsx`) now compares and gates Save at
+   whole-second resolution (`toWholeSeconds`) rather than exact-instant
+   equality, and sends the original stored value back verbatim -- preserving
+   its milliseconds -- whenever the edited second matches the stored one, so
+   a save-without-editing can no longer move a stored instant or make Undo
+   silently disappear. `isoToLocalInputValue`'s JSDoc no longer claims an
+   exact round trip. Test: "does not lose recorded milliseconds on a
+   save-without-editing" in `frontend/src/pages/PadPage.test.tsx`.
+4. **Pause correction had no UI.** `CompletedBout`'s "Edit times" disclosure
+   now lists every one of the bout's own pauses, individually labelled
+   ("Pause 1 of bout 2", "Pause 2 of bout 2", ...) via the new
+   `FragmentPauseTimes` component, wired to `correctWalkingPauseTimesAction`
+   through a new `correctPauseTimes` handler in `PadPage`. Test: "shows and
+   corrects each of a bout's own pauses in its Edit times disclosure".
+5. **The running bout's own start was not correctable until it finished.**
+   The currently open bout now gets its own compact "Edit times" disclosure
+   (`OpenBoutTimes`, `started_at` only, since it has no `ended_at` yet),
+   alongside every finished bout's. `docs/pad-walking.md`'s claim that
+   `started_at` "may be corrected at any time, open or closed" is now true
+   without qualification. Test: "lets the running bout's own start be
+   corrected before it finishes".
+6. **`stop_reason` was not re-derived after a bout-end correction.**
+   `correctWalkingBoutTimesAction` now re-runs `inferWalkingStopReason`
+   against the corrected end whenever the stored reason still exactly
+   matches what inference would have produced for the *original* end --
+   never a reason that does not match (a deliberate, explicitly documented
+   inability to distinguish a user pick that coincidentally matches the
+   inferred value from a genuinely-still-inferred one; see
+   `docs/pad-walking.md`, "Corrections"). Tests: "re-derives an inferred
+   MAX_DURATION stop reason..." and "never overwrites a stop reason the user
+   chose explicitly...".
+7. **Delete renumbered from parsed bouts but deleted children from raw
+   rows.** `deleteWalkingBoutAction` now sweeps raw `walking_bouts` rows
+   (filtered by `walking_session_id`, sorted by the same tolerant
+   started-at-or-created-at key the parser itself falls back to) for the
+   renumbering, matching the raw-row-careful pattern
+   `closeWalkingSessionAction` already used, so a sibling row the tolerant
+   parser dropped can no longer collide with a survivor's new
+   `bout_number`. Test: "renumbers from raw bout rows...".
+8. **"After synchronization" coverage stopped at `acknowledgeOutbox`.** A
+   new test in `padCorrections.test.ts` ("corrects, undoes and deletes
+   against records that have round-tripped through applyServerRecords")
+   drives a correction, an undo and a delete against records that have
+   actually been through `repo.applyServerRecords`, not merely an
+   acknowledged outbox.
+9. **The undo confirmation did not name what it would undo.** It now reads,
+   for example, "Undo starting bout 3?" (`describeUndoableTransition`,
+   `frontend/src/pages/PadPage.tsx`), now that finding 1's stamp makes the
+   target unambiguous. Separately, the commit handler now compares what the
+   confirmation named against a fresh live re-detection before committing
+   (`sameUndoableTransition`), and refuses with a clear message rather than
+   silently doing nothing or undoing something else if a second tab has
+   changed what is actually undoable in the meantime. Test: "names what Undo
+   would reverse in its confirmation".
+
+The issue #21 and issue #22 replay fixtures
+(`backend/apps/sync/tests/fixtures/pad_workflow_outbox.json`,
+`pad_corrections_outbox.json`) were refreshed with
+`UPDATE_PAD_REPLAY_FIXTURE=1 npm test -- --run src/padWorkflowReplay.test.ts`
+/ `src/padCorrectionsReplay.test.ts` to reflect the session record's new
+`transition_*` fields and finding 6's `stop_reason` re-derivation; the
+Django replay tests (`test_pad_workflow_replay.py`,
+`test_pad_corrections_replay.py`) still pass against the refreshed
+fixtures, both for a first `applied` submission and a resubmitted
+`duplicate` one.
+
+All gates re-run clean after these fixes: `cd frontend && npm run check`
+(typecheck, `eslint --max-warnings 0`, 404 vitest tests -- 394 from before
+this review plus 10 new regression tests, production build); `ruff check`
+and `ruff format --check` clean over `backend/ scripts/ tests/`; `mypy
+backend/` clean (67 source files); `pytest` 357 passed, 6 skipped (the
+PostgreSQL-only concurrency tests, unrelated to this issue); `manage.py
+check` clean.

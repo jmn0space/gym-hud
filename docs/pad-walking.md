@@ -329,14 +329,33 @@ Recorded times can be tapped and corrected: a bout's `started_at`/`ended_at`,
 a pause's `started_at`/`ended_at`, and a rest's `started_at`/`ended_at`. Pain,
 stop reason and notes were already editable (see [Pain input](#pain-input)
 and [Stop-reason behaviour](#stop-reason-behaviour) above); a time correction
-is the same kind of edit, applied to a timestamp field instead.
+is the same kind of edit, applied to a timestamp field instead. A bout's own
+"Edit times" disclosure lists every pause it has, individually labelled
+("Pause 1 of bout 2", "Pause 2 of bout 2", ...) when it has more than one.
+
+If a bout's `stop_reason` is still exactly the value `MAX_DURATION`/
+`CLAUDICATION` inference would have produced for its *original* end, correcting
+that end re-runs inference against the *corrected* end and stores whatever it
+now says (including clearing it back to none). A `stop_reason` that does not
+match what inference would have said -- the user picked it, or picked the
+same value inference would also have picked, which this cannot tell apart
+from "still inferred" -- is never touched by a correction. That one
+ambiguous case (a user pick that happens to coincide with the inferred
+value) is accepted rather than tracked with a separate provenance field: the
+failure mode is narrow (at most, a stale `MAX_DURATION`/`CLAUDICATION` survives
+a correction that should have cleared it), and it never overwrites a reason
+that obviously came from the user (`FOOT_NUMBNESS`, `SUDDEN_SWELLING`,
+`OTHER`, or a `MAX_DURATION`/`CLAUDICATION` chosen when a *different* value was
+what inference actually said at the time).
 
 A correction changes the *value* of an endpoint that is already recorded; it
 does not open or close an interval. Concretely: `ended_at` may only be
 corrected once the record has actually finished (a still-open bout, pause or
 rest is closed by `FINISH BOUT`/`RESUME`/`START NEXT BOUT`, never by editing a
 time field to a non-null value), and a correction never sets an endpoint back
-to null. `started_at` may be corrected at any time, open or closed.
+to null. `started_at` may be corrected at any time, open or closed -- the
+currently running bout gets its own "Edit times" disclosure (its `started_at`
+only, since it has no `ended_at` yet) alongside every finished one's.
 
 Changing an endpoint recalculates every derived duration that reads it --
 walking time, the pause-adjusted effective walking time, rest duration, and
@@ -389,7 +408,8 @@ Bout finished
 Rest finished / next bout started
 ```
 
-Undo requires confirmation.
+Undo requires confirmation, and the confirmation names what it will undo (for
+example "Undo starting bout 3?").
 
 **Settled 2026-09-20 (issue #22).** Undo commits a new, forward action that
 reverses the effect of the transition above -- it never deletes or rewrites
@@ -413,17 +433,38 @@ rule](data-sync.md#conflict-rule-latest-explicit-edit-wins), "A tombstone
 wins"), which the undoing device always is.
 
 What is undoable is derived from the session's own persisted records, not a
-separate undo stack or store: the three states with a running interval
-(WALKING, PAUSED, RESTING) each identify at most one reversible transition
-purely from the shape of the session's current bouts, pauses and rests --
-which interval is open, and which closed pair of timestamps share the exact
-instant one of the transitions above produces. This is why undo survives a
-reload and a second tab, and why a correction that has since moved one side
-of a coupled pair -- a bout's end, or its rest's start -- makes that
-particular undo unavailable rather than reversing it inexactly: once
-corrected, that value is the user's deliberate, newer edit, not the one the
-original transition wrote. An unrelated edit on top (a pain value, a note)
-does not block undoing the transition underneath it.
+separate undo stack or store: every one of the five transitions above stamps
+*which one it was and which bout/pause/rest it touched* directly onto the
+session record, in the same write that already advances `workflow_revision`
+on every transition. This is why undo survives a reload and a second tab: the
+stamp is ordinary persisted domain data, not a side channel, and it round-trips
+through synchronization like any other field the server does not itself model
+(see [Data & synchronization: PAD validation](data-sync.md#pad-validation)).
+
+**Settled 2026-09-20 (issue #22, finding 1).** Earlier revisions of this
+feature derived the undo target by matching timestamps instead -- "the bout
+whose `started_at` equals some rest's `ended_at`" -- which a confirmed bug
+showed was not reliable: a device clock stepping back mid-session (see [Data &
+synchronization: Clock steps are
+clamped](data-sync.md#clock-steps-are-clamped)) can make two
+different rests, or two different pauses, legitimately share one instant, and
+equality alone cannot tell them apart. Reading the explicit stamp removes the
+guessing entirely -- undo always reverses the specific record the last
+transition actually touched, never a same-instant look-alike -- and the
+resulting state is still validated as a whole (the same containment check a
+correction gets) before anything commits, so even a stamp that no longer
+matches what is actually open now is refused rather than acted on.
+
+A correction or delete that touches the very record the stamp names
+invalidates it -- once corrected or deleted, that record no longer reverses
+to what the original transition wrote, so undo becomes unavailable for it,
+rather than reversing it inexactly. An unrelated edit on top (a pain value, a
+note, a correction to a *different* bout/pause/rest) does not block undoing
+the transition underneath it. Undo does not chain: undoing one transition
+always clears the stamp, even when the resulting state happens to look
+structurally like an earlier one (undoing "bout resumed" leaves the bout
+PAUSED, for instance) -- a second Undo is not offered for it. There is no
+redo.
 
 ### Delete
 
