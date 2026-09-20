@@ -16,6 +16,15 @@ export const DATABASE_STORES = {
 export const OUTBOX_SEQUENCE_INDEX = "by_sequence";
 
 /**
+ * `sync_metadata` key under which the sync engine (issue #20) persists the
+ * changes-feed cursor (`GET /api/v1/sync/changes/`'s `since`/`cursor`).
+ * `applyServerRecords` writes it in the same transaction as the page's domain
+ * records, so an interrupted pull re-reads the same page rather than skipping
+ * it (docs/data-sync.md, "Pull: changes feed").
+ */
+export const SYNC_CURSOR_KEY = "sync_changes_cursor";
+
+/**
  * Parent-id indexes added in schema v3. `readSnapshot` uses these to fetch the
  * live descendants of an active session (bouts of a walking session, pauses/rests
  * of a bout, rows of a resistance session) with `index.getAll(parentId)` instead

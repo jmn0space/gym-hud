@@ -13,6 +13,7 @@ import { LoginPage } from "./auth/LoginPage";
 import { StorageWarningBanner } from "./auth/StorageWarningBanner";
 import { LocalDataProvider } from "./local/LocalDataProvider";
 import type { LocalRepository } from "./storage";
+import { SyncProvider } from "./sync/SyncProvider";
 
 interface AppProps {
   repository?: LocalRepository | undefined;
@@ -32,7 +33,9 @@ export function App({ authRepository, repository }: AppProps) {
   return (
     <AuthProvider repository={authRepository ?? repository}>
       <LocalDataProvider repository={repository}>
-        <AuthGate />
+        <SyncProvider repository={repository}>
+          <AuthGate />
+        </SyncProvider>
       </LocalDataProvider>
     </AuthProvider>
   );

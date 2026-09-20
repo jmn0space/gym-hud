@@ -4,6 +4,7 @@ import { Outlet, useLocation } from "react-router";
 import { AccountMismatchBanner } from "../auth/AccountMismatchBanner";
 import { ExpiredSessionBanner } from "../auth/ExpiredSessionBanner";
 import { StorageWarningBanner } from "../auth/StorageWarningBanner";
+import { SyncRejectionBanner, SyncStatus } from "../sync/SyncStatus";
 import { AccountStatus } from "./AccountStatus";
 import { AppUpdateBanner } from "./AppUpdateBanner";
 import { BottomNav } from "./BottomNav";
@@ -31,8 +32,10 @@ export function AppLayout() {
         <StorageWarningBanner />
         <ExpiredSessionBanner />
         <AccountMismatchBanner />
+        <SyncRejectionBanner />
         <AppUpdateBanner />
         <LocalDataStatus />
+        <SyncStatus />
         <AccountStatus />
         <Outlet />
       </main>

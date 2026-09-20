@@ -15,6 +15,7 @@ import {
   DEFAULT_DATABASE_NAME,
   OUTBOX_SEQUENCE_INDEX,
   PARENT_INDEXES,
+  SYNC_CURSOR_KEY,
 } from "./schema";
 import {
   DOMAIN_STORES,
@@ -30,12 +31,25 @@ import {
   type OutboxChange,
   type OutboxEntry,
   type OutboxOwner,
+  type OutboxRejection,
   type RecordPrecondition,
   type RecoverySnapshot,
+  type RejectedOutboxEntry,
+  type ServerChangeRecord,
 } from "./types";
 
 interface StoredReceipt extends CommitReceipt {
   fingerprint: string;
+}
+
+/**
+ * The outbox store's actual on-disk shape: an `OutboxEntry` plus the optional
+ * rejection `markOutboxRejected` records. Kept private to the repository --
+ * callers see either `OutboxEntry` (`listPendingOutbox`, which never returns a
+ * rejected row) or `RejectedOutboxEntry` (`listRejectedOutbox`).
+ */
+interface StoredOutboxEntry extends OutboxEntry {
+  rejection?: OutboxRejection;
 }
 
 interface MetadataRecord {
@@ -855,7 +869,26 @@ export function createLocalRepository(options: LocalRepositoryOptions = {}): Loc
   async function listPendingOutbox(): Promise<OutboxEntry[]> {
     return withReadonlyTransaction(DATABASE_STORES.outbox, async (transaction) => {
       const store = transaction.objectStore(DATABASE_STORES.outbox);
-      return requestResult(store.index(OUTBOX_SEQUENCE_INDEX).getAll() as IDBRequest<OutboxEntry[]>);
+      const entries = await requestResult(
+        store.index(OUTBOX_SEQUENCE_INDEX).getAll() as IDBRequest<StoredOutboxEntry[]>,
+      );
+      // See the `listPendingOutbox` JSDoc in types.ts: a permanently rejected
+      // entry is never retried, so it is excluded here rather than blocking
+      // the queue behind it (and, via `hasLiveWork`, wedging service-worker
+      // updates forever). `listRejectedOutbox` is the needs-attention view.
+      return entries.filter((entry) => entry.rejection === undefined);
+    });
+  }
+
+  async function listRejectedOutbox(): Promise<RejectedOutboxEntry[]> {
+    return withReadonlyTransaction(DATABASE_STORES.outbox, async (transaction) => {
+      const store = transaction.objectStore(DATABASE_STORES.outbox);
+      const entries = await requestResult(
+        store.index(OUTBOX_SEQUENCE_INDEX).getAll() as IDBRequest<StoredOutboxEntry[]>,
+      );
+      return entries.filter(
+        (entry): entry is RejectedOutboxEntry => entry.rejection !== undefined,
+      );
     });
   }
 
@@ -945,12 +978,15 @@ export function createLocalRepository(options: LocalRepositoryOptions = {}): Loc
           >),
         };
 
-        const pendingOutbox = await requestResult(
+        const outboxEntries = await requestResult(
           transaction
             .objectStore(DATABASE_STORES.outbox)
             .index(OUTBOX_SEQUENCE_INDEX)
-            .getAll() as IDBRequest<OutboxEntry[]>,
+            .getAll() as IDBRequest<StoredOutboxEntry[]>,
         );
+        // Same exclusion as `listPendingOutbox` (see its JSDoc): a rejected
+        // entry is never retried, so it is not "pending" here either.
+        const pendingOutbox = outboxEntries.filter((entry) => entry.rejection === undefined);
         return { records, pendingOutbox };
       },
     );
@@ -968,6 +1004,230 @@ export function createLocalRepository(options: LocalRepositoryOptions = {}): Loc
       abortQuietly(transaction);
       await complete.catch(() => undefined);
       throw normalizeError(error, "Unable to acknowledge local outbox entry");
+    }
+  }
+
+  async function markOutboxRejected(mutationId: string, rejection: OutboxRejection): Promise<void> {
+    validateIdentifier(mutationId, "Mutation ID");
+    const transaction = await openTransaction(DATABASE_STORES.outbox, "readwrite", "strict");
+    const complete = transactionComplete(transaction);
+    void complete.catch(() => undefined);
+    try {
+      const store = transaction.objectStore(DATABASE_STORES.outbox);
+      const existing = await requestResult(
+        store.get(mutationId) as IDBRequest<StoredOutboxEntry | undefined>,
+      );
+      // A no-op if the entry is already gone (acknowledged by a concurrent
+      // drain, or never existed): there is nothing left to mark, and this must
+      // not resurrect a row `acknowledgeOutbox` has already removed.
+      if (existing !== undefined) {
+        store.put({ ...existing, rejection } satisfies StoredOutboxEntry);
+      }
+      await complete;
+    } catch (error) {
+      abortQuietly(transaction);
+      await complete.catch(() => undefined);
+      throw normalizeError(error, "Unable to mark local outbox entry rejected");
+    }
+  }
+
+  async function getClientId(): Promise<string> {
+    const transaction = await openTransaction(DATABASE_STORES.internalMetadata, "readwrite", "strict");
+    const complete = transactionComplete(transaction);
+    void complete.catch(() => undefined);
+    try {
+      const store = transaction.objectStore(DATABASE_STORES.internalMetadata);
+      const existing = await requestResult(
+        store.get(CLIENT_ID_KEY) as IDBRequest<MetadataRecord | undefined>,
+      );
+      if (existing !== undefined) {
+        if (typeof existing.value !== "string") {
+          throw new StorageCorruptionError("Persisted local client id is invalid");
+        }
+        await complete;
+        return existing.value;
+      }
+      // Same key, same generation as `commitAction`'s own client-id bootstrap,
+      // so whichever of the two runs first is the one that creates it, and it
+      // never changes afterwards.
+      const id = uuid();
+      store.put({ key: CLIENT_ID_KEY, value: id } satisfies MetadataRecord);
+      await complete;
+      return id;
+    } catch (error) {
+      abortQuietly(transaction);
+      await complete.catch(() => undefined);
+      throw normalizeError(error, "Unable to read or create the local client id");
+    }
+  }
+
+  /**
+   * Closing (terminal) fields a feed record may carry that a record owned by
+   * a still-pending *or rejected* outbox mutation must not lose, even though
+   * every other field is left exactly as that mutation left it (see
+   * `applyServerRecords`' JSDoc and docs/data-sync.md, "Server-admin
+   * configuration precedence"): a tombstone (delete, including one cascaded
+   * from a parent), a session closed by the server (supersede, admin
+   * discard), and a bout/pause/rest closed because its parent closed.
+   * Applying just these keeps `active_markers` consistent with the feed
+   * without letting the feed overwrite a field the pending mutation is about
+   * to (re)write once it commits, or silently revert a rejected mutation's
+   * data out from under the "needs attention" banner (see M2 in the issue
+   * #20 review).
+   */
+  function applyServerClosureOnly(existing: LocalRecord, feedRecord: LocalRecord): LocalRecord {
+    // `exactOptionalPropertyTypes` rejects an explicit `updated_at: undefined`,
+    // so the key is only ever included when there is a string to put there --
+    // otherwise the spread below already carries the prior value forward.
+    //
+    // This can roll `updated_at` *backwards*: the feed's value is the older
+    // device-owned write the server already had, while the local record
+    // being closed here may carry a newer `updated_at` from the still-
+    // pending/rejected mutation itself. Harmless today -- nothing resolves
+    // conflicts by comparing `updated_at` (the conflict rule uses outbox
+    // `sequence` and server commit order, see docs/data-sync.md, "Conflict
+    // rule") and the outbox envelope itself is frozen regardless -- but
+    // flagged here so a future change doesn't mistake this field for a
+    // merge/freshness signal.
+    const updatedAt = typeof feedRecord.updated_at === "string" ? { updated_at: feedRecord.updated_at } : {};
+    let result = existing;
+
+    if (typeof feedRecord.deleted_at === "string" && !isDeleted(existing)) {
+      return { ...result, ...updatedAt, deleted_at: feedRecord.deleted_at };
+    }
+
+    if (
+      typeof feedRecord.status === "string" &&
+      feedRecord.status !== "ACTIVE" &&
+      result.status === "ACTIVE"
+    ) {
+      result = { ...result, ...updatedAt, status: feedRecord.status };
+      if (Object.prototype.hasOwnProperty.call(feedRecord, "completed_at")) {
+        result = { ...result, completed_at: feedRecord.completed_at };
+      }
+    }
+
+    if (
+      typeof feedRecord.ended_at === "string" &&
+      (result.ended_at === null || result.ended_at === undefined)
+    ) {
+      result = { ...result, ...updatedAt, ended_at: feedRecord.ended_at };
+    }
+
+    return result;
+  }
+
+  async function applyServerRecords(
+    changes: readonly ServerChangeRecord[],
+    cursor: number,
+  ): Promise<void> {
+    if (!Number.isSafeInteger(cursor) || cursor < 0) {
+      throw new InvalidActionError("Sync cursor must be a non-negative integer");
+    }
+    const stores = [
+      ...DOMAIN_STORES,
+      DATABASE_STORES.outbox,
+      DATABASE_STORES.syncMetadata,
+      DATABASE_STORES.activeMarkers,
+    ];
+    const transaction = await openTransaction(stores, "readwrite", "strict");
+    const complete = transactionComplete(transaction);
+    void complete.catch(() => undefined);
+    try {
+      // The set of records a still-pending outbox mutation touches -- a
+      // rejected entry counts too, not only a genuinely pending one: the
+      // feed must not replace their device-writable fields (see
+      // `applyServerClosureOnly` above and the method's own JSDoc). "On
+      // `rejected`, keep the mutation and its local data" (docs/data-sync.md,
+      // "Client obligations") means a permanently-rejected edit is still the
+      // device's own local data, exactly like a still-pending one -- the feed
+      // may apply only a server-side closure to it, never a full replace.
+      // Before this fix, a rejected entry was skipped here, so the next feed
+      // page carrying that record would silently revert it to whatever the
+      // server last held (e.g. a rejected "finish session" edit reverting to
+      // the server's `ACTIVE` record and reinstalling the active marker,
+      // making a finished session reappear as live) even though the "needs
+      // attention" banner tells the user their edit is still on this device.
+      const outboxEntries = await requestResult(
+        transaction
+          .objectStore(DATABASE_STORES.outbox)
+          .index(OUTBOX_SEQUENCE_INDEX)
+          .getAll() as IDBRequest<StoredOutboxEntry[]>,
+      );
+      const pendingTargets = new Set<string>();
+      for (const entry of outboxEntries) {
+        for (const change of entry.changes) {
+          const id = change.operation === "put" ? change.record.id : change.id;
+          pendingTargets.add(`${change.store}\u0000${id}`);
+        }
+      }
+
+      const markerStore = transaction.objectStore(DATABASE_STORES.activeMarkers);
+      for (const change of changes) {
+        const store = transaction.objectStore(change.store);
+        const existing = await requestResult(
+          store.get(change.entity_id) as IDBRequest<LocalRecord | undefined>,
+        );
+        const target = `${change.store}\u0000${change.entity_id}`;
+        const merged = pendingTargets.has(target)
+          ? (existing === undefined ? change.record : applyServerClosureOnly(existing, change.record))
+          : { ...(existing ?? {}), ...change.record };
+        store.put(merged);
+
+        // Keep `active_markers` consistent with what was just written (see the
+        // method's JSDoc): self-healing, exactly like `commitAction`'s own
+        // marker maintenance, but simpler -- the feed is server-authoritative,
+        // so there is nothing to reject here, only to reflect.
+        if (isActiveSessionStore(change.store)) {
+          const id = markerId(change.store, change.store);
+          if (isActive(merged)) {
+            markerStore.put({ id, store: change.store, scopeKey: change.store, recordId: merged.id } satisfies ActiveMarkerRecord);
+          } else {
+            const currentMarker = await requestResult(
+              markerStore.get(id) as IDBRequest<ActiveMarkerRecord | undefined>,
+            );
+            if (currentMarker?.recordId === merged.id) {
+              markerStore.delete(id);
+            }
+          }
+        } else {
+          const parentField = OPEN_PARENT_FIELD_BY_STORE[change.store];
+          if (parentField !== undefined) {
+            const parentValue = merged[parentField];
+            if (typeof parentValue === "string" && parentValue.trim().length > 0) {
+              const id = markerId(change.store, parentValue);
+              if (isOpen(merged)) {
+                markerStore.put({
+                  id,
+                  store: change.store,
+                  scopeKey: parentValue,
+                  recordId: merged.id,
+                } satisfies ActiveMarkerRecord);
+              } else {
+                const currentMarker = await requestResult(
+                  markerStore.get(id) as IDBRequest<ActiveMarkerRecord | undefined>,
+                );
+                if (currentMarker?.recordId === merged.id) {
+                  markerStore.delete(id);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Durable with the page it advances past, in the same transaction as
+      // the records above (docs/data-sync.md, "Pull: changes feed"): an
+      // interrupted pull re-reads this page rather than skipping it.
+      transaction
+        .objectStore(DATABASE_STORES.syncMetadata)
+        .put({ key: SYNC_CURSOR_KEY, value: cursor } satisfies MetadataRecord);
+
+      await complete;
+    } catch (error) {
+      abortQuietly(transaction);
+      await complete.catch(() => undefined);
+      throw normalizeError(error, "Unable to apply server changes");
     }
   }
 
@@ -1052,6 +1312,10 @@ export function createLocalRepository(options: LocalRepositoryOptions = {}): Loc
     listRecords,
     listPendingOutbox,
     acknowledgeOutbox,
+    markOutboxRejected,
+    listRejectedOutbox,
+    getClientId,
+    applyServerRecords,
     getSyncMetadata: (key) => readKeyValue(DATABASE_STORES.syncMetadata, key),
     setSyncMetadata: (key, value) => writeKeyValue(DATABASE_STORES.syncMetadata, key, value),
     readReferenceCache: (key) => readKeyValue(DATABASE_STORES.referenceData, key),
