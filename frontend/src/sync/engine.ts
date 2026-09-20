@@ -26,11 +26,24 @@ export const SYNC_LIMITS_CACHE_KEY = "sync_limits";
  * `frontend/src/auth/AuthProvider.tsx`), so the two features feel consistent. */
 const INITIAL_BACKOFF_MS = 5000;
 const MAX_BACKOFF_MS = 5 * 60 * 1000;
-/** Bounded +/-20% jitter around the backoff delay, so a device that goes
- * offline alongside others does not retry in lockstep with them. */
+/** Bounded +/-10% jitter around the backoff delay, so a device that goes
+ * offline alongside others does not retry in lockstep with them.
+ * `jitterFactor` below is `1 + (random() - 0.5) * JITTER_RATIO`: `random()-0.5`
+ * ranges over [-0.5, 0.5), so the factor ranges over [1 - JITTER_RATIO/2, 1 +
+ * JITTER_RATIO/2) -- i.e. this constant is the *full width* of the jitter
+ * band, not the +/- amount. Matches docs/data-sync.md's "+/-10%". */
 const JITTER_RATIO = 0.2;
 
 const LOCK_NAME = "gym-hud-sync";
+
+// Module scope, not per-engine: when `navigator.locks` is unavailable (jsdom,
+// older browsers), this is the only thing serializing drains across *all*
+// engines in one tab/worker, not just within one engine instance. A
+// per-engine closure variable would let two engines interleave their
+// repository access whenever the Web Locks API path isn't exercised -- which
+// is the entire jsdom test suite -- making the "single drainer" guarantee
+// weaker there than the real browser gives it.
+let fallbackChain: Promise<void> = Promise.resolve();
 
 export type SyncEngineState = "synced" | "pending" | "syncing" | "retrying" | "blocked" | "paused";
 
@@ -130,9 +143,9 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
 
   // One drainer per device (docs/data-sync.md, "Client obligations"): a Web
   // Locks request when available, so a second tab or worker genuinely queues
-  // behind this one; an in-process promise chain otherwise (jsdom, older
-  // browsers), which at least keeps this repository connection single-flight.
-  let fallbackChain: Promise<void> = Promise.resolve();
+  // behind this one; the module-scope `fallbackChain` promise chain otherwise
+  // (jsdom, older browsers), which at least keeps every repository connection
+  // in this tab single-flight, not just this one engine's.
   function withDeviceLock<T>(run: () => Promise<T>): Promise<T> {
     const locks = resolveLocks();
     if (locks !== undefined) {
@@ -149,6 +162,13 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   let maxMutationsPerRequest = DEFAULT_MAX_MUTATIONS_PER_REQUEST;
   let backoffMs = initialBackoffMs;
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  // Set once by `dispose()`. A cycle already in flight when `dispose()` runs
+  // cannot be aborted mid-network-call, but checking this at the top of
+  // `runCycle` stops it from starting another one, and checking it in
+  // `scheduleRetry` stops it from arming a timer that would resurrect the
+  // engine after the caller believed it was gone (a disposed `SyncProvider`
+  // unmount, or a repository `closeAfterUnmount` has since closed).
+  let disposed = false;
 
   function resetBackoff(): void {
     backoffMs = initialBackoffMs;
@@ -165,7 +185,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   }
 
   function scheduleRetry(): void {
-    if (retryTimer !== undefined) {
+    if (disposed || retryTimer !== undefined) {
       return;
     }
     const base = backoffMs;
@@ -235,6 +255,14 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
           // "Client obligations").
           return { kind: "auth-paused", blockedByServer };
         }
+        if (error instanceof ApiError && error.status === 413) {
+          // The server's own `request_too_large` detail says to send fewer:
+          // halve the batch size for the rest of this session (floor 1) so
+          // the next attempt, after backing off below, has a real chance of
+          // fitting -- otherwise this would resend the identical
+          // too-large batch forever.
+          maxMutationsPerRequest = Math.max(1, Math.floor(maxMutationsPerRequest / 2));
+        }
         return { kind: "network-failure", blockedByServer };
       }
 
@@ -288,7 +316,16 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
     } catch {
       return "failure";
     }
-    maxMutationsPerRequest = bootstrap.limits.max_mutations_per_request;
+    // Clamp what the server reports: `isSyncLimits` only checks
+    // `Number.isFinite`, so a server bug returning 0, a negative, or a
+    // fractional value must not be allowed to shrink the batch to nothing
+    // (an empty batch is a 400 `invalid_request`, which maps to
+    // `network-failure` -- the outbox would never drain again) or above the
+    // client's own default ceiling.
+    maxMutationsPerRequest = Math.max(
+      1,
+      Math.min(DEFAULT_MAX_MUTATIONS_PER_REQUEST, Math.floor(bootstrap.limits.max_mutations_per_request)),
+    );
     try {
       await repository.writeReferenceCache(PAD_DEFAULTS_CACHE_KEY, {
         speed_kmh: bootstrap.pad.defaults.speed_kmh,
@@ -327,6 +364,15 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       } catch {
         return "failure";
       }
+      // A well-behaved server always advances the cursor whenever it claims
+      // more pages remain (see docs/data-sync.md, "Pull: changes feed"), but
+      // a malformed/buggy response that doesn't would otherwise spin this
+      // loop forever (re-requesting the same page), holding the device lock
+      // throughout. Guarded only for `has_more`: a legitimate "nothing new"
+      // response (`cursor === since`, `has_more: false`) must still succeed.
+      if (page.has_more && page.cursor <= since) {
+        return "failure";
+      }
       try {
         await repository.applyServerRecords(
           page.changes.map((entry) => ({ store: entry.store, entity_id: entry.entity_id, record: entry.record })),
@@ -346,6 +392,9 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   }
 
   async function runCycle(): Promise<void> {
+    if (disposed) {
+      return;
+    }
     try {
       if (!canSync()) {
         clearScheduledRetry();
@@ -371,7 +420,17 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
       // succeeded), so a pull is safe: drain before pull, and a record with a
       // still-pending mutation is protected inside `applyServerRecords`
       // (docs/data-sync.md, "Conflict strategy").
-      resetBackoff();
+      //
+      // Backoff resets only on a *genuinely* successful drain (`kind ===
+      // "clear"`: nothing left blocked), not on `partial` (a `retry` ack
+      // stopped the batch, or an unsupported_store/unsupported_version
+      // deferral): resetting unconditionally here made the delay always
+      // `initialBackoffMs` on the blocked path -- a push + a bootstrap + a
+      // changes request every ~5s indefinitely instead of climbing toward the
+      // cap (docs/data-sync.md, "reset by any successful drain").
+      if (drain.kind === "clear") {
+        resetBackoff();
+      }
       clearScheduledRetry();
 
       const pull = await pullChanges();
@@ -451,7 +510,13 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   }
 
   function trigger(): void {
-    void startOrJoin();
+    // Fire-and-forget by design (callers are event handlers, not awaiters).
+    // `startOrJoin` itself should never reject (`runCycle` catches
+    // everything), but `withDeviceLock` calling straight into
+    // `navigator.locks.request` means a browser that throws synchronously
+    // there (rather than rejecting) could otherwise surface as an unhandled
+    // rejection.
+    void startOrJoin().catch(() => undefined);
   }
 
   async function syncNow(): Promise<void> {
@@ -461,6 +526,7 @@ export function createSyncEngine(deps: SyncEngineDeps): SyncEngine {
   }
 
   function dispose(): void {
+    disposed = true;
     clearScheduledRetry();
   }
 

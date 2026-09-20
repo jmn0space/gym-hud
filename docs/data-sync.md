@@ -322,8 +322,17 @@ Attempt synchronization:
 The application must never depend on step 5, and does not implement it:
 `frontend/src/sync/SyncProvider.tsx` drives triggers 1-4 only (owner decision,
 issue #20). Trigger 1 is a `useEffect` on `LocalDataProvider`'s own
-post-commit `pendingOutbox` length growing, not a hook into `commitAction`
-itself -- a commit must never await the network. Trigger 3 is
+post-commit snapshot: it compares the pending outbox's mutation ids against
+the set this provider already accounted for on its previous read, and fires
+whenever the current set holds one it has not seen pending before -- not a
+hook into `commitAction` itself, since a commit must never await the
+network. This is deliberately not "the pending count grew since last time":
+the sync engine acknowledges mutations on its own, usually separate,
+repository connection (see [Active-session
+recovery](#active-session-recovery) and `App.tsx`), which never refreshes
+this provider's own snapshot, so a length comparison alone can land on the
+same count across two genuinely different commits and miss the second one
+(reproduced and fixed by issue #20's review, finding M1). Trigger 3 is
 `visibilitychange` (to `visible`) plus window `focus`. Trigger 4 is the
 `online` event and the sync gate (below) transitioning to true (in particular,
 authentication succeeding). Overlapping triggers coalesce into at most one
@@ -707,6 +716,18 @@ another session anywhere. Two mechanisms resolve it:
   its `detail` and envelope) plus Django's own admin log entry -- and marks the
   session `DISCARDED` with its open children closed, at its latest recorded moment.
 
+**Known v1 limitation, not a defect (issue #20's review, finding M3):** a
+device whose feed carries another device's live `ACTIVE` session installs
+that session's local active marker exactly as a locally-committed one would
+(so it shows as a Resume card from `readSnapshot()`, the same escape as any
+other active session -- see [Active-session
+recovery](#active-session-recovery)) and cannot start its own session of
+that type until the feed's session is resumed, finished, or discarded by an
+administrator; a local supersede is deliberately not implemented (owner
+decision, issue #13: at most one `ACTIVE` session per type locally), and the
+multi-device case is explicitly out of v1 scope (see [Conflict
+strategy](#conflict-strategy)).
+
 **The frontend mirrors these rules** in its write transaction, so that it never
 queues a mutation the server has to repair or refuse: close every open pause when a
 bout ends and every open bout, pause and rest when the session ends; stamp times
@@ -758,10 +779,16 @@ Implemented by the sync engine, `frontend/src/sync/engine.ts` (issue #20):
   needs-attention banner (`SyncRejectionBanner`) surfaces it.
 - On a request-level error, a network failure or a lost response, keep everything
   queued and resend later with bounded exponential backoff (jittered, ~5s initial,
-  capped ~5 minutes, reset by any successful drain or an explicit "Sync now");
-  duplicates are answered `duplicate`. A `401` specifically stops the drain and
-  leaves it paused -- `apiFetch` has already flipped auth to `expired` -- with
-  nothing acknowledged.
+  capped ~5 minutes). The backoff resets only when a drain reaches the server
+  and finds nothing left blocked -- the whole outbox cleared, not merely
+  stopped partway on a `retry`/`unsupported_store` result -- or on an explicit
+  "Sync now"; a drain that stops partway keeps climbing toward the cap on
+  each subsequent blocked cycle instead of retrying at the initial delay
+  forever (issue #20's review, finding M4, fixed a bug where the delay reset
+  unconditionally before every pull regardless of whether anything was still
+  blocked). Duplicates are answered `duplicate`. A `401` specifically stops
+  the drain and leaves it paused -- `apiFetch` has already flipped auth to
+  `expired` -- with nothing acknowledged.
 - **Apply changes-feed records as server-authoritative**, without the local parent
   and precondition checks an action goes through (or buffer them until the whole
   feed is read): a parent can arrive on a later page than its child. The server may

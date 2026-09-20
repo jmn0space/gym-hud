@@ -54,7 +54,7 @@ export function SyncProvider({ children, repository: suppliedRepository }: SyncP
   }));
 
   const { status, online } = useAuth();
-  const { snapshot: localSnapshot } = useLocalData();
+  const { snapshot: localSnapshot, refreshLiveData } = useLocalData();
 
   // Read fresh by the engine on every check, never captured once (the sync
   // gate can flip between one trigger and the next).
@@ -92,6 +92,23 @@ export function SyncProvider({ children, repository: suppliedRepository }: SyncP
     engine?.subscribe ?? (() => () => undefined),
     () => engine?.getSnapshot() ?? INITIAL_SNAPSHOT,
   );
+
+  // Hardening (issue #20 review): this provider opens its own repository
+  // connection, distinct from `LocalDataProvider`'s (see `App.tsx`), so
+  // applying changes-feed records through it (`applyServerRecords`, run
+  // inside the engine's pull) does not, by itself, refresh
+  // `LocalDataProvider`'s React snapshot -- a server-closed session or an
+  // admin's edit would otherwise stay on screen until the next focus event.
+  // `lastSyncedAt` only ever moves forward, and only once per cycle that
+  // completed a pull (see `engine.ts`'s `runCycle`), so watching it for
+  // change is a cheap, restructuring-free proxy for "a pull just finished".
+  const lastSyncedAtRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (snapshot.lastSyncedAt !== null && snapshot.lastSyncedAt !== lastSyncedAtRef.current) {
+      lastSyncedAtRef.current = snapshot.lastSyncedAt;
+      refreshLiveData();
+    }
+  }, [snapshot.lastSyncedAt, refreshLiveData]);
 
   // Trigger 3: PWA foreground return (visibility + window focus).
   useEffect(() => {
@@ -139,14 +156,42 @@ export function SyncProvider({ children, repository: suppliedRepository }: SyncP
   // Trigger 1: after a local commit. `commitAction` must never await the
   // network, so this watches LocalDataProvider's own post-commit snapshot
   // refresh instead of hooking the commit path directly (see
-  // docs/data-sync.md, "Synchronization triggers"): a growing pending-outbox
-  // length is what a just-committed mutation looks like from here.
-  const previousPendingLengthRef = useRef<number | null>(null);
+  // docs/data-sync.md, "Synchronization triggers"): every time that snapshot
+  // updates (mount, a commit, a focus/visibility refresh, `retry()`) and it
+  // contains a pending mutation this provider has not already accounted for,
+  // there is new work to attempt.
+  //
+  // This is deliberately *not* "the pending length grew since last time":
+  // `acknowledgeOutbox` (run by the sync engine, on a different repository
+  // connection in production -- see `App.tsx`) never refreshes this
+  // provider's own snapshot, so after a drain the remembered previous length
+  // stays at whatever it was mid-drain. A length-delta check could then miss
+  // a real commit that happens to land on the same length a moment later
+  // (commit A: 0->1, drains to 0 without this provider ever seeing it,
+  // commit B: local state still remembers 1, so 1 -> 1 reads as "no
+  // growth" -- no trigger, even though B is genuinely new and unsent).
+  //
+  // A set-of-mutation-ids comparison (rather than simply "count > 0") also
+  // matters once a pull can refresh this snapshot on its own (see the
+  // "refresh after a pull" effect above): while a mutation is stuck blocked
+  // (`retry`/`unsupported_store`, docs/data-sync.md "Unsupported stores and
+  // versions"), every cycle's pull still succeeds and republishes
+  // `lastSyncedAt`, which refreshes this snapshot with the *same* still-
+  // pending mutation every time. A plain "count > 0" check would re-trigger
+  // on each of those refreshes, an engine cycle triggering its own next
+  // cycle forever. Comparing the actual ids only fires for a mutation this
+  // provider has not already seen pending.
+  const previousPendingIdsRef = useRef<Set<string> | null>(null);
   useEffect(() => {
-    const length = localSnapshot?.pendingOutbox.length ?? null;
-    const previous = previousPendingLengthRef.current;
-    previousPendingLengthRef.current = length;
-    if (engine !== null && length !== null && previous !== null && length > previous) {
+    const currentIds = new Set(localSnapshot?.pendingOutbox.map((entry) => entry.mutation_id) ?? []);
+    const previousIds = previousPendingIdsRef.current;
+    previousPendingIdsRef.current = currentIds;
+    if (engine === null) {
+      return;
+    }
+    const hasUnaccountedEntry =
+      previousIds === null ? currentIds.size > 0 : [...currentIds].some((id) => !previousIds.has(id));
+    if (hasUnaccountedEntry) {
       engine.trigger();
     }
   }, [localSnapshot, engine]);

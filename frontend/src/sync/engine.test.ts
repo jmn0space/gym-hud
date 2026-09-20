@@ -340,13 +340,21 @@ describe("sync engine: outbox drain", () => {
 
 describe("sync engine: backoff", () => {
   // Deterministic by construction, not by racing real (or faked) timers
-  // against `fake-indexeddb`'s own scheduling: after each failure this reads
-  // the scheduled `nextRetryAt` directly, then disposes the engine's pending
-  // timer (which only cancels the *timer handle* -- see `dispose`, it never
-  // touches `backoffMs`) and issues its own `trigger()` to force the next
-  // attempt immediately. That reproduces exactly the sequence a real timer
-  // firing would have produced, without ever letting the engine's own timer
-  // and the test's assertions race each other.
+  // against `fake-indexeddb`'s own scheduling (the previous version of this
+  // test read `Date.now()` against a real elapsed interval and asserted
+  // within a +/-500ms window -- the most plausible CI flake in the suite).
+  // Two changes fix that:
+  //  - An injected `clock` that never advances: `nextRetryAt` is computed
+  //    from it (`scheduleRetry` -> `nowIso(clock.now() + delay)`), so
+  //    comparing the two is an exact integer subtraction, never a race
+  //    against real elapsed time.
+  //  - The engine's *own* real `setTimeout` is still what advances it to the
+  //    next cycle (this deliberately does not call `engine.dispose()`
+  //    mid-test to skip it -- `dispose()` is now terminal, see the M5 fix in
+  //    `engine.ts`, and disposing then re-triggering would make `runCycle`
+  //    a permanent no-op). Backoff bounds are kept small (tens of ms) purely
+  //    so waiting the real delay out stays fast, not because it changes what
+  //    is being proven; production values are 5s/5min.
   it("backs off exponentially on repeated transient failures, capped, and resets on success", async () => {
     const repository = repo();
     await putExercise(repository, "m1", "e1");
@@ -358,6 +366,7 @@ describe("sync engine: backoff", () => {
       }
       return Promise.resolve(mutations.map((m) => applied(m.mutation_id)));
     });
+    const FIXED_NOW = Date.UTC(2026, 0, 1);
     const engine = createSyncEngine({
       repository,
       pushMutations,
@@ -365,55 +374,107 @@ describe("sync engine: backoff", () => {
       fetchChanges: () => Promise.resolve(emptyChanges()),
       canSync: () => true,
       random: () => 0.5, // neutralizes jitter: factor 1
-      initialBackoffMs: 1000,
-      maxBackoffMs: 4000,
+      clock: { now: () => FIXED_NOW },
+      initialBackoffMs: 100,
+      maxBackoffMs: 400,
     });
 
     function nextDelayMs(): number {
       const nextRetryAt = engine.getSnapshot().nextRetryAt;
       expect(nextRetryAt).not.toBeNull();
-      return Date.parse(nextRetryAt ?? "") - Date.now();
+      return Date.parse(nextRetryAt ?? "") - FIXED_NOW;
     }
-    // Generous tolerance: this only has to distinguish 1000/2000/4000 from
-    // each other, not measure wall-clock precisely.
-    function expectDelayNear(expectedMs: number): void {
-      const delta = nextDelayMs();
-      expect(delta).toBeGreaterThan(expectedMs - 500);
-      expect(delta).toBeLessThan(expectedMs + 500);
+
+    // Waits out the currently-scheduled real retry timer (a generous margin
+    // over its known delay, never a race: the wait is a lower bound, so a
+    // slow CI host makes this slower, not flaky) and lets the cycle it
+    // triggers settle (fake-indexeddb resolves its requests on real
+    // macrotasks, not merely microtasks -- see `flushAsync`).
+    async function waitOutScheduledRetry(): Promise<void> {
+      const delay = nextDelayMs();
+      await new Promise((resolve) => setTimeout(resolve, delay + 40));
+      await flushAsync(20);
     }
 
     await engine.syncNow();
     expect(engine.getSnapshot().state).toBe("retrying");
-    expectDelayNear(1000);
+    expect(nextDelayMs()).toBe(100);
 
-    engine.dispose();
-    engine.trigger();
-    await flushAsync();
-    expectDelayNear(2000);
+    await waitOutScheduledRetry();
+    expect(nextDelayMs()).toBe(200);
 
-    engine.dispose();
-    engine.trigger();
-    await flushAsync();
-    expectDelayNear(4000); // capped: would be 4000 uncapped too, next proves the cap actually held
+    await waitOutScheduledRetry();
+    expect(nextDelayMs()).toBe(400); // capped: would be 400 uncapped too, next proves the cap actually held
 
-    engine.dispose();
-    engine.trigger();
-    await flushAsync();
-    expectDelayNear(4000); // still capped, not 8000
+    await waitOutScheduledRetry();
+    expect(nextDelayMs()).toBe(400); // still capped, not 800
 
     succeed = true;
-    engine.dispose();
-    engine.trigger();
-    await flushAsync();
+    await waitOutScheduledRetry();
     expect(engine.getSnapshot().state).toBe("synced");
     expect(engine.getSnapshot().nextRetryAt).toBeNull();
 
-    // Reset: the next failure starts back at ~1000ms, not the 4000ms cap.
+    // Reset: the next failure starts back at ~40ms, not the 160ms cap.
     succeed = false;
     await putExercise(repository, "m2", "e2");
     engine.trigger();
     await flushAsync();
-    expectDelayNear(1000);
+    expect(nextDelayMs()).toBe(100);
+
+    engine.dispose();
+  });
+
+  it("does not reset the backoff on a partial drain (a retry/unsupported-store result), so repeated blocked cycles climb toward the cap (M4)", async () => {
+    // Reproduces the bug this fix closes: resetting backoff unconditionally
+    // before every pull -- regardless of whether the drain actually cleared
+    // -- made a blocked queue retry at a flat ~initialBackoffMs forever
+    // (measured in production: [1000, 1000, 1000, 1000], a push + a
+    // bootstrap + a changes request every 5s indefinitely).
+    const repository = repo();
+    await putExercise(repository, "m1", "e1");
+
+    // Every push comes back `retry`/`unsupported_store`: the batch never
+    // clears, so `drainOutbox` always returns `kind: "partial"`.
+    const pushMutations = vi.fn((_clientId: string, mutations: readonly OutboxEntry[]) =>
+      Promise.resolve(mutations.map((m) => retry(m.mutation_id, "unsupported_store", "not yet"))),
+    );
+    const FIXED_NOW = Date.UTC(2026, 0, 1);
+    const engine = createSyncEngine({
+      repository,
+      pushMutations,
+      fetchBootstrap: () => Promise.resolve(emptyBootstrap()),
+      fetchChanges: () => Promise.resolve(emptyChanges()),
+      canSync: () => true,
+      random: () => 0.5,
+      clock: { now: () => FIXED_NOW },
+      initialBackoffMs: 100,
+      maxBackoffMs: 400,
+    });
+
+    function nextDelayMs(): number {
+      const nextRetryAt = engine.getSnapshot().nextRetryAt;
+      expect(nextRetryAt).not.toBeNull();
+      return Date.parse(nextRetryAt ?? "") - FIXED_NOW;
+    }
+
+    async function waitOutScheduledRetry(): Promise<void> {
+      const delay = nextDelayMs();
+      await new Promise((resolve) => setTimeout(resolve, delay + 40));
+      await flushAsync(20);
+    }
+
+    await engine.syncNow();
+    expect(engine.getSnapshot().state).toBe("blocked");
+    expect(nextDelayMs()).toBe(100);
+
+    await waitOutScheduledRetry();
+    expect(engine.getSnapshot().state).toBe("blocked");
+    // Before the fix this was 40 again every time (backoff reset before the
+    // pull on every cycle, partial or not); it must now have doubled.
+    expect(nextDelayMs()).toBe(200);
+
+    await waitOutScheduledRetry();
+    expect(nextDelayMs()).toBe(400); // capped
 
     engine.dispose();
   });
@@ -631,5 +692,260 @@ describe("sync engine: changes feed", () => {
     await expect(repository.listPendingOutbox()).resolves.toEqual([
       expect.objectContaining({ mutation_id: "local-pending" }),
     ]);
+  });
+});
+
+describe("sync engine: hardening (issue #20 review)", () => {
+  it("dispose() stops a cycle already in flight from scheduling a further retry or running again (M5)", async () => {
+    const repository = repo();
+    await putExercise(repository, "m1", "e1");
+
+    let releasePush!: () => void;
+    const pushGate = new Promise<void>((resolve) => {
+      releasePush = resolve;
+    });
+    const pushMutations = vi.fn(async () => {
+      await pushGate;
+      throw new ApiError(0, "network", "down");
+    });
+
+    const engine = createSyncEngine({
+      repository,
+      pushMutations,
+      fetchBootstrap: () => Promise.resolve(emptyBootstrap()),
+      fetchChanges: () => Promise.resolve(emptyChanges()),
+      canSync: () => true,
+    });
+
+    engine.trigger(); // starts a cycle; pushMutations is now awaiting `pushGate`.
+    await flushAsync(10);
+    expect(pushMutations).toHaveBeenCalledTimes(1);
+
+    // Dispose while the network call is still in flight -- exactly the
+    // "unmount with work in flight" scenario the review reproduced (14
+    // further pushes observed 300ms after dispose).
+    engine.dispose();
+    releasePush();
+    await flushAsync(20);
+
+    // Before the fix, `scheduleRetry()` had no `disposed` guard: the in-
+    // flight cycle would still arm a real timer here.
+    expect(engine.getSnapshot().nextRetryAt).toBeNull();
+
+    // And no further cycle ever runs after dispose -- not from a (never-
+    // armed) timer, and not from a stray `trigger()` either, since
+    // `runCycle` itself is now a no-op once disposed.
+    engine.trigger();
+    await flushAsync(20);
+    expect(pushMutations).toHaveBeenCalledTimes(1);
+  });
+
+  it("bails out of the changes-feed loop as a failure instead of spinning forever when a page's cursor does not advance (M6)", async () => {
+    const repository = repo();
+    const fetchChanges = vi.fn(() => Promise.resolve({ changes: [], cursor: 0, has_more: true }));
+    const engine = createSyncEngine({
+      repository,
+      pushMutations: () => Promise.resolve([]),
+      fetchBootstrap: () => Promise.resolve(emptyBootstrap()),
+      fetchChanges,
+      canSync: () => true,
+    });
+
+    await engine.syncNow();
+
+    expect(engine.getSnapshot().state).toBe("retrying");
+    // Exactly one request, not the 2000+ a broken response spinning on a
+    // stuck cursor produced before this guard, holding the device lock
+    // throughout.
+    expect(fetchChanges).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not treat a legitimate 'nothing new' page (cursor unchanged, has_more false) as a failure (M6 guard scoping)", async () => {
+    const repository = repo();
+    const engine = createSyncEngine({
+      repository,
+      pushMutations: () => Promise.resolve([]),
+      fetchBootstrap: () => Promise.resolve(emptyBootstrap()),
+      fetchChanges: () => Promise.resolve({ changes: [], cursor: 0, has_more: false }),
+      canSync: () => true,
+    });
+
+    await engine.syncNow();
+
+    expect(engine.getSnapshot().state).toBe("synced");
+  });
+
+  it("clamps a malformed max_mutations_per_request from bootstrap so the batch is never empty (M7)", async () => {
+    const repository = repo();
+    await putExercise(repository, "m1", "e1");
+    await putExercise(repository, "m2", "e2");
+
+    const pushMutations = vi.fn((_clientId: string, mutations: readonly OutboxEntry[]) => {
+      if (mutations.length === 0) {
+        // Mirrors the real API: an empty mutations array is a 400
+        // `invalid_request` (docs/data-sync.md, "Request-level errors").
+        return Promise.reject(new ApiError(400, "invalid_request", "mutations empty"));
+      }
+      return Promise.resolve(mutations.map((m) => applied(m.mutation_id)));
+    });
+    // Malformed: 0 is `Number.isFinite`, so it passes `isSyncLimits`, but
+    // must not be allowed to shrink the next batch to nothing.
+    const fetchBootstrap = () =>
+      Promise.resolve({
+        ...emptyBootstrap(),
+        limits: { max_mutations_per_request: 0, max_changes_per_mutation: 500 },
+      });
+
+    const engine = createSyncEngine({
+      repository,
+      pushMutations,
+      fetchBootstrap,
+      fetchChanges: () => Promise.resolve(emptyChanges()),
+      canSync: () => true,
+    });
+
+    // First cycle: drain runs before the pull that learns the bad limit, so
+    // it still uses the default (50) and clears both mutations normally.
+    await engine.syncNow();
+    expect(pushMutations.mock.calls[0]?.[1]).toHaveLength(2);
+    expect(engine.getSnapshot().state).toBe("synced");
+
+    // Second cycle: the bad limit is now in effect. Without the clamp,
+    // `maxMutationsPerRequest` would be 0, the batch would be `[]`, and the
+    // mock above (mirroring the real API) would reject it, wedging the
+    // outbox on this same empty batch forever.
+    await putExercise(repository, "m3", "e3");
+    await engine.syncNow();
+    expect(pushMutations.mock.calls[1]?.[1].length).toBeGreaterThan(0);
+    expect(engine.getSnapshot().state).toBe("synced");
+  });
+
+  it("halves the batch size on a 413 request_too_large instead of resending the identical too-large batch forever (suspected hardening)", async () => {
+    const repository = repo();
+    for (let i = 0; i < 30; i += 1) {
+      await putExercise(repository, `m${i.toString()}`, `e${i.toString()}`);
+    }
+
+    let calls = 0;
+    const pushMutations = vi.fn((_clientId: string, mutations: readonly OutboxEntry[]) => {
+      calls += 1;
+      if (calls === 1) {
+        // The client's `ApiErrorCode` union does not model every server code
+        // (see `frontend/src/api/client.ts`'s `isKnownCode`); a real 413
+        // maps to `"unknown"` there. The engine's own 413 handling keys off
+        // `error.status`, not `error.code`, so this still exercises it.
+        return Promise.reject(new ApiError(413, "unknown", "send fewer per request"));
+      }
+      return Promise.resolve(mutations.map((m) => applied(m.mutation_id)));
+    });
+
+    const engine = createSyncEngine({
+      repository,
+      pushMutations,
+      fetchBootstrap: () => Promise.resolve(emptyBootstrap()),
+      fetchChanges: () => Promise.resolve(emptyChanges()),
+      canSync: () => true,
+      initialBackoffMs: 5,
+      maxBackoffMs: 20,
+    });
+
+    await engine.syncNow();
+    expect(pushMutations.mock.calls[0]?.[1]).toHaveLength(30); // the default cap (50) never limited this batch
+    expect(engine.getSnapshot().state).toBe("retrying");
+    await expect(repository.listPendingOutbox()).resolves.toHaveLength(30); // nothing acknowledged on a 413
+
+    await engine.syncNow();
+    // Halved from the default 50 to 25 by the 413 handler, so the retried
+    // batch is smaller than the full 30 still queued -- not identical to the
+    // one the server just rejected as too large.
+    expect(pushMutations.mock.calls[1]?.[1]).toHaveLength(25);
+
+    engine.dispose();
+  });
+
+  it("serializes drains across two engines in one tab when navigator.locks is unavailable (suspected hardening: fallbackChain hoisted to module scope)", async () => {
+    // jsdom does not implement the Web Locks API (see the file's own note in
+    // `docs/plans/issue-20-outbox-drain.md`, "Known limitations"), so both
+    // engines below go through the in-process fallback chain -- which must
+    // now be shared module-wide, not per-engine, for this to hold.
+    expect(typeof (globalThis.navigator as { locks?: unknown }).locks).toBe("undefined");
+
+    const repositoryA = repo();
+    const repositoryB = repo();
+    await putExercise(repositoryA, "a1", "ea1");
+    await putExercise(repositoryB, "b1", "eb1");
+
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    function makePush() {
+      return vi.fn(async (_clientId: string, mutations: readonly OutboxEntry[]) => {
+        concurrent += 1;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        concurrent -= 1;
+        return mutations.map((m) => applied(m.mutation_id));
+      });
+    }
+
+    const engineA = createSyncEngine({
+      repository: repositoryA,
+      pushMutations: makePush(),
+      fetchBootstrap: () => Promise.resolve(emptyBootstrap()),
+      fetchChanges: () => Promise.resolve(emptyChanges()),
+      canSync: () => true,
+    });
+    const engineB = createSyncEngine({
+      repository: repositoryB,
+      pushMutations: makePush(),
+      fetchBootstrap: () => Promise.resolve(emptyBootstrap()),
+      fetchChanges: () => Promise.resolve(emptyChanges()),
+      canSync: () => true,
+    });
+
+    await Promise.all([engineA.syncNow(), engineB.syncNow()]);
+
+    // Before the fix, `fallbackChain` was a variable inside `createSyncEngine`
+    // (per-engine), so these two engines' pushes could overlap.
+    expect(maxConcurrent).toBe(1);
+
+    engineA.dispose();
+    engineB.dispose();
+  });
+
+  it("trigger() never produces an unhandled rejection when the Web Locks API throws synchronously (suspected hardening)", async () => {
+    const repository = repo();
+    // Adds a `locks` property directly to the real `navigator` (a class
+    // instance in jsdom -- spreading it would lose its prototype), rather
+    // than replacing the whole object.
+    Object.defineProperty(globalThis.navigator, "locks", {
+      value: {
+        request: () => {
+          throw new Error("locks unavailable");
+        },
+      },
+      configurable: true,
+    });
+
+    try {
+      const engine = createSyncEngine({
+        repository,
+        pushMutations: () => Promise.resolve([]),
+        fetchBootstrap: () => Promise.resolve(emptyBootstrap()),
+        fetchChanges: () => Promise.resolve(emptyChanges()),
+        canSync: () => true,
+      });
+
+      // `trigger()` is fire-and-forget; the assertion here is really that
+      // this test finishes without vitest reporting an unhandled rejection
+      // (it would, without the `.catch(() => undefined)` this hardens).
+      expect(() => {
+        engine.trigger();
+      }).not.toThrow();
+      await flushAsync(5);
+
+      engine.dispose();
+    } finally {
+      delete (globalThis.navigator as { locks?: unknown }).locks;
+    }
   });
 });

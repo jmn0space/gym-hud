@@ -1620,4 +1620,220 @@ describe("LocalRepository sync-engine support (issue #20)", () => {
     const second = repository(factory, { databaseName });
     await expect(second.getSyncMetadata(SYNC_CURSOR_KEY)).resolves.toBe(7);
   });
+
+  // --- Issue #20 review, M2: a rejected mutation's local data must not be
+  // silently reverted by the changes feed. ---
+
+  it("applyServerRecords does not revert a rejected mutation's local data (M2)", async () => {
+    const repo = repository(new IDBFactory());
+    // A bout already synced at pain 2 (no pending mutation).
+    await repo.applyServerRecords(
+      [
+        {
+          store: "walking_bouts",
+          entity_id: "bout-1",
+          record: {
+            id: "bout-1",
+            walking_session_id: "session-1",
+            pain_min: 2,
+            pain_max: 2,
+            started_at: "2026-09-14T10:00:00.000Z",
+            created_at: "2026-09-14T10:00:00.000Z",
+            updated_at: "2026-09-14T10:00:00.000Z",
+            deleted_at: null,
+          },
+        },
+      ],
+      1,
+    );
+
+    // The user edits pain to 4; the mutation is queued, then permanently rejected.
+    await repo.commitAction({
+      actionId: "edit-pain",
+      changes: [
+        {
+          store: "walking_bouts",
+          operation: "put",
+          record: {
+            id: "bout-1",
+            walking_session_id: "session-1",
+            pain_min: 4,
+            pain_max: 4,
+            started_at: "2026-09-14T10:00:00.000Z",
+          },
+        },
+      ],
+    });
+    await repo.markOutboxRejected("edit-pain", {
+      code: "invalid_record",
+      detail: "pain out of range",
+      rejectedAt: "2026-09-20T00:00:00.000Z",
+    });
+
+    // The next feed page still carries the server's own (never-updated) value.
+    await repo.applyServerRecords(
+      [
+        {
+          store: "walking_bouts",
+          entity_id: "bout-1",
+          record: {
+            id: "bout-1",
+            walking_session_id: "session-1",
+            pain_min: 2,
+            pain_max: 2,
+            started_at: "2026-09-14T10:00:00.000Z",
+            created_at: "2026-09-14T10:00:00.000Z",
+            updated_at: "2026-09-14T10:05:00.000Z",
+            deleted_at: null,
+          },
+        },
+      ],
+      2,
+    );
+
+    const record = await repo.getRecord("walking_bouts", "bout-1");
+    // The user's edit must survive the feed page: this is what the "needs
+    // attention" banner's "The data is still on this device" claims.
+    expect(record?.pain_min).toBe(4);
+    expect(record?.pain_max).toBe(4);
+  });
+
+  it("applyServerRecords does not reinstall the active marker from a rejected 'finish session' mutation (M2, sharper variant)", async () => {
+    const repo = repository(new IDBFactory());
+    await repo.commitAction({
+      actionId: "start-session",
+      changes: [
+        { store: "walking_sessions", operation: "put", record: { id: "session-1", status: "ACTIVE", started_at: "2026-09-14T10:00:00.000Z" } },
+      ],
+    });
+    await repo.acknowledgeOutbox("start-session");
+
+    // The user finishes the session locally; the mutation is queued, then rejected.
+    await repo.commitAction({
+      actionId: "finish-session",
+      changes: [
+        {
+          store: "walking_sessions",
+          operation: "put",
+          record: {
+            id: "session-1",
+            status: "COMPLETED",
+            started_at: "2026-09-14T10:00:00.000Z",
+            completed_at: "2026-09-14T10:30:00.000Z",
+          },
+        },
+      ],
+    });
+    await repo.markOutboxRejected("finish-session", {
+      code: "invalid_transition",
+      detail: "already closed",
+      rejectedAt: "2026-09-20T00:00:00.000Z",
+    });
+
+    // The feed still reports the server's own (stale) ACTIVE state.
+    await repo.applyServerRecords(
+      [
+        {
+          store: "walking_sessions",
+          entity_id: "session-1",
+          record: {
+            id: "session-1",
+            status: "ACTIVE",
+            started_at: "2026-09-14T10:00:00.000Z",
+            created_at: "2026-09-14T10:00:00.000Z",
+            updated_at: "2026-09-14T10:00:00.000Z",
+            deleted_at: null,
+          },
+        },
+      ],
+      1,
+    );
+
+    const record = await repo.getRecord("walking_sessions", "session-1");
+    expect(record?.status).toBe("COMPLETED");
+
+    // The active marker must not be reinstalled either -- otherwise the
+    // finished session would reappear as a Resume card, and a new local
+    // session of the same type would be falsely rejected as a conflict.
+    await expect(
+      repo.commitAction({
+        actionId: "start-new-session",
+        preconditions: [{ store: "walking_sessions", id: "session-2", expected: null }],
+        changes: [{ store: "walking_sessions", operation: "put", record: { id: "session-2", status: "ACTIVE" } }],
+      }),
+    ).resolves.toBeDefined();
+  });
+
+  // --- Issue #20 review, M3: the feed-installed active-marker escape (resume
+  // the session the feed carries) must actually work end to end, and the
+  // feed *installing* a fresh marker (not only clearing a stale one) needs
+  // its own coverage. No local supersede is implemented here -- by design,
+  // see docs/data-sync.md, "Stuck ACTIVE sessions" and issue #13. ---
+
+  it("readSnapshot resolves a feed-only ACTIVE walking session as resumable, with no outbox entry at all (M3)", async () => {
+    const repo = repository(new IDBFactory());
+    // Arrives only through the feed -- e.g. another device started it -- and
+    // is never committed locally, so there is no outbox entry for it.
+    await repo.applyServerRecords(
+      [
+        {
+          store: "walking_sessions",
+          entity_id: "session-1",
+          record: {
+            id: "session-1",
+            status: "ACTIVE",
+            started_at: "2026-09-14T10:00:00.000Z",
+            created_at: "2026-09-14T10:00:00.000Z",
+            updated_at: "2026-09-14T10:00:00.000Z",
+            deleted_at: null,
+          },
+        },
+      ],
+      1,
+    );
+
+    const snapshot = await repo.readSnapshot();
+    // This is the Resume-card escape docs/data-sync.md names for a device
+    // whose feed carries another device's live ACTIVE session: HomePage
+    // derives its Resume cards straight from this field
+    // (`local/activeSessions.ts`), with no dependency on how the ACTIVE
+    // record got here.
+    expect(snapshot.records.walking_sessions).toEqual([
+      expect.objectContaining({ id: "session-1", status: "ACTIVE" }),
+    ]);
+    expect(snapshot.pendingOutbox).toEqual([]);
+  });
+
+  it("applyServerRecords installs the active marker for a brand-new feed ACTIVE session, not only clears a stale one (M3)", async () => {
+    const repo = repository(new IDBFactory());
+    await repo.applyServerRecords(
+      [
+        {
+          store: "walking_sessions",
+          entity_id: "session-1",
+          record: {
+            id: "session-1",
+            status: "ACTIVE",
+            started_at: "2026-09-14T10:00:00.000Z",
+            created_at: "2026-09-14T10:00:00.000Z",
+            updated_at: "2026-09-14T10:00:00.000Z",
+            deleted_at: null,
+          },
+        },
+      ],
+      1,
+    );
+
+    // By design (owner decision, issue #13): at most one ACTIVE session per
+    // type locally. A feed-installed marker must block a new local one
+    // exactly like a locally-committed one would -- resume/finish the
+    // existing session is the intended escape, not a local supersede.
+    await expect(
+      repo.commitAction({
+        actionId: "start-new-session",
+        preconditions: [{ store: "walking_sessions", id: "session-2", expected: null }],
+        changes: [{ store: "walking_sessions", operation: "put", record: { id: "session-2", status: "ACTIVE" } }],
+      }),
+    ).rejects.toThrow(ActiveSessionConflictError);
+  });
 });

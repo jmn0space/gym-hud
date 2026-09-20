@@ -1062,21 +1062,33 @@ export function createLocalRepository(options: LocalRepositoryOptions = {}): Loc
   }
 
   /**
-   * Closing (terminal) fields a feed record may carry that a record with a
-   * still-pending outbox mutation must not lose, even though every other
-   * field is left as the pending mutation left it (see `applyServerRecords`'
-   * JSDoc and docs/data-sync.md, "Server-admin configuration precedence"):
-   * a tombstone (delete, including one cascaded from a parent), a session
-   * closed by the server (supersede, admin discard), and a bout/pause/rest
-   * closed because its parent closed. Applying just these keeps
-   * `active_markers` consistent with the feed without letting the feed
-   * overwrite a field the pending mutation is about to (re)write once it
-   * commits.
+   * Closing (terminal) fields a feed record may carry that a record owned by
+   * a still-pending *or rejected* outbox mutation must not lose, even though
+   * every other field is left exactly as that mutation left it (see
+   * `applyServerRecords`' JSDoc and docs/data-sync.md, "Server-admin
+   * configuration precedence"): a tombstone (delete, including one cascaded
+   * from a parent), a session closed by the server (supersede, admin
+   * discard), and a bout/pause/rest closed because its parent closed.
+   * Applying just these keeps `active_markers` consistent with the feed
+   * without letting the feed overwrite a field the pending mutation is about
+   * to (re)write once it commits, or silently revert a rejected mutation's
+   * data out from under the "needs attention" banner (see M2 in the issue
+   * #20 review).
    */
   function applyServerClosureOnly(existing: LocalRecord, feedRecord: LocalRecord): LocalRecord {
     // `exactOptionalPropertyTypes` rejects an explicit `updated_at: undefined`,
     // so the key is only ever included when there is a string to put there --
     // otherwise the spread below already carries the prior value forward.
+    //
+    // This can roll `updated_at` *backwards*: the feed's value is the older
+    // device-owned write the server already had, while the local record
+    // being closed here may carry a newer `updated_at` from the still-
+    // pending/rejected mutation itself. Harmless today -- nothing resolves
+    // conflicts by comparing `updated_at` (the conflict rule uses outbox
+    // `sequence` and server commit order, see docs/data-sync.md, "Conflict
+    // rule") and the outbox envelope itself is frozen regardless -- but
+    // flagged here so a future change doesn't mistake this field for a
+    // merge/freshness signal.
     const updatedAt = typeof feedRecord.updated_at === "string" ? { updated_at: feedRecord.updated_at } : {};
     let result = existing;
 
@@ -1122,9 +1134,20 @@ export function createLocalRepository(options: LocalRepositoryOptions = {}): Loc
     const complete = transactionComplete(transaction);
     void complete.catch(() => undefined);
     try {
-      // The set of records a still-pending (non-rejected) outbox mutation
-      // touches: the feed must not replace their device-writable fields (see
-      // `applyServerClosureOnly` above and the method's own JSDoc).
+      // The set of records a still-pending outbox mutation touches -- a
+      // rejected entry counts too, not only a genuinely pending one: the
+      // feed must not replace their device-writable fields (see
+      // `applyServerClosureOnly` above and the method's own JSDoc). "On
+      // `rejected`, keep the mutation and its local data" (docs/data-sync.md,
+      // "Client obligations") means a permanently-rejected edit is still the
+      // device's own local data, exactly like a still-pending one -- the feed
+      // may apply only a server-side closure to it, never a full replace.
+      // Before this fix, a rejected entry was skipped here, so the next feed
+      // page carrying that record would silently revert it to whatever the
+      // server last held (e.g. a rejected "finish session" edit reverting to
+      // the server's `ACTIVE` record and reinstalling the active marker,
+      // making a finished session reappear as live) even though the "needs
+      // attention" banner tells the user their edit is still on this device.
       const outboxEntries = await requestResult(
         transaction
           .objectStore(DATABASE_STORES.outbox)
@@ -1133,9 +1156,6 @@ export function createLocalRepository(options: LocalRepositoryOptions = {}): Loc
       );
       const pendingTargets = new Set<string>();
       for (const entry of outboxEntries) {
-        if (entry.rejection !== undefined) {
-          continue;
-        }
         for (const change of entry.changes) {
           const id = change.operation === "put" ? change.record.id : change.id;
           pendingTargets.add(`${change.store}\u0000${id}`);

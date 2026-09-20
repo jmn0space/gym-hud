@@ -249,3 +249,88 @@ for PAD-04 device runs and `docs/device-smoke-tests.md` remain manual).
   narrow and additive (it can only ever apply a closure, never a broader
   field), so a future clarification should only need to widen it, not undo
   anything already applied.
+
+## Review pass (commit `78ddbcb` reviewed, fixes applied as a follow-up commit)
+
+A deep review of the initial implementation found four major defects, six
+minor ones, and a set of hardening items; the test suite (319 green tests)
+missed all four majors because the untested paths were exactly where they
+lived. All were fixed except where noted below as disagreed-with.
+
+**Majors:**
+
+- **M1 (trigger 1 stops firing after the first drain).** `SyncProvider`'s
+  trigger 1 inferred "new work" from `pendingOutbox.length` growing versus a
+  remembered previous length, but nothing refreshes that remembered length
+  when the sync engine's own (usually separate) repository connection
+  acknowledges a mutation, so a second commit landing at the same length as
+  the first read as "no growth" and never fired -- during a foregrounded PAD
+  session, a whole session's mutations could sit queued indefinitely.
+  **Fixed**: trigger 1 now compares the *set* of pending mutation ids against
+  what this provider already accounted for, firing whenever the current set
+  holds an id it has not seen pending before. A plain "count > 0" check was
+  considered (an alternative the review explicitly allowed) but rejected
+  during this fix once the "refresh after a pull" hardening item below was
+  added: a persistently blocked mutation combined with every cycle's
+  successful pull refreshing the snapshot would otherwise re-trigger on every
+  refresh, an engine cycle triggering its own next cycle forever. The
+  set-comparison does not have that failure mode. See
+  `frontend/src/sync/SyncProvider.tsx` and its regression test in
+  `frontend/src/sync/SyncProvider.test.tsx`.
+- **M2 (the changes feed reverts local data behind a rejected mutation).**
+  `applyServerRecords`'s `pendingTargets` set skipped outbox entries carrying
+  a `rejection`, so a permanently-rejected mutation's record took the feed's
+  full-replace merge on the next page -- silently reverting the user's edit
+  (or, for a rejected "finish session", reinstalling the `ACTIVE` marker and
+  making a finished session reappear as live) even though the "needs
+  attention" banner claims the data is still on the device. **Fixed**:
+  rejected entries are now included in `pendingTargets` exactly like pending
+  ones, so the feed may only apply a server-side closure to their records,
+  never a full replace. See `frontend/src/storage/repository.ts` and the two
+  regression tests in `frontend/src/storage/repository.test.ts`.
+- **M3 (a feed-installed ACTIVE session blocks a new local one).**
+  Reviewed and found to be **working as designed**, not a defect: at most one
+  `ACTIVE` session per type locally is the owner-settled rule (issue #13),
+  the installed marker is also what surfaces the session as a Resume card
+  (the intended escape), and a local supersede is explicitly out of scope. No
+  code change. Added the two tests the review asked for (a feed-only session
+  resolves as a Resume card from `readSnapshot()`; the feed *installing* a
+  fresh marker, not only clearing a stale one) and documented the limitation
+  as one paragraph in `docs/data-sync.md` next to "Stuck ACTIVE sessions".
+- **M4 (backoff resets every cycle while a `retry` blocks the batch).**
+  `runCycle` called `resetBackoff()` unconditionally before every pull,
+  regardless of whether the drain actually cleared, so a blocked queue
+  retried at a flat ~5s forever instead of climbing toward the cap.
+  **Fixed**: the reset is now conditional on `drain.kind === "clear"`. See
+  `frontend/src/sync/engine.ts` and the new `"does not reset the backoff on a
+  partial drain"` test in `frontend/src/sync/engine.test.ts`.
+
+**Minors (M5-M9) and hardening**, all applied: `dispose()` now sets a
+`disposed` flag checked at the top of `runCycle` and inside `scheduleRetry`
+(M5); `pullChanges` bails out as a failure if a page claims `has_more` without
+its cursor advancing (M6, scoped to `has_more` so a legitimate "nothing new"
+page is unaffected); a malformed `max_mutations_per_request` from bootstrap is
+clamped to `[1, DEFAULT_MAX_MUTATIONS_PER_REQUEST]` (M7); the jitter
+comment now says +/-10%, matching the code and this doc (M8); the
+`docs/data-sync.md` triggers and backoff wording were corrected (M9, above).
+Hardening: a `413` halves `maxMutationsPerRequest` for the session before
+backing off; `fallbackChain` moved to module scope so it serializes across
+engines, not just within one; `trigger()`'s `startOrJoin()` call now has a
+`.catch(() => undefined)`; `applyServerClosureOnly`'s intentional backwards
+`updated_at` move is now commented; and `SyncProvider` now asks
+`LocalDataProvider` to refresh its snapshot after a cycle completes a pull
+(`refreshLiveData`, watching `lastSyncedAt`), since the two hold separate
+repository connections to the same database in production and nothing else
+would otherwise invalidate the React snapshot after `applyServerRecords`
+closes a session behind the user's back.
+
+**Test coverage added (M10):** `frontend/src/sync/SyncProvider.test.tsx` (new
+-- triggers 1/3/4, and `SyncStatus`/`SyncRejectionBanner`'s blocked/rejected/
+"Sync now" states); `frontend/src/sync/api.test.ts` (new -- `fetchChanges`'s
+exact query string, including `since=0` and cursor advancement across pages);
+`engine.test.ts`'s `"backs off exponentially..."` test now injects a fixed
+`clock` instead of reading real `Date.now()` against a +/-500ms window, and
+no longer uses `dispose()` mid-test to skip the real timer (which would now
+be a permanent no-op post-M5) -- it waits out the real, small-scale timer
+instead and asserts against the fixed clock, which is exact rather than
+windowed.

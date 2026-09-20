@@ -98,6 +98,18 @@ export interface LocalDataContextValue extends LocalDataState {
   retry: () => Promise<void>;
   /** Clears a non-retryable error (conflict/invalid/corruption) once the user has seen it. */
   dismissError: () => void;
+  /**
+   * Fire-and-forget background refresh of the live snapshot from this
+   * provider's own repository -- the same path the focus/visibility
+   * listeners below use, without flashing "loading" and without disturbing
+   * an unresolved retryable-write error. `SyncProvider` opens its own,
+   * separate repository connection to the same IndexedDB database (see
+   * `App.tsx`), so applying changes-feed records through that connection
+   * does not, by itself, update this provider's React state; it calls this
+   * after a pull completes so a server-closed session or an admin's edit
+   * becomes visible without waiting for the next focus event.
+   */
+  refreshLiveData: () => void;
 }
 
 interface LocalDataProviderProps {
@@ -375,6 +387,21 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
     ++operationRef.current;
   }, []);
 
+  // Extracted (not just a closure inside the mount effect below) so
+  // `refreshLiveData` on the context value and the focus/visibility
+  // listeners share one implementation.
+  const refreshFromAnotherView = useCallback(() => {
+    if (failedActionRef.current !== null) {
+      // A retryable write failure is still unresolved: a background refresh that
+      // happens to succeed must not silently clear it, or the user would never
+      // learn the save failed and Retry needs the failed action to still exist.
+      return;
+    }
+    const refreshOperation =
+      stickyErrorRef.current !== null ? refreshPreservingStickyError : () => readSnapshot("refresh");
+    void enqueue(refreshOperation).catch(() => undefined);
+  }, [enqueue, readSnapshot, refreshPreservingStickyError]);
+
   const closeAfterUnmount = useCallback(
     (lifecycle: number) => {
       queueMicrotask(() => {
@@ -397,17 +424,6 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
     mountedRef.current = true;
     const lifecycle = ++lifecycleRef.current;
     void readSnapshot().catch(() => undefined);
-    const refreshFromAnotherView = () => {
-      if (failedActionRef.current !== null) {
-        // A retryable write failure is still unresolved: a background refresh that
-        // happens to succeed must not silently clear it, or the user would never
-        // learn the save failed and Retry needs the failed action to still exist.
-        return;
-      }
-      const refreshOperation =
-        stickyErrorRef.current !== null ? refreshPreservingStickyError : () => readSnapshot("refresh");
-      void enqueue(refreshOperation).catch(() => undefined);
-    };
     const refreshWhenVisible = () => {
       if (document.visibilityState === "visible") {
         refreshFromAnotherView();
@@ -422,7 +438,7 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
       cancelPendingOperations();
       closeAfterUnmount(lifecycle);
     };
-  }, [cancelPendingOperations, closeAfterUnmount, enqueue, readSnapshot, refreshPreservingStickyError]);
+  }, [cancelPendingOperations, closeAfterUnmount, readSnapshot, refreshFromAnotherView]);
 
   const value = useMemo<LocalDataContextValue>(
     () => ({
@@ -435,6 +451,7 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
       setSyncMetadata,
       retry,
       dismissError,
+      refreshLiveData: refreshFromAnotherView,
     }),
     [
       commitAction,
@@ -443,6 +460,7 @@ export function LocalDataProvider({ children, repository: suppliedRepository }: 
       listPendingOutbox,
       listRecords,
       readLiveSnapshot,
+      refreshFromAnotherView,
       setSyncMetadata,
       retry,
       state,
