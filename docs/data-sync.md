@@ -734,9 +734,37 @@ bout ends and every open bout, pause and rest when the session ends; stamp times
 monotonically within a session (done: `monotonicNow`); refuse a new bout while a
 rest is open; tombstone a rest when undoing the bout finish that created it; delete
 children with their parent; never reopen a finished session; keep pain, stop reason
-and text within the rules above. Today's local repository enforces the one-at-a-time
-rules and the monotonic clock, but not containment or PAD-06; the PAD controls
-(#21, #22) and the sync engine (#20) must add them.
+and text within the rules above.
+
+**Settled 2026-09-20 (issue #22).** The local repository (`commitAction` in
+`frontend/src/storage/repository.ts`) enforces the one-at-a-time rules, the
+monotonic clock, and PAD-06 (`checkNewWalkingBoutsAgainstRests`, a dedicated
+check alongside the generic cardinality one, since "a bout cannot open while a
+rest is open" spans two records neither the bout's own scope nor the rest's
+own scope alone describes). Containment -- a bout inside its session, a pause
+inside its bout, a rest starting at or after its bout ended, and the rest of
+[PAD validation](#pad-validation) -- is not a repository-level check: it is
+enforced by the PAD action layer (`frontend/src/pad/actions.ts`) instead,
+which validates the resulting session state as a whole (`assertContainedWalkingSession`)
+before building every correction, every undo and every delete, and is the
+only path the application uses to construct these mutations. See [PAD
+walking: Editing, undo, and delete](pad-walking.md#editing-undo-and-delete)
+for the correction validation rules, the undo contract (a forward
+compensating mutation, derived from an explicit transition stamp on the
+session record rather than an undo stack), and the delete-with-renumber
+mutation shape.
+
+**Correction (issue #22, finding 2):** at the time this paragraph was first
+written, `assertContainedWalkingSession` was called only from the three
+`correct*` builders -- undo and delete built their mutations unchecked, which
+made the claim above false for two of the three kinds of mutation this
+paragraph describes, and was the concrete opening finding 1's stamp fix (see
+[PAD walking: Undo](pad-walking.md#undo)) closed: a wrong undo target could
+otherwise have been committed rather than refused. Both now call it too
+(`frontend/src/pad/actions.ts`, `undoLastWalkingTransitionAction` and
+`deleteWalkingBoutAction`), against the *hypothetical resulting* bouts/pauses/
+rests before any change is pushed onto the `LocalAction`, so the sentence
+above is accurate as written.
 
 ### Unsupported stores and versions
 

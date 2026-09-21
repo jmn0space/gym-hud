@@ -9,9 +9,16 @@ then deletes child-first) -- and the record shapes of
 push, so "the server accepts everything the frontend produces" is tested
 against the frontend's shapes rather than hand-written JSON.
 
-The PAD actions beyond start/finish session (pause, finish bout + rest, start
-next bout, pain, delete, undo) are not in the frontend yet; they are built the
-way docs/pad-walking.md and docs/data-sync.md describe them.
+Pause, finish bout + rest, start next bout and pain/notes edits mirror the
+frontend's own builders (`frontend/src/pad/actions.ts`, issues #18/#21).
+`delete_bout` mirrors deleting a bout's children and itself, but -- unlike
+`frontend/src/pad/actions.ts`'s `deleteWalkingBoutAction` (issue #22) -- does
+not also renumber surviving bouts in the same mutation: existing callers only
+use it to exercise the generic tombstone/cascade/undo mechanics, which do not
+depend on numbering. The renumbering shape is instead proven end to end by
+`frontend/src/padCorrectionsReplay.test.ts` and
+`test_pad_corrections_replay.py`, which replay the frontend's own generated
+envelope rather than building one here.
 """
 
 from __future__ import annotations
