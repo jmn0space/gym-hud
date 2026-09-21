@@ -1,6 +1,6 @@
 # Acceptance Criteria
 
-[← Documentation index](README.md) · [PAD walking](pad-walking.md) · [Resistance & cardio](training.md) · [Architecture](architecture.md) · [Data & sync](data-sync.md)
+[← Documentation index](README.md) · [PAD walking](pad-walking.md) · [Resistance & cardio](training.md) · [Architecture](architecture.md) · [Data & sync](data-sync.md) · [Device smoke tests](device-smoke-tests.md) · [PAD pilot validation](pad-pilot-validation.md)
 
 These tests define the minimum behaviour required for v1.
 
@@ -93,9 +93,16 @@ protocol, the processed-mutation ledger and the PAD models; see [Data &
 synchronization: server synchronization
 protocol](data-sync.md#server-synchronization-protocol)). Issue #20 delivered the
 client sync engine that drains the outbox and pulls reference data (see [Data &
-synchronization: client obligations](data-sync.md#client-obligations)). Pause,
-finish-bout and rest controls are still outstanding; each item is annotated
-below with exactly what it is still waiting on.
+synchronization: client obligations](data-sync.md#client-obligations)). Issue
+#21 then delivered the pause, finish-bout, and start-next-bout controls
+(`Pause`/`Resume`, `Finish bout`, `Start next bout` in
+`frontend/src/pages/PadPage.tsx`), which unblocks the PAUSED and RESTING items
+below; each item is annotated with exactly what it is still waiting on, if
+anything. Issue #23 is the validation pass across all of this: its evidence
+record is [`docs/pad-pilot-validation.md`](pad-pilot-validation.md), which
+tracks device and automated coverage per acceptance ID and is the place to
+check the current pass/fail status rather than this checklist's own item-level
+notes.
 
 - [ ] Start a PAD bout while offline and confirm the saved state is visible.
   **No longer blocked; not yet run.** Issue #18 added the start-session and
@@ -112,23 +119,26 @@ below with exactly what it is still waiting on.
   it is not a substitute for this box, which is about a real locked phone.
 - [ ] Force-stop the installed PWA/browser process, reopen it, and confirm Home shows
   `Resume PAD Walking` with the correct READY, WALKING, PAUSED, or RESTING state.
-  **Runnable for WALKING; PAUSED and RESTING still blocked; not yet run.** The
-  "installed," "force-stop," and "cold-start reopen while offline" mechanics
-  are a concrete procedure in
-  [`docs/device-smoke-tests.md`](device-smoke-tests.md), and issue #18's
-  controls can now put a real walking bout on the device before the force-stop,
-  so the WALKING case (PAD-02 below) is runnable. PAUSED and RESTING cannot yet
-  be produced through the UI — pause and finish-bout controls are the deferred
-  story — so that part of this item stays blocked. The application reconstructs
-  and displays both states when the records exist, and automated tests cover
-  that, but no device run has been performed.
+  **Fully runnable; not yet run.** The "installed," "force-stop," and
+  "cold-start reopen while offline" mechanics are a concrete procedure in
+  [`docs/device-smoke-tests.md`](device-smoke-tests.md). Issue #18's controls
+  make the WALKING case runnable (Part B, PAD-02 below); issue #21's `Pause`
+  and `Finish bout` controls make PAUSED and RESTING runnable too — see Part C,
+  steps C3–C4 (PAUSED) and C6 (RESTING). The application reconstructs and
+  displays all three states when the records exist, and automated tests cover
+  that, but no device run has been performed. See
+  [`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for the issue #23
+  evidence record.
 - [ ] Complete a multi-record transition offline, reload, and confirm its pending
   synchronization action is still present exactly once.
-  **Partially unblocked; not yet run.** `FINISH SESSION` with a bout still open
-  is a multi-record transition in one action (it closes the bout and completes
-  the session together), so this item can now be exercised that way. The
-  specific transition LOCAL-03 names — finishing a bout and starting its rest —
-  still needs the deferred finish-bout control.
+  **Fully unblocked; not yet run.** `FINISH SESSION` with a bout still open is
+  one such multi-record transition (it closes the bout and completes the
+  session together). The specific transition LOCAL-03 names — finishing a bout
+  and starting its rest — is issue #21's `Finish bout` control, exercised
+  offline end to end in Part C, steps C7–C11 of
+  [`docs/device-smoke-tests.md`](device-smoke-tests.md) (PAD-03). See
+  [`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for the issue #23
+  evidence record.
 - [ ] Restore connectivity and confirm a failed synchronization attempt remains
   pending for retry.
   **No longer blocked; not yet run.** The client sync engine (issue #20,
@@ -136,7 +146,10 @@ below with exactly what it is still waiting on.
   bounded backoff; see PAD-04 below for the automated coverage of the same
   offline-queue-then-drain behaviour and [Data & synchronization: sync
   gate](data-sync.md#sync-gate). This box is the real-device run: a genuine
-  network toggle, not a mocked one, has not been performed.
+  network toggle, not a mocked one, has not been performed. See Part C, steps
+  C12–C14 of [`docs/device-smoke-tests.md`](device-smoke-tests.md) and
+  [`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for the issue #23
+  evidence record.
 
 These boxes record manual device work only. Automated browser and repository tests
 do not mark them complete. See the Overall v1 continuity criterion at the end of
@@ -201,7 +214,8 @@ app becomes visible again, and then matches the timestamp-derived duration
 exactly. That covers the derivation, not the device: the real locked-phone run
 is the checklist box above and Part B of
 [`docs/device-smoke-tests.md`](device-smoke-tests.md), neither of which has been
-performed.
+performed. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for
+the issue #23 evidence record and current status.
 
 ### PAD-02 — Application termination
 
@@ -219,7 +233,8 @@ summary are both reconstructed from persisted records alone, with the correct
 bout number and elapsed duration. Terminating a React tree is not terminating an
 Android process: the real force-stop run is Part B of
 [`docs/device-smoke-tests.md`](device-smoke-tests.md) and has not been
-performed.
+performed. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for
+the issue #23 evidence record and current status.
 
 ### PAD-03 — Offline session
 
@@ -231,6 +246,14 @@ performed.
 6. Start the next bout.
 
 Expected: all operations work locally.
+
+Every step of this sequence is available through the UI as of issue #21
+(`Start walking`, `Finish bout`, the pain selector, `Start next bout` in
+`frontend/src/pages/PadPage.tsx`), so this is now a runnable device
+procedure — see Part C, steps C7–C11 of
+[`docs/device-smoke-tests.md`](device-smoke-tests.md) — but no device run
+has been performed. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md)
+for the issue #23 evidence record.
 
 ### PAD-04 — Reconnection
 
@@ -250,7 +273,11 @@ through the real sync engine once authenticated and online"` in
 `frontend/src/App.test.tsx`. That covers the drain itself, not the device:
 the real airplane-mode-then-restore run is the checklist box above and Part B
 of [`docs/device-smoke-tests.md`](device-smoke-tests.md), neither of which has
-been performed.
+been performed. The full offline-then-reconnect sequence, including a
+concrete server-side check for "one server record per logical action," is
+Part C, steps C12–C14 of the same document. See
+[`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for the issue #23
+evidence record.
 
 ### PAD-05 — Duplicate mutation
 
@@ -281,7 +308,11 @@ above this proves "only one logical server-side event exists" end to end
 through the client's own retry path. Not verified here: the
 transmit-twice-from-the-phone real-device run (radio toggled mid-request,
 genuine duplicate delivery) — see
-[`docs/device-smoke-tests.md`](device-smoke-tests.md).
+[`docs/device-smoke-tests.md`](device-smoke-tests.md). No device procedure
+for that specific real-device scenario has been written yet; see
+[`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for the issue #23
+evidence record and why it is out of scope for the current device
+procedure.
 
 ### PAD-06 — Rest integrity
 
@@ -298,14 +329,26 @@ both records written); `test_close_rest_and_start_next_roll_back_together` and
 `test_finish_bout_and_start_rest_roll_back_together` show both multi-record
 operations roll back as a whole. This is the server refusing the out-of-band start.
 The device side -- the RESTING state, the `START NEXT BOUT` control, and a local
-rule that refuses the start before it is queued -- belongs to the pause/rest
-controls (issues #21/#22), is not built yet, and no device run has been performed.
+rule that refuses the start before it is queued -- is delivered by issue #21
+(`finishWalkingBoutAction`/`startNextWalkingBoutAction` and the matching
+`requireState`/`currentRest` guards in `frontend/src/pad/actions.ts`), so this
+is now a runnable device procedure -- see Part C, step C6 of
+[`docs/device-smoke-tests.md`](device-smoke-tests.md) -- but no device run has
+been performed. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md)
+for the issue #23 evidence record.
 
 ### PAD-07 — Maximum timer
 
 Allow a bout to reach and exceed its configured maximum.
 
 Expected: the HUD alerts the user but does not automatically terminate the bout.
+
+This is a runnable device procedure — `WalkingHud` grows a `· Maximum
+reached` alert once `hasReachedMaximum` is true and never stops the bout on
+its own (`frontend/src/pages/PadPage.tsx`, `frontend/src/pad/session.ts`) —
+see Part C, steps C15–C16 of [`docs/device-smoke-tests.md`](device-smoke-tests.md),
+which has not been run. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md)
+for the issue #23 evidence record.
 
 ### PAD-08 — Pause
 
@@ -316,6 +359,16 @@ Expected: the HUD alerts the user but does not automatically terminate the bout.
 
 Expected: effective walking duration excludes the paused interval.
 
+Runnable since issue #21 added the `Pause`/`Resume` controls
+(`pauseWalkingBoutAction`/`resumeWalkingBoutAction` in
+`frontend/src/pad/actions.ts`, whose derivation is
+`walkingElapsedMs`/`pausedMs` in `frontend/src/pad/session.ts`) — see Part C,
+steps C1–C5 of [`docs/device-smoke-tests.md`](device-smoke-tests.md), which
+also covers this state surviving a force-stop and offline cold-reopen. No
+device run has been performed. See
+[`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for the issue #23
+evidence record.
+
 ### PAD-09 — Manual time correction
 
 1. Allow a bout to continue accidentally beyond its intended end.
@@ -323,6 +376,15 @@ Expected: effective walking duration excludes the paused interval.
 3. Edit the displayed end time.
 
 Expected: bout duration and related derived values are recalculated correctly.
+
+**Blocked.** Editing a recorded bout's end time has no implementation on
+this branch. It is issue #22's scope (PAD timestamp corrections, confirmed
+undo, bout deletion), whose pull request,
+[#43](https://github.com/jmn0space/gym-hud/pull/43), is open and unmerged.
+Neither automated coverage nor a device procedure exists for PAD-09 yet; see
+[`docs/pad-pilot-validation.md`](pad-pilot-validation.md) ("Blocking
+issues") for the full record. This is expected to remain `BLOCKED` until
+issue #22 merges.
 
 ## Resistance training
 
@@ -513,6 +575,13 @@ different-user protection — are covered by automated tests in
 `frontend/src/auth/AuthProvider.test.tsx` (the `AuthProvider logout` and
 `AuthProvider account-mismatch (finding #2)` describe blocks) rather than
 restated here.
+
+Case (c)'s device evidence — invalidating a real session server-side while
+the phone holds a pending offline workout, then reconnecting and
+re-authenticating — is Part C, steps C17–C21 of
+[`docs/device-smoke-tests.md`](device-smoke-tests.md); no device run has
+been performed. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md)
+for the issue #23 evidence record.
 
 **(a) No valid session, protected API endpoint**
 
