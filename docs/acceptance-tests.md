@@ -217,6 +217,22 @@ is the checklist box above and Part B of
 performed. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for
 the issue #23 evidence record and current status.
 
+Real-browser coverage (issue #23): `PAD-01 — lock-screen recovery: displayed
+duration resyncs after a visibility/focus recovery signal, and ONLY via that
+resync path` in `frontend/e2e/pad-walking.spec.ts` installs Playwright's
+`page.clock` before navigation and pauses it, so `useNow`'s `setInterval`
+(`frontend/src/pad/useNow.ts`) provably cannot tick even once while fake time
+advances 10s; the displayed duration can only catch up through the
+`visibilitychange`/`focus` resync listeners. This test is genuinely
+fail-sensitive to that resync path specifically, not merely to "does the
+duration eventually update": deleting those two listeners from `useNow.ts`
+makes it fail (a stale 10000ms reading against a 1100ms tolerance), and
+restoring them makes it pass again. Still a real desktop-Chromium browser,
+not the target Android device — see
+[`docs/pad-pilot-validation.md`](pad-pilot-validation.md#what-automated-evidence-can-and-cannot-establish)
+for exactly what a paused fake clock cannot establish about a real locked
+phone.
+
 ### PAD-02 — Application termination
 
 1. Start a bout.
@@ -236,6 +252,24 @@ Android process: the real force-stop run is Part B of
 performed. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for
 the issue #23 evidence record and current status.
 
+Real-browser coverage (issue #23): `PAD-02 — application termination: Home
+reconstructs the WALKING state and elapsed duration after a cold reopen, and
+resuming shows the same in the PAD HUD` in `frontend/e2e/pad-walking.spec.ts`
+covers the WALKING case, and `PAD-02 — application termination: Home
+reconstructs the RESTING state after a cold reopen while resting, and
+resuming offers Start next bout` in `frontend/e2e/pad-offline.spec.ts` covers
+RESTING; the PAUSED case is exercised by `PAD-08 — pause: the PAUSED state
+and its excluded-pause elapsed time restore after a cold reopen`
+(`pad-walking.spec.ts`). All three use `coldReopen`
+(`frontend/e2e/support/fixtures.ts`), which closes a real Playwright `Page`
+and opens a fresh one in the same browser context — a genuine service-worker
+and IndexedDB-connection teardown/re-establishment, which is closer to a
+real termination than unmounting a React tree, but it is still one `Page`
+closing inside a process Playwright itself keeps alive throughout, not an
+Android force-stop killing the whole application process. See
+[`docs/pad-pilot-validation.md`](pad-pilot-validation.md#what-automated-evidence-can-and-cannot-establish)
+for why that distinction still matters.
+
 ### PAD-03 — Offline session
 
 1. Disable connectivity.
@@ -254,6 +288,14 @@ procedure — see Part C, steps C7–C11 of
 [`docs/device-smoke-tests.md`](device-smoke-tests.md) — but no device run
 has been performed. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md)
 for the issue #23 evidence record.
+
+Real-browser coverage (issue #23): `PAD-03 — offline session: bout, finish,
+pain, rest and next bout all work while offline` in
+`frontend/e2e/pad-offline.spec.ts` runs this exact sequence — start, finish,
+pain 3–4, start next bout — under a genuine `context.setOffline(true)`
+network cut (not a mocked `fetch` failure), and confirms zero requests
+reached the mock server at any point. Real desktop-Chromium networking, not
+a real device's radio, DNS, or captive-portal behaviour.
 
 ### PAD-04 — Reconnection
 
@@ -278,6 +320,17 @@ concrete server-side check for "one server record per logical action," is
 Part C, steps C12–C14 of the same document. See
 [`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for the issue #23
 evidence record.
+
+Real-browser coverage (issue #23): `PAD-04 — reconnection drains the whole
+offline queue with no manual re-entry, in order, one applied server record
+per logical action` in `frontend/e2e/auth-sync.spec.ts` queues six distinct
+logical PAD actions under a genuine `context.setOffline(true)`, then flips
+connectivity back on and polls the mock server's own ledger for exactly six
+applied mutations, in ascending sequence, with a per-mutation signature
+distinguishing "finish bout 1" from "start bout 2" — no manual "Sync now" or
+re-entry involved, matching Trigger 4 (the browser's own `online` event).
+Real desktop-Chromium networking and a real mock HTTP server, not the target
+device's radio.
 
 ### PAD-05 — Duplicate mutation
 
@@ -314,6 +367,20 @@ for that specific real-device scenario has been written yet; see
 evidence record and why it is out of scope for the current device
 procedure.
 
+Real-browser coverage (issue #23): `PAD-05 — a mutation delivered twice
+because its first acknowledgement was lost is applied exactly once` in
+`frontend/e2e/auth-sync.spec.ts` intercepts the first push with
+`route.fetch()` (letting the mock server genuinely apply and ledger the
+mutation) followed by `route.abort("failed")` (throwing the response away
+before the client sees it) — deliberately indistinguishable, from the
+client's point of view, from a real lost acknowledgement. The client's own
+retry path (`syncNow`) then resends, gets back `duplicate`, and the test
+confirms exactly one applied mutation on the server despite two-or-more
+deliveries. This proves the client's real retry code and the mock server's
+real ledger agree end to end in a real browser; it is not, and does not
+claim to be, the genuine radio-toggle duplicate-delivery device scenario
+above.
+
 ### PAD-06 — Rest integrity
 
 While resting, attempt to start another bout outside the normal control.
@@ -337,6 +404,18 @@ is now a runnable device procedure -- see Part C, step C6 of
 been performed. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md)
 for the issue #23 evidence record.
 
+Real-browser coverage (issue #23): `PAD-06 — rest integrity: Start walking
+is not offered while RESTING, and Start next bout closes the rest and
+starts the next bout atomically` in `frontend/e2e/pad-offline.spec.ts` runs
+this offline, on purpose: it strengthens the claim that the restriction is a
+local UI/state-machine rule (`requireState(view, "RESTING")` in
+`frontend/src/pad/actions.ts`) rather than something only a reachable server
+enforces. It confirms `Start walking` does not exist in the DOM at all while
+RESTING (not merely hidden or disabled) and that `Start next bout` closes
+the rest and opens the next bout in one tap with nothing pushed to the
+server throughout. This is UI-level coverage of the local rule; the
+server-side rejection path above remains the server-side evidence.
+
 ### PAD-07 — Maximum timer
 
 Allow a bout to reach and exceed its configured maximum.
@@ -349,6 +428,16 @@ its own (`frontend/src/pages/PadPage.tsx`, `frontend/src/pad/session.ts`) —
 see Part C, steps C15–C16 of [`docs/device-smoke-tests.md`](device-smoke-tests.md),
 which has not been run. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md)
 for the issue #23 evidence record.
+
+Real-browser coverage (issue #23): `PAD-07 — maximum timer: the HUD alerts
+once the maximum bout is reached but does not auto-terminate the bout` in
+`frontend/e2e/pad-walking.spec.ts` sets `Maximum bout (minutes)` to `0.5`
+(the smallest legal value) and genuinely waits out the full 30 real
+wall-clock seconds — not a faked clock, since `useNow`'s interval is already
+running against the page's real timers before this test could install one —
+confirming the `· Maximum reached` alert appears, the bout stays WALKING
+with `Pause`/`Finish bout` still offered, `Start next bout` never appears,
+and no `walking_rests` mutation was ever pushed to the server.
 
 ### PAD-08 — Pause
 
@@ -368,6 +457,18 @@ also covers this state surviving a force-stop and offline cold-reopen. No
 device run has been performed. See
 [`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for the issue #23
 evidence record.
+
+Real-browser coverage (issue #23): `PAD-08 — pause: effective walking
+duration excludes the paused interval` in `frontend/e2e/pad-walking.spec.ts`
+walks a real ~3s, pauses a real ~3s, walks a further real ~2s, then finishes
+the bout and asserts the recorded duration matches the two measured walk
+spans (not the raw total) within an 800ms tolerance — measured against
+`Date.now()` at each click rather than nominal wait constants, so the only
+slack is the commit round-trip. `PAD-08 — pause: the PAUSED state and its
+excluded-pause elapsed time restore after a cold reopen` covers the pause
+surviving a `coldReopen`: the excluded-pause figure reconstructs to the
+pre-pause walking time immediately after reopening and does not keep
+growing while the pause stays open through more real waiting afterwards.
 
 ### PAD-09 — Manual time correction
 
@@ -583,6 +684,23 @@ re-authenticating — is Part C, steps C17–C21 of
 been performed. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md)
 for the issue #23 evidence record.
 
+Real-browser coverage (issue #23) for case (c): `AUTH-01(c) — session expiry
+during a pending offline workout keeps local data and the outbox untouched,
+and drains once with no duplicates after re-authenticating` in
+`frontend/e2e/auth-sync.spec.ts` queues three mutations offline, invalidates
+the session server-side while still offline (so the device genuinely cannot
+know yet), then reconnects — the resulting 401 on the drain attempt, not the
+offline gap itself, is what flips `authStatus` to `expired`. It confirms the
+PAD screen stays live and usable throughout (never unmounted), the outbox
+and applied-mutation count stay untouched until re-authentication, and the
+whole three-mutation queue then drains once, in order, with no duplicates,
+through the expired-session banner's own inline sign-in form — no
+sign-out/sign-in round trip. This is a real session invalidation against
+the mock server and a real client-side `authStatus` transition, not a
+mocked 401; it is still desktop Chromium against a mock server, not the
+target device against the real backend, which is what Part C's device run
+above still needs to prove.
+
 **(a) No valid session, protected API endpoint**
 
 Call a protected `/api/v1/` endpoint (i.e. anything outside the public
@@ -596,6 +714,19 @@ Expected: `401 {"code": "not_authenticated"}`. Separately, an unsafe request
 CSRF validity are independent checks, and neither substitutes for the
 other. See [Architecture: uniform API error shape](architecture.md#uniform-api-error-shape).
 
+Real-browser suite (issue #23), mock-fidelity guard only: `AUTH-01(a) mock-fidelity guard — the
+harness's guardProtectedEndpoint reproduces the real server's 401-before-403
+ordering` in `frontend/e2e/auth-sync.spec.ts` is **not** acceptance evidence
+for case (a) — every assertion in it targets the harness's own mock
+(`support/server.ts`'s `guardProtectedEndpoint`), never the real Django
+server, so it cannot fail if the real `SessionAuthentication.enforce_csrf`
+ordering in `backend/core/authentication.py` regressed. It stays useful as a
+guard that the mock keeps reproducing the documented 401-before-403 ordering
+faithfully, so `AUTH-01(b)`/`(c)` below are not misled by a mock that has
+drifted from the real contract. The genuine, real-server evidence for case
+(a) remains `backend/core/tests/test_auth.py` and the backend guard test
+below.
+
 **(b) Device that has never signed in**
 
 Open the application on a device that has never completed a successful
@@ -603,6 +734,15 @@ login.
 
 Expected: only the login screen is shown. No local workout data exists yet
 to expose, and none is fetched.
+
+Real-browser coverage (issue #23): `AUTH-01(b) — a device that has never
+signed in shows only the login screen and fetches no workout data` in
+`frontend/e2e/auth-sync.spec.ts` is genuine product coverage: it asserts the
+login form (`Username`/`Password`/`Sign in`) is shown, primary navigation
+and PAD links do not exist, and — read from the mock server's own request
+log, captured from the very first byte the browser sent this origin, not
+from a route installed mid-test — zero `/api/v1/sync/` requests, zero
+pushes, zero applied mutations.
 
 **(c) Previously signed-in device without a currently valid session**
 

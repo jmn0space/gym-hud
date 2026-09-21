@@ -295,9 +295,34 @@ C11. Reload the page (browser refresh) while still offline. Confirm the HUD
 
 **PAD-04 reconnection: one server record per logical action:**
 
-C12. Count the logical actions queued offline in C7–C10: start session +
-     bout 1, finish bout 1 into its rest, edit bout 1's pain, start bout 2 —
-     four, unless a step above reused a bout already running.
+C12. Enumerate the mutations C7–C10 should have queued offline, in the
+     order they were committed, and why each is its own row rather than
+     folded into its neighbor:
+
+     1. start session (C7's `Start`) — creates the walking session.
+     2. start bout 1 (C7's `Start walking`) — a separate action from #1:
+        starting a session and starting its first bout are two logical
+        actions in this app (`startWalkingSessionAction` and
+        `startWalkingBoutAction` in `frontend/src/pad/actions.ts`), even
+        though C7 has you press both buttons back to back.
+     3. finish bout 1 into its rest (C8) — one row, not two: ending the
+        bout and opening its rest commit atomically in the same mutation
+        (`finishWalkingBoutAction`); there is no separate action for
+        "open a rest."
+     4. pain → 3 (C9's first press).
+     5. pain → 3–4 (C9's second press) — its own row, not an amendment of
+        #4: every pain button press commits and clears immediately, so
+        the next press starts a fresh mutation rather than editing the
+        one before it. Two presses always produce two rows, whatever
+        range they land on.
+     6. start bout 2, closing bout 1's rest (C10) — again one row: closing
+        the rest and opening bout 2 commit atomically in the same
+        mutation (`startNextWalkingBoutAction`).
+
+     Six mutations in total for C7–C10 as scripted above. If you pressed
+     the pain selector a different number of times than C9 says, adjust
+     only step 4/5 above — every other press-to-mutation is one-for-one
+     regardless.
 C13. Disable Airplane Mode. Confirm Home's "Saved on this device" count
      drains to `No saved changes waiting to sync` within a few seconds, with
      no action beyond reconnecting — no manual re-entry.
@@ -317,12 +342,21 @@ C14. On the host, confirm the server side agrees exactly. Using the
      "
      ```
 
-     Confirm `applied` equals the count from C12 and equals `processed
-     (all)` (nothing `rejected`, nothing left `retry`), and that `live
-     bouts`/`live rests` match what the device shows — one ledger row per
-     queued action, never two for the same button press. Equivalently,
-     browse `/admin/sync/processedmutation/` and `/admin/pad/walkingbout/`
-     in Django Admin, filtered to this account.
+     Confirm `applied` equals the six-row enumeration from C12 (or your
+     adjusted count, if C9's presses differed) and equals `processed
+     (all)` — nothing `rejected`, nothing left unresolved — and that `live
+     bouts`/`live rests` match what the device shows.
+
+     The number itself depends on following C7–C10 exactly as scripted, so
+     the invariant that actually matters, and that holds no matter how many
+     times you tapped the pain selector, is this: **never two ledger rows
+     for one button press.** Concretely, one press of `Start`, `Start
+     walking`, `Finish bout`, a pain button, or `Start next bout` must
+     correspond to exactly one `ProcessedMutation` row — not zero (lost),
+     not two (duplicated). That per-press count is what this step is really
+     checking; the six-row total is only that count applied to the script
+     above. Equivalently, browse `/admin/sync/processedmutation/` and
+     `/admin/pad/walkingbout/` in Django Admin, filtered to this account.
 
 **PAD-07 maximum timer:**
 
@@ -340,9 +374,23 @@ C16. Let the bout run past 30 seconds without pressing `Finish bout`.
 **Session expiry and re-authentication during a pending offline workout**
 (AUTH-01(c), issue #23 criterion 4):
 
-C17. Online and signed in, press `Start`, then `Start walking`. Enable
-     Airplane Mode, then press `Pause`, so at least two mutations (start,
-     pause) sit queued offline.
+C17. Start online and signed in, with no active session and nothing waiting
+     to sync — Home must read `No saved changes waiting to sync` before you
+     continue. The point of this step is a *valid* server session that C18
+     can then invalidate, so it has to be established online first.
+
+     Now enable Airplane Mode, and only then press `Start`, `Start walking`
+     and `Pause`. That queues three mutations offline (start session, start
+     bout 1, pause — see C12 for why the first two are separate logical
+     actions). Confirm Home's "Saved on this device" count shows three
+     waiting.
+
+     The order matters and is easy to get wrong: pressing `Start` while
+     still online lets the sync engine drain it immediately, which would
+     leave only the pause genuinely queued and reduce this check to a
+     single-mutation case. Everything C19–C21 assert about local data and
+     the outbox surviving an expiry is only meaningfully tested with a
+     real queue behind it.
 C18. On the host, while the phone stays offline, rotate the provisioned
      account's password to force its current session out — see
      `docs/architecture.md`, "Provisioning the application account":
@@ -363,13 +411,14 @@ C19. Disable Airplane Mode on the phone. Confirm the app's next session
      expired — sign in to sync` banner (`ExpiredSessionBanner`) on every
      screen.
 C20. Confirm local data survives untouched: PAD still shows the same paused
-     bout from C17, and Home's "Saved on this device" count still lists the
-     queued mutation(s) — nothing is cleared by the expiry.
+     bout from C17, and Home's "Saved on this device" count still shows all
+     three queued mutations — the expiry must clear neither the records nor
+     the outbox.
 C21. Tap the banner's `Sign in` and sign in with the new password. Confirm
-     the banner disappears and, with no further manual action, the queued
-     mutation(s) drain (the pending count returns to `No saved changes
-     waiting to sync`). Re-run the C14 server check and confirm no
-     duplicate rows exist for this device's actions.
+     the banner disappears and, with no further manual action, all three
+     queued mutations drain (the pending count returns to `No saved changes
+     waiting to sync`). Then apply C14's ledger check to these three: one
+     `applied` row each, and no duplicate rows for this device's actions.
 
 **Service-worker update while a session is active** (issue #23
 criterion 4):
@@ -452,12 +501,12 @@ Per-step results (Run 1):
 | C9 | C | Record pain 3–4, offline | NOT YET RUN | |
 | C10 | C | Start next bout, offline | NOT YET RUN | |
 | C11 | C | Reload offline; state persisted (PAD-03) | NOT YET RUN | |
-| C12 | C | Count logical offline actions | NOT YET RUN | |
+| C12 | C | Enumerate the expected offline mutations (six, per script) | NOT YET RUN | |
 | C13 | C | Reconnect; outbox drains with no manual re-entry (PAD-04) | NOT YET RUN | |
-| C14 | C | Server-side check: one ledger row and one record per action | NOT YET RUN | |
+| C14 | C | Server-side check: applied count matches C12's enumeration; never two rows for one press | NOT YET RUN | |
 | C15 | C | Start session with a 30-second maximum bout | NOT YET RUN | |
 | C16 | C | Maximum exceeded; HUD alerts, bout not auto-terminated (PAD-07) | NOT YET RUN | |
-| C17 | C | Start + pause offline (queue two mutations) | NOT YET RUN | |
+| C17 | C | Sign in online, then start + pause offline (queue three mutations) | NOT YET RUN | |
 | C18 | C | Invalidate session server-side (`ensure_app_user --reset-password`) | NOT YET RUN | |
 | C19 | C | Reconnect; app reaches `expired`, banner shown | NOT YET RUN | |
 | C20 | C | Local data and outbox survive the expiry untouched | NOT YET RUN | |
