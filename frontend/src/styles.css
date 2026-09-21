@@ -415,6 +415,68 @@ p {
   gap: 0.75rem;
 }
 
+/* Corrections (issue #22): recorded times can be tapped and corrected, in a
+   details/summary disclosure matching .pad-notes so the default read-only
+   HUD stays uncluttered. */
+.pad-times {
+  width: 100%;
+  padding: 0.5rem 0;
+  text-align: left;
+}
+
+.pad-times summary {
+  min-height: var(--touch-target);
+  padding: 0.75rem 0;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.pad-times[open] {
+  display: grid;
+  gap: 0.75rem;
+}
+
+/* Collapsed state: a full-width, >=48px tap target showing the label and the
+   recorded time -- the documented exception to "avoid keyboard input during
+   normal operation" only opens once this is tapped. */
+.pad-time-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  min-height: var(--touch-target);
+  padding: 0.5rem 1rem;
+  border: 2px solid var(--color-control-border);
+  border-radius: var(--radius);
+  background: var(--color-surface-raised);
+  color: var(--color-text);
+  font: inherit;
+  text-align: left;
+}
+
+.pad-time-field__label {
+  font-weight: 600;
+}
+
+.pad-time-field__value {
+  font-variant-numeric: tabular-nums;
+}
+
+.pad-time-field__editor {
+  padding: 0.5rem 0;
+}
+
+.pad-time-field__actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.pad-time-field__actions > .button {
+  width: auto;
+  flex: 1;
+}
+
 .health {
   display: grid;
   gap: 0.5rem;

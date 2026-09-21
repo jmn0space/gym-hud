@@ -5,8 +5,13 @@ import { formatDuration, TimerDisplay } from "../components/TimerDisplay";
 import { isRetryableWriteError, useLocalData } from "../local/LocalDataProvider";
 import {
   buildPadSessionView,
+  correctWalkingBoutTimesAction,
+  correctWalkingPauseTimesAction,
+  correctWalkingRestTimesAction,
   DEFAULT_WALKING_SETTINGS,
+  deleteWalkingBoutAction,
   derivePadElapsedMs,
+  detectUndoableWalkingTransition,
   discardWalkingSessionAction,
   findActiveWalkingSessionRecord,
   findPreviousWalkingSession,
@@ -24,6 +29,7 @@ import {
   startNextWalkingBoutAction,
   startWalkingSessionAction,
   summarizeWalkingSession,
+  undoLastWalkingTransitionAction,
   useNow,
   updateWalkingBoutAction,
   updateWalkingSessionNotesAction,
@@ -31,12 +37,13 @@ import {
   walkingSessionSummaryValue,
   type PadSessionView,
   type PreviousWalkingSession,
+  type UndoableWalkingTransition,
   type WalkingSessionSettings,
   type WalkingState,
   type WalkingStopReason,
 } from "../pad";
 import { createUuid, InvalidActionError, type LocalAction } from "../storage";
-import type { WalkingBout } from "../pad/types";
+import type { WalkingBout, WalkingBoutPause } from "../pad/types";
 
 /**
  * One attempt at a logical operation: the identifiers the action writes with, and
@@ -148,6 +155,65 @@ type PadScreen =
   | { kind: "unreadable" }
   | { kind: "start" };
 
+/**
+ * Whether two undo targets name the same transition. Used to detect that
+ * what Undo would reverse has changed between the screen this was confirmed
+ * on and the live snapshot the commit actually re-detects from -- which can
+ * legitimately disagree across a second tab (issue #22 finding 9).
+ */
+function sameUndoableTransition(
+  a: UndoableWalkingTransition | null,
+  b: UndoableWalkingTransition | null,
+): boolean {
+  if (a === null || b === null) {
+    return a === b;
+  }
+  switch (a.type) {
+    case "bout_started":
+      return b.type === "bout_started" && a.boutId === b.boutId;
+    case "bout_paused":
+      return b.type === "bout_paused" && a.pauseId === b.pauseId;
+    case "bout_resumed":
+      return b.type === "bout_resumed" && a.pauseId === b.pauseId;
+    case "bout_finished":
+      return b.type === "bout_finished" && a.boutId === b.boutId && a.restId === b.restId && a.pauseId === b.pauseId;
+    case "next_bout_started":
+      return b.type === "next_bout_started" && a.boutId === b.boutId && a.restId === b.restId;
+  }
+}
+
+/**
+ * What Undo would reverse, in words -- named explicitly now that the
+ * transition stamp (issue #22 finding 1) makes it unambiguous, instead of
+ * the previous vague "the last change to this session" (issue #22 finding
+ * 9). Bout numbers are looked up from the displayed view for a reading a
+ * user recognizes; an id that no longer resolves (stale in a way that has
+ * not yet been caught by the live re-check) falls back to "a bout" rather
+ * than showing nothing.
+ */
+function describeUndoableTransition(transition: UndoableWalkingTransition, view: PadSessionView): string {
+  const boutNumber = (boutId: string): string => {
+    const bout = view.bouts.find((item) => item.id === boutId);
+    return bout === undefined ? "a bout" : `bout ${bout.bout_number.toString()}`;
+  };
+  const pauseBoutNumber = (pauseId: string): string => {
+    const pause = view.pauses.find((item) => item.id === pauseId);
+    return pause === undefined ? "a bout" : boutNumber(pause.walking_bout_id);
+  };
+  switch (transition.type) {
+    case "bout_started":
+      return `starting ${boutNumber(transition.boutId)}`;
+    case "bout_paused":
+      return `pausing ${pauseBoutNumber(transition.pauseId)}`;
+    case "bout_resumed":
+      return `resuming ${pauseBoutNumber(transition.pauseId)}`;
+    case "bout_finished":
+      return `finishing ${boutNumber(transition.boutId)}`;
+    case "next_bout_started":
+      return `starting ${boutNumber(transition.boutId)}`;
+  }
+}
+
 /** A queued write or Retry may run after another tab advanced the HUD. */
 function requireDisplayedInterval(displayed: PadSessionView, live: PadSessionView | null): PadSessionView {
   if (
@@ -249,6 +315,85 @@ export function PadPage() {
     [readLiveSnapshot, run, view],
   );
 
+  const correctBoutTimes = useCallback(
+    (boutId: string, values: { startedAt?: string; endedAt?: string }) => {
+      if (view === null) return;
+      run(`correct-bout-times-${boutId}`, async (attempt) => {
+        const liveView = readPadSession(await readLiveSnapshot());
+        if (liveView?.session.id !== view.session.id) {
+          throw new InvalidActionError("This walking session is no longer active.");
+        }
+        return correctWalkingBoutTimesAction({ actionId: attempt.actionId, view: liveView, boutId, ...values });
+      });
+    },
+    [readLiveSnapshot, run, view],
+  );
+
+  const correctPauseTimes = useCallback(
+    (pauseId: string, values: { startedAt?: string; endedAt?: string }) => {
+      if (view === null) return;
+      run(`correct-pause-times-${pauseId}`, async (attempt) => {
+        const liveView = readPadSession(await readLiveSnapshot());
+        if (liveView?.session.id !== view.session.id) {
+          throw new InvalidActionError("This walking session is no longer active.");
+        }
+        return correctWalkingPauseTimesAction({ actionId: attempt.actionId, view: liveView, pauseId, ...values });
+      });
+    },
+    [readLiveSnapshot, run, view],
+  );
+
+  const correctRestTimes = useCallback(
+    (restId: string, values: { startedAt?: string; endedAt?: string }) => {
+      if (view === null) return;
+      run(`correct-rest-times-${restId}`, async (attempt) => {
+        const liveView = readPadSession(await readLiveSnapshot());
+        if (liveView?.session.id !== view.session.id) {
+          throw new InvalidActionError("This walking session is no longer active.");
+        }
+        return correctWalkingRestTimesAction({ actionId: attempt.actionId, view: liveView, restId, ...values });
+      });
+    },
+    [readLiveSnapshot, run, view],
+  );
+
+  const deleteBout = useCallback(
+    (boutId: string) => {
+      if (view === null) return;
+      run(`delete-bout-${boutId}`, async (attempt) => {
+        const liveView = readPadSession(await readLiveSnapshot());
+        if (liveView?.session.id !== view.session.id) {
+          throw new InvalidActionError("This walking session is no longer active.");
+        }
+        return deleteWalkingBoutAction({ actionId: attempt.actionId, view: liveView, boutId });
+      });
+    },
+    [readLiveSnapshot, run, view],
+  );
+
+  const undoTransition = useCallback(() => {
+    if (view === null) return;
+    // Captured at confirm time: what the confirmation dialog actually named.
+    const confirmedTransition = detectUndoableWalkingTransition(view);
+    run(`undo-${view.session.id}`, async (attempt) => {
+      const liveView = readPadSession(await readLiveSnapshot());
+      if (liveView?.session.id !== view.session.id) {
+        throw new InvalidActionError("This walking session is no longer active.");
+      }
+      // The button's visibility and confirmation text come from the rendered
+      // view; the commit re-detects from a fresh live snapshot. They can
+      // legitimately disagree across a second tab -- surfaced here as a
+      // clear refusal rather than silently undoing something else, or
+      // silently doing nothing (issue #22 finding 9).
+      if (!sameUndoableTransition(confirmedTransition, detectUndoableWalkingTransition(liveView))) {
+        throw new InvalidActionError(
+          "What Undo would reverse has changed (perhaps from another tab). Review the current state and try again.",
+        );
+      }
+      return undoLastWalkingTransitionAction({ actionId: attempt.actionId, view: liveView });
+    });
+  }, [readLiveSnapshot, run, view]);
+
   const transitionBout = useCallback(
     (kind: "pause" | "resume" | "finish" | "next") => {
       if (view === null) return;
@@ -349,11 +494,16 @@ export function PadPage() {
         <WalkingHud
           busy={busy}
           now={now}
-          onFinishSession={finishSession}
-          onTransitionBout={transitionBout}
           onChangeBout={changeBout}
           onChangeSessionNotes={changeSessionNotes}
+          onCorrectBoutTimes={correctBoutTimes}
+          onCorrectPauseTimes={correctPauseTimes}
+          onCorrectRestTimes={correctRestTimes}
+          onDeleteBout={deleteBout}
+          onFinishSession={finishSession}
           onStartBout={startBout}
+          onTransitionBout={transitionBout}
+          onUndo={undoTransition}
           unreadable={screen.unreadable}
           view={screen.view}
         />
@@ -698,14 +848,73 @@ function UnreadableSession({ busy, onDiscard }: UnreadableSessionProps) {
   );
 }
 
+/**
+ * Recorded times are stored in UTC ISO form but edited in the browser's own
+ * local time, through `<input type="datetime-local">`: a device-local
+ * correction is what the user actually observed ("it was about quarter past
+ * three"), and converting is cheaper and less error-prone than asking anyone
+ * to enter UTC by hand.
+ *
+ * The field itself works at second resolution (`step="1"`): there is no
+ * control here for typing a millisecond. Stored times do carry milliseconds
+ * (every recorded PAD timestamp comes from `new Date()` or `monotonicNow`),
+ * so this does NOT round-trip exactly -- `RecordedTimeField` is what
+ * preserves the original sub-second remainder for a save that only touched
+ * the displayed second (issue #22 finding 3); this function is purely the
+ * whole-second display conversion.
+ */
+function isoToLocalInputValue(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const pad = (value: number) => value.toString().padStart(2, "0");
+  return (
+    `${date.getFullYear().toString()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+  );
+}
+
+/** The inverse of `isoToLocalInputValue`, or `null` for an unparseable/blank draft. */
+function localInputValueToIso(value: string): string | null {
+  if (value.trim() === "") {
+    return null;
+  }
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+/**
+ * `iso` truncated to whole seconds, as epoch milliseconds (`NaN` if
+ * unparseable). What the `datetime-local` editor can actually express, so
+ * this is the resolution Save is gated on and drafts are compared at --
+ * never the exact instant, which the stored value can carry sub-second
+ * precision on but the field cannot edit (issue #22 finding 3).
+ */
+function toWholeSeconds(iso: string): number {
+  const ms = Date.parse(iso);
+  return Number.isNaN(ms) ? NaN : Math.floor(ms / 1000) * 1000;
+}
+
+/** How a recorded time reads in the collapsed (non-editing) view of a time field. */
+function formatClockTime(iso: string): string {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? iso : date.toLocaleTimeString();
+}
+
 interface WalkingHudProps {
   busy: boolean;
   now: number;
   onChangeBout: (boutId: string, values: { painMin?: number | null; painMax?: number | null; stopReason?: WalkingStopReason | null; notes?: string | null }) => void;
   onChangeSessionNotes: (notes: string) => void;
+  onCorrectBoutTimes: (boutId: string, values: { startedAt?: string; endedAt?: string }) => void;
+  onCorrectPauseTimes: (pauseId: string, values: { startedAt?: string; endedAt?: string }) => void;
+  onCorrectRestTimes: (restId: string, values: { startedAt?: string; endedAt?: string }) => void;
+  onDeleteBout: (boutId: string) => void;
   onFinishSession: () => void;
   onStartBout: () => void;
   onTransitionBout: (kind: "pause" | "resume" | "finish" | "next") => void;
+  onUndo: () => void;
   /** Whether this session has open records the parser dropped. */
   unreadable: boolean;
   view: PadSessionView;
@@ -716,9 +925,14 @@ function WalkingHud({
   now,
   onChangeBout,
   onChangeSessionNotes,
+  onCorrectBoutTimes,
+  onCorrectPauseTimes,
+  onCorrectRestTimes,
+  onDeleteBout,
   onFinishSession,
   onStartBout,
   onTransitionBout,
+  onUndo,
   unreadable,
   view,
 }: WalkingHudProps) {
@@ -732,6 +946,7 @@ function WalkingHud({
   // session with prior bouts, Add Bout prepares that slot without starting time.
   const [preparedBoutNumber, setPreparedBoutNumber] = useState<number | null>(null);
   const nextBoutPrepared = preparedBoutNumber === view.currentBoutNumber;
+  const undoableTransition = detectUndoableWalkingTransition(view);
 
   return (
     <>
@@ -785,6 +1000,15 @@ function WalkingHud({
               notes={currentBout.notes}
               onSave={(notes) => { onChangeBout(currentBout.id, { notes }); }}
             />
+            {/* The running bout's own start can be corrected before it
+                finishes (docs/pad-walking.md: "started_at may be corrected
+                at any time, open or closed"); only `started_at` is offered
+                here since `ended_at` does not exist yet. */}
+            <OpenBoutTimes
+              busy={busy}
+              bout={currentBout}
+              onCorrectBoutTimes={(values) => { onCorrectBoutTimes(currentBout.id, values); }}
+            />
           </>
         )}
         {view.state === "READY" && (view.bouts.length === 0 || nextBoutPrepared) && (
@@ -817,6 +1041,9 @@ function WalkingHud({
             Finish session
           </button>
         )}
+        {undoableTransition !== null && (
+          <UndoControl busy={busy} description={describeUndoableTransition(undoableTransition, view)} onUndo={onUndo} />
+        )}
       </section>
 
       {finishedBouts.length > 0 && (
@@ -832,6 +1059,11 @@ function WalkingHud({
                   busy={busy}
                   duration={walkingElapsedMs(bout, view.pauses, now)}
                   onChange={(values) => { onChangeBout(bout.id, values); }}
+                  onCorrectBoutTimes={(values) => { onCorrectBoutTimes(bout.id, values); }}
+                  onCorrectPauseTimes={onCorrectPauseTimes}
+                  onCorrectRestTimes={onCorrectRestTimes}
+                  onDelete={() => { onDeleteBout(bout.id); }}
+                  pauses={view.pauses.filter((pause) => pause.walking_bout_id === bout.id)}
                   rest={view.rests.find((rest) => rest.walking_bout_id === bout.id) ?? null}
                   now={now}
                 />
@@ -852,6 +1084,55 @@ function WalkingHud({
         onSave={onChangeSessionNotes}
       />
     </>
+  );
+}
+
+/**
+ * Undo, with confirmation (docs/pad-walking.md: "Undo requires confirmation").
+ * `description` names the transition Undo would reverse (issue #22 finding
+ * 9: the transition stamp, added for finding 1, makes exactly one candidate
+ * knowable, so vagueness is no longer the only honest option).
+ */
+function UndoControl({
+  busy,
+  description,
+  onUndo,
+}: {
+  busy: boolean;
+  description: string;
+  onUndo: () => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  if (!confirming) {
+    return (
+      <button
+        className="button"
+        disabled={busy}
+        onClick={() => { setConfirming(true); }}
+        type="button"
+      >
+        Undo
+      </button>
+    );
+  }
+  return (
+    <div className="stack" role="alertdialog" aria-label="Confirm undo">
+      <p className="muted">Undo {description}?</p>
+      <button
+        className="button button--primary"
+        disabled={busy}
+        onClick={() => {
+          setConfirming(false);
+          onUndo();
+        }}
+        type="button"
+      >
+        Undo
+      </button>
+      <button className="button" disabled={busy} onClick={() => { setConfirming(false); }} type="button">
+        Cancel
+      </button>
+    </div>
   );
 }
 
@@ -918,6 +1199,11 @@ function CompletedBout({
   duration,
   now,
   onChange,
+  onCorrectBoutTimes,
+  onCorrectPauseTimes,
+  onCorrectRestTimes,
+  onDelete,
+  pauses,
   rest,
 }: {
   bout: WalkingBout;
@@ -925,10 +1211,19 @@ function CompletedBout({
   duration: number;
   now: number;
   onChange: (values: { painMin?: number | null; painMax?: number | null; stopReason?: WalkingStopReason | null; notes?: string | null }) => void;
+  onCorrectBoutTimes: (values: { startedAt?: string; endedAt?: string }) => void;
+  onCorrectPauseTimes: (pauseId: string, values: { startedAt?: string; endedAt?: string }) => void;
+  onCorrectRestTimes: (restId: string, values: { startedAt?: string; endedAt?: string }) => void;
+  onDelete: () => void;
+  pauses: readonly WalkingBoutPause[];
   rest: PadSessionView["currentRest"];
 }) {
   const reasonId = useId();
+  const timesHeadingId = useId();
   const selected = selectedPain(bout);
+  // Display order only, for stable, distinguishable labels ("Pause 1",
+  // "Pause 2", ...): a bout may have several (issue #22 finding 4).
+  const orderedPauses = [...pauses].sort((left, right) => Date.parse(left.started_at) - Date.parse(right.started_at));
   const restMs = rest === null ? null : Math.max(0, (rest.ended_at === null ? now : Date.parse(rest.ended_at)) - Date.parse(rest.started_at));
   return (
     <div className="pad-bout-record">
@@ -964,6 +1259,245 @@ function CompletedBout({
         notes={bout.notes}
         onSave={(notes) => { onChange({ notes }); }}
       />
+      {/* Recorded times can be tapped and corrected (docs/pad-walking.md,
+          "Editing, undo, and delete"); collapsed by default, like the notes
+          editor above, so the normal read-only HUD stays uncluttered. */}
+      <details className="pad-times" aria-labelledby={timesHeadingId}>
+        <summary id={timesHeadingId}>Edit times for bout {bout.bout_number.toString()}</summary>
+        <RecordedTimeField
+          busy={busy}
+          label={`Bout ${bout.bout_number.toString()} started`}
+          onSave={(startedAt) => { onCorrectBoutTimes({ startedAt }); }}
+          value={bout.started_at}
+        />
+        {bout.ended_at !== null && (
+          <RecordedTimeField
+            busy={busy}
+            label={`Bout ${bout.bout_number.toString()} ended`}
+            onSave={(endedAt) => { onCorrectBoutTimes({ endedAt }); }}
+            value={bout.ended_at}
+          />
+        )}
+        {orderedPauses.map((pause, index) => (
+          <FragmentPauseTimes
+            key={pause.id}
+            busy={busy}
+            boutNumber={bout.bout_number}
+            onCorrectPauseTimes={(values) => { onCorrectPauseTimes(pause.id, values); }}
+            pause={pause}
+            pauseNumber={index + 1}
+          />
+        ))}
+        {rest !== null && (
+          <RecordedTimeField
+            busy={busy}
+            label={`Rest after bout ${bout.bout_number.toString()} started`}
+            onSave={(startedAt) => { onCorrectRestTimes(rest.id, { startedAt }); }}
+            value={rest.started_at}
+          />
+        )}
+        {rest?.ended_at !== null && rest !== null && (
+          <RecordedTimeField
+            busy={busy}
+            label={`Rest after bout ${bout.bout_number.toString()} ended`}
+            onSave={(endedAt) => { onCorrectRestTimes(rest.id, { endedAt }); }}
+            value={rest.ended_at}
+          />
+        )}
+      </details>
+      <DeleteBoutControl boutNumber={bout.bout_number} busy={busy} onDelete={onDelete} />
+    </div>
+  );
+}
+
+/**
+ * One recorded timestamp, tapped to reveal a `datetime-local` editor
+ * (docs/pad-walking.md: "Recorded times can be tapped and corrected").
+ * Keyboard input is normally avoided in this HUD, but a correction is the
+ * documented exception -- typing an exact time is the point.
+ */
+function RecordedTimeField({
+  busy,
+  label,
+  onSave,
+  value,
+}: {
+  busy: boolean;
+  label: string;
+  onSave: (iso: string) => void;
+  value: string;
+}) {
+  const id = useId();
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(() => isoToLocalInputValue(value));
+  const parsed = localInputValueToIso(draft);
+  // Compared -- and Save gated -- at whole-second resolution: the field
+  // cannot edit milliseconds, so a draft that reads back the same second as
+  // the stored value is not a change, even though the stored instant itself
+  // may carry a sub-second remainder the field never showed (issue #22
+  // finding 3; a save-without-editing must never silently move the stored
+  // instant by up to 999 ms).
+  const unchanged = parsed !== null && toWholeSeconds(parsed) === toWholeSeconds(value);
+
+  if (!editing) {
+    return (
+      <button
+        className="pad-time-field"
+        disabled={busy}
+        onClick={() => {
+          setDraft(isoToLocalInputValue(value));
+          setEditing(true);
+        }}
+        type="button"
+      >
+        <span className="pad-time-field__label">{label}</span>
+        <span className="pad-time-field__value">{formatClockTime(value)}</span>
+      </button>
+    );
+  }
+  return (
+    <div className="field pad-time-field__editor">
+      <label htmlFor={id}>{label}</label>
+      <input
+        className="text-input"
+        id={id}
+        onChange={(event) => { setDraft(event.target.value); }}
+        step="1"
+        type="datetime-local"
+        value={draft}
+      />
+      <div className="pad-time-field__actions">
+        <button
+          className="button button--primary"
+          disabled={busy || parsed === null || unchanged}
+          onClick={() => {
+            if (parsed !== null) {
+              // Defense in depth alongside the `unchanged` gate above: if the
+              // edited second is the same second the stored value already
+              // reads (the draft was opened and saved without a real edit),
+              // send the original value back verbatim so its milliseconds
+              // are never silently dropped.
+              onSave(toWholeSeconds(parsed) === toWholeSeconds(value) ? value : parsed);
+              setEditing(false);
+            }
+          }}
+          type="button"
+        >
+          Save
+        </button>
+        <button className="button" disabled={busy} onClick={() => { setEditing(false); }} type="button">
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The currently running (open) bout's own "Edit times" disclosure --
+ * `started_at` only, since it has no `ended_at` yet (issue #22 finding 5;
+ * `docs/pad-walking.md`, "Editing, undo, and delete"). The action layer
+ * already allows correcting an open bout's start (`correctWalkingBoutTimesAction`
+ * only restricts `ended_at` to a finished bout), so nothing but the UI kept
+ * this from being true before.
+ */
+function OpenBoutTimes({
+  bout,
+  busy,
+  onCorrectBoutTimes,
+}: {
+  bout: WalkingBout;
+  busy: boolean;
+  onCorrectBoutTimes: (values: { startedAt?: string; endedAt?: string }) => void;
+}) {
+  const timesHeadingId = useId();
+  return (
+    <details className="pad-times" aria-labelledby={timesHeadingId}>
+      <summary id={timesHeadingId}>Edit times for bout {bout.bout_number.toString()}</summary>
+      <RecordedTimeField
+        busy={busy}
+        label={`Bout ${bout.bout_number.toString()} started`}
+        onSave={(startedAt) => { onCorrectBoutTimes({ startedAt }); }}
+        value={bout.started_at}
+      />
+    </details>
+  );
+}
+
+/**
+ * One pause's recorded start (and end, once closed), labelled by its
+ * position among the bout's own pauses so several are distinguishable
+ * (docs/pad-walking.md: a pause's `started_at`/`ended_at` can be tapped and
+ * corrected -- issue #22 finding 4).
+ */
+function FragmentPauseTimes({
+  boutNumber,
+  busy,
+  onCorrectPauseTimes,
+  pause,
+  pauseNumber,
+}: {
+  boutNumber: number;
+  busy: boolean;
+  onCorrectPauseTimes: (values: { startedAt?: string; endedAt?: string }) => void;
+  pause: WalkingBoutPause;
+  pauseNumber: number;
+}) {
+  return (
+    <>
+      <RecordedTimeField
+        busy={busy}
+        label={`Pause ${pauseNumber.toString()} of bout ${boutNumber.toString()} started`}
+        onSave={(startedAt) => { onCorrectPauseTimes({ startedAt }); }}
+        value={pause.started_at}
+      />
+      {pause.ended_at !== null && (
+        <RecordedTimeField
+          busy={busy}
+          label={`Pause ${pauseNumber.toString()} of bout ${boutNumber.toString()} ended`}
+          onSave={(endedAt) => { onCorrectPauseTimes({ endedAt }); }}
+          value={pause.ended_at}
+        />
+      )}
+    </>
+  );
+}
+
+/** Delete a bout, with confirmation (docs/pad-walking.md: "A bout may also be deleted with confirmation"). */
+function DeleteBoutControl({
+  boutNumber,
+  busy,
+  onDelete,
+}: {
+  boutNumber: number;
+  busy: boolean;
+  onDelete: () => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  if (!confirming) {
+    return (
+      <button className="button button--quiet" disabled={busy} onClick={() => { setConfirming(true); }} type="button">
+        Delete bout {boutNumber.toString()}
+      </button>
+    );
+  }
+  return (
+    <div className="stack" role="alertdialog" aria-label={`Confirm delete bout ${boutNumber.toString()}`}>
+      <p className="muted">Delete bout {boutNumber.toString()}? Its pause and rest intervals are removed with it.</p>
+      <button
+        className="button button--primary"
+        disabled={busy}
+        onClick={() => {
+          setConfirming(false);
+          onDelete();
+        }}
+        type="button"
+      >
+        Delete
+      </button>
+      <button className="button" disabled={busy} onClick={() => { setConfirming(false); }} type="button">
+        Cancel
+      </button>
     </div>
   );
 }
