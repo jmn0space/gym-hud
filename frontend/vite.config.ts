@@ -4,7 +4,7 @@ import { join, posix, resolve } from "node:path";
 
 import react from "@vitejs/plugin-react";
 import { loadEnv, type Plugin } from "vite";
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 // Django local settings trust exactly this origin for CSRF/CORS.
 const DEV_SERVER_PORT = 5173;
@@ -196,6 +196,11 @@ export default defineConfig(({ mode }) => {
       setupFiles: ["./src/test/setup.ts"],
       restoreMocks: true,
       unstubGlobals: true,
+      // Vitest's default include (`**/*.{test,spec}.*`) would otherwise also pick up
+      // frontend/e2e/*.spec.ts -- real-browser Playwright specs that only run under
+      // `npx playwright test` and would fail outright in jsdom (no service worker, no
+      // real network origin).
+      exclude: [...configDefaults.exclude, "e2e/**"],
     },
   };
 });

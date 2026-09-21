@@ -10,7 +10,8 @@ This directory contains the v0.1 functional and technical specification for Gym 
 - [Architecture & deployment](architecture.md) — frontend/backend stack, Django authentication, Docker, Cloudflare Tunnel, Neon PostgreSQL, and production layout.
 - [Data & synchronization](data-sync.md) — entity summary, IndexedDB, mutation outbox, offline behaviour, conflict rules, history, and backups.
 - [Acceptance criteria](acceptance-tests.md) — critical behavioural tests for PAD, resistance training, cardio, authentication, deployment, offline recovery, Home screen session cardinality, and server-admin configuration precedence.
-- [Device smoke tests](device-smoke-tests.md) — real-device evidence log for the Android PWA: installation and offline reopen (issue #17), and the PAD-01/PAD-02 walking-recovery procedure (issue #18).
+- [Device smoke tests](device-smoke-tests.md) — real-device evidence log for the Android PWA: installation and offline reopen (issue #17), the PAD-01/PAD-02 walking-recovery procedure (issue #18), and the complete PAD pilot procedure (issue #23).
+- [PAD pilot validation](pad-pilot-validation.md) — the issue #23 evidence record: coverage matrix, reproduction steps, blocking issues, and exit criteria for the complete PAD pilot gate.
 
 ## Reading order
 

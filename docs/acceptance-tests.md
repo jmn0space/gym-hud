@@ -1,6 +1,6 @@
 # Acceptance Criteria
 
-[← Documentation index](README.md) · [PAD walking](pad-walking.md) · [Resistance & cardio](training.md) · [Architecture](architecture.md) · [Data & sync](data-sync.md)
+[← Documentation index](README.md) · [PAD walking](pad-walking.md) · [Resistance & cardio](training.md) · [Architecture](architecture.md) · [Data & sync](data-sync.md) · [Device smoke tests](device-smoke-tests.md) · [PAD pilot validation](pad-pilot-validation.md)
 
 These tests define the minimum behaviour required for v1.
 
@@ -93,9 +93,16 @@ protocol, the processed-mutation ledger and the PAD models; see [Data &
 synchronization: server synchronization
 protocol](data-sync.md#server-synchronization-protocol)). Issue #20 delivered the
 client sync engine that drains the outbox and pulls reference data (see [Data &
-synchronization: client obligations](data-sync.md#client-obligations)). Pause,
-finish-bout and rest controls are still outstanding; each item is annotated
-below with exactly what it is still waiting on.
+synchronization: client obligations](data-sync.md#client-obligations)). Issue
+#21 then delivered the pause, finish-bout, and start-next-bout controls
+(`Pause`/`Resume`, `Finish bout`, `Start next bout` in
+`frontend/src/pages/PadPage.tsx`), which unblocks the PAUSED and RESTING items
+below; each item is annotated with exactly what it is still waiting on, if
+anything. Issue #23 is the validation pass across all of this: its evidence
+record is [`docs/pad-pilot-validation.md`](pad-pilot-validation.md), which
+tracks device and automated coverage per acceptance ID and is the place to
+check the current pass/fail status rather than this checklist's own item-level
+notes.
 
 - [ ] Start a PAD bout while offline and confirm the saved state is visible.
   **No longer blocked; not yet run.** Issue #18 added the start-session and
@@ -112,23 +119,26 @@ below with exactly what it is still waiting on.
   it is not a substitute for this box, which is about a real locked phone.
 - [ ] Force-stop the installed PWA/browser process, reopen it, and confirm Home shows
   `Resume PAD Walking` with the correct READY, WALKING, PAUSED, or RESTING state.
-  **Runnable for WALKING; PAUSED and RESTING still blocked; not yet run.** The
-  "installed," "force-stop," and "cold-start reopen while offline" mechanics
-  are a concrete procedure in
-  [`docs/device-smoke-tests.md`](device-smoke-tests.md), and issue #18's
-  controls can now put a real walking bout on the device before the force-stop,
-  so the WALKING case (PAD-02 below) is runnable. PAUSED and RESTING cannot yet
-  be produced through the UI — pause and finish-bout controls are the deferred
-  story — so that part of this item stays blocked. The application reconstructs
-  and displays both states when the records exist, and automated tests cover
-  that, but no device run has been performed.
+  **Fully runnable; not yet run.** The "installed," "force-stop," and
+  "cold-start reopen while offline" mechanics are a concrete procedure in
+  [`docs/device-smoke-tests.md`](device-smoke-tests.md). Issue #18's controls
+  make the WALKING case runnable (Part B, PAD-02 below); issue #21's `Pause`
+  and `Finish bout` controls make PAUSED and RESTING runnable too — see Part C,
+  steps C3–C4 (PAUSED) and C6 (RESTING). The application reconstructs and
+  displays all three states when the records exist, and automated tests cover
+  that, but no device run has been performed. See
+  [`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for the issue #23
+  evidence record.
 - [ ] Complete a multi-record transition offline, reload, and confirm its pending
   synchronization action is still present exactly once.
-  **Partially unblocked; not yet run.** `FINISH SESSION` with a bout still open
-  is a multi-record transition in one action (it closes the bout and completes
-  the session together), so this item can now be exercised that way. The
-  specific transition LOCAL-03 names — finishing a bout and starting its rest —
-  still needs the deferred finish-bout control.
+  **Fully unblocked; not yet run.** `FINISH SESSION` with a bout still open is
+  one such multi-record transition (it closes the bout and completes the
+  session together). The specific transition LOCAL-03 names — finishing a bout
+  and starting its rest — is issue #21's `Finish bout` control, exercised
+  offline end to end in Part C, steps C7–C11 of
+  [`docs/device-smoke-tests.md`](device-smoke-tests.md) (PAD-03). See
+  [`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for the issue #23
+  evidence record.
 - [ ] Restore connectivity and confirm a failed synchronization attempt remains
   pending for retry.
   **No longer blocked; not yet run.** The client sync engine (issue #20,
@@ -136,7 +146,10 @@ below with exactly what it is still waiting on.
   bounded backoff; see PAD-04 below for the automated coverage of the same
   offline-queue-then-drain behaviour and [Data & synchronization: sync
   gate](data-sync.md#sync-gate). This box is the real-device run: a genuine
-  network toggle, not a mocked one, has not been performed.
+  network toggle, not a mocked one, has not been performed. See Part C, steps
+  C12–C14 of [`docs/device-smoke-tests.md`](device-smoke-tests.md) and
+  [`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for the issue #23
+  evidence record.
 
 These boxes record manual device work only. Automated browser and repository tests
 do not mark them complete. See the Overall v1 continuity criterion at the end of
@@ -201,7 +214,24 @@ app becomes visible again, and then matches the timestamp-derived duration
 exactly. That covers the derivation, not the device: the real locked-phone run
 is the checklist box above and Part B of
 [`docs/device-smoke-tests.md`](device-smoke-tests.md), neither of which has been
-performed.
+performed. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for
+the issue #23 evidence record and current status.
+
+Real-browser coverage (issue #23): `PAD-01 — lock-screen recovery: displayed
+duration resyncs after a visibility/focus recovery signal, and ONLY via that
+resync path` in `frontend/e2e/pad-walking.spec.ts` installs Playwright's
+`page.clock` before navigation and pauses it, so `useNow`'s `setInterval`
+(`frontend/src/pad/useNow.ts`) provably cannot tick even once while fake time
+advances 10s; the displayed duration can only catch up through the
+`visibilitychange`/`focus` resync listeners. This test is genuinely
+fail-sensitive to that resync path specifically, not merely to "does the
+duration eventually update": deleting those two listeners from `useNow.ts`
+makes it fail (a stale 10000ms reading against a 1100ms tolerance), and
+restoring them makes it pass again. Still a real desktop-Chromium browser,
+not the target Android device — see
+[`docs/pad-pilot-validation.md`](pad-pilot-validation.md#what-automated-evidence-can-and-cannot-establish)
+for exactly what a paused fake clock cannot establish about a real locked
+phone.
 
 ### PAD-02 — Application termination
 
@@ -219,7 +249,26 @@ summary are both reconstructed from persisted records alone, with the correct
 bout number and elapsed duration. Terminating a React tree is not terminating an
 Android process: the real force-stop run is Part B of
 [`docs/device-smoke-tests.md`](device-smoke-tests.md) and has not been
-performed.
+performed. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for
+the issue #23 evidence record and current status.
+
+Real-browser coverage (issue #23): `PAD-02 — application termination: Home
+reconstructs the WALKING state and elapsed duration after a cold reopen, and
+resuming shows the same in the PAD HUD` in `frontend/e2e/pad-walking.spec.ts`
+covers the WALKING case, and `PAD-02 — application termination: Home
+reconstructs the RESTING state after a cold reopen while resting, and
+resuming offers Start next bout` in `frontend/e2e/pad-offline.spec.ts` covers
+RESTING; the PAUSED case is exercised by `PAD-08 — pause: the PAUSED state
+and its excluded-pause elapsed time restore after a cold reopen`
+(`pad-walking.spec.ts`). All three use `coldReopen`
+(`frontend/e2e/support/fixtures.ts`), which closes a real Playwright `Page`
+and opens a fresh one in the same browser context — a genuine service-worker
+and IndexedDB-connection teardown/re-establishment, which is closer to a
+real termination than unmounting a React tree, but it is still one `Page`
+closing inside a process Playwright itself keeps alive throughout, not an
+Android force-stop killing the whole application process. See
+[`docs/pad-pilot-validation.md`](pad-pilot-validation.md#what-automated-evidence-can-and-cannot-establish)
+for why that distinction still matters.
 
 ### PAD-03 — Offline session
 
@@ -231,6 +280,22 @@ performed.
 6. Start the next bout.
 
 Expected: all operations work locally.
+
+Every step of this sequence is available through the UI as of issue #21
+(`Start walking`, `Finish bout`, the pain selector, `Start next bout` in
+`frontend/src/pages/PadPage.tsx`), so this is now a runnable device
+procedure — see Part C, steps C7–C11 of
+[`docs/device-smoke-tests.md`](device-smoke-tests.md) — but no device run
+has been performed. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md)
+for the issue #23 evidence record.
+
+Real-browser coverage (issue #23): `PAD-03 — offline session: bout, finish,
+pain, rest and next bout all work while offline` in
+`frontend/e2e/pad-offline.spec.ts` runs this exact sequence — start, finish,
+pain 3–4, start next bout — under a genuine `context.setOffline(true)`
+network cut (not a mocked `fetch` failure), and confirms zero requests
+reached the mock server at any point. Real desktop-Chromium networking, not
+a real device's radio, DNS, or captive-portal behaviour.
 
 ### PAD-04 — Reconnection
 
@@ -250,7 +315,22 @@ through the real sync engine once authenticated and online"` in
 `frontend/src/App.test.tsx`. That covers the drain itself, not the device:
 the real airplane-mode-then-restore run is the checklist box above and Part B
 of [`docs/device-smoke-tests.md`](device-smoke-tests.md), neither of which has
-been performed.
+been performed. The full offline-then-reconnect sequence, including a
+concrete server-side check for "one server record per logical action," is
+Part C, steps C12–C14 of the same document. See
+[`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for the issue #23
+evidence record.
+
+Real-browser coverage (issue #23): `PAD-04 — reconnection drains the whole
+offline queue with no manual re-entry, in order, one applied server record
+per logical action` in `frontend/e2e/auth-sync.spec.ts` queues six distinct
+logical PAD actions under a genuine `context.setOffline(true)`, then flips
+connectivity back on and polls the mock server's own ledger for exactly six
+applied mutations, in ascending sequence, with a per-mutation signature
+distinguishing "finish bout 1" from "start bout 2" — no manual "Sync now" or
+re-entry involved, matching Trigger 4 (the browser's own `online` event).
+Real desktop-Chromium networking and a real mock HTTP server, not the target
+device's radio.
 
 ### PAD-05 — Duplicate mutation
 
@@ -281,7 +361,25 @@ above this proves "only one logical server-side event exists" end to end
 through the client's own retry path. Not verified here: the
 transmit-twice-from-the-phone real-device run (radio toggled mid-request,
 genuine duplicate delivery) — see
-[`docs/device-smoke-tests.md`](device-smoke-tests.md).
+[`docs/device-smoke-tests.md`](device-smoke-tests.md). No device procedure
+for that specific real-device scenario has been written yet; see
+[`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for the issue #23
+evidence record and why it is out of scope for the current device
+procedure.
+
+Real-browser coverage (issue #23): `PAD-05 — a mutation delivered twice
+because its first acknowledgement was lost is applied exactly once` in
+`frontend/e2e/auth-sync.spec.ts` intercepts the first push with
+`route.fetch()` (letting the mock server genuinely apply and ledger the
+mutation) followed by `route.abort("failed")` (throwing the response away
+before the client sees it) — deliberately indistinguishable, from the
+client's point of view, from a real lost acknowledgement. The client's own
+retry path (`syncNow`) then resends, gets back `duplicate`, and the test
+confirms exactly one applied mutation on the server despite two-or-more
+deliveries. This proves the client's real retry code and the mock server's
+real ledger agree end to end in a real browser; it is not, and does not
+claim to be, the genuine radio-toggle duplicate-delivery device scenario
+above.
 
 ### PAD-06 — Rest integrity
 
@@ -318,13 +416,47 @@ prove that `correctWalkingBoutTimesAction`/`correctWalkingPauseTimesAction`/
 is already recorded (never re-open a closed one), so a correction cannot create
 this state by construction; `deleteWalkingBoutAction`'s test deletes a bout that
 is currently being rested after and confirms the session returns to READY, not
-to a dangling open rest. No device run has been performed.
+to a dangling open rest.
+
+This is now a runnable device procedure -- see Part C, step C6 of
+[`docs/device-smoke-tests.md`](device-smoke-tests.md) -- but no device run has
+been performed. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md)
+for the issue #23 evidence record.
+
+Real-browser coverage (issue #23): `PAD-06 — rest integrity: Start walking
+is not offered while RESTING, and Start next bout closes the rest and
+starts the next bout atomically` in `frontend/e2e/pad-offline.spec.ts` runs
+this offline, on purpose: it strengthens the claim that the restriction is a
+local UI/state-machine rule (`requireState(view, "RESTING")` in
+`frontend/src/pad/actions.ts`) rather than something only a reachable server
+enforces. It confirms `Start walking` does not exist in the DOM at all while
+RESTING (not merely hidden or disabled) and that `Start next bout` closes
+the rest and opens the next bout in one tap with nothing pushed to the
+server throughout. This is UI-level coverage of the local rule; the
+server-side rejection path above remains the server-side evidence.
 
 ### PAD-07 — Maximum timer
 
 Allow a bout to reach and exceed its configured maximum.
 
 Expected: the HUD alerts the user but does not automatically terminate the bout.
+
+This is a runnable device procedure — `WalkingHud` grows a `· Maximum
+reached` alert once `hasReachedMaximum` is true and never stops the bout on
+its own (`frontend/src/pages/PadPage.tsx`, `frontend/src/pad/session.ts`) —
+see Part C, steps C15–C16 of [`docs/device-smoke-tests.md`](device-smoke-tests.md),
+which has not been run. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md)
+for the issue #23 evidence record.
+
+Real-browser coverage (issue #23): `PAD-07 — maximum timer: the HUD alerts
+once the maximum bout is reached but does not auto-terminate the bout` in
+`frontend/e2e/pad-walking.spec.ts` sets `Maximum bout (minutes)` to `0.5`
+(the smallest legal value) and genuinely waits out the full 30 real
+wall-clock seconds — not a faked clock, since `useNow`'s interval is already
+running against the page's real timers before this test could install one —
+confirming the `· Maximum reached` alert appears, the bout stays WALKING
+with `Pause`/`Finish bout` still offered, `Start next bout` never appears,
+and no `walking_rests` mutation was ever pushed to the server.
 
 ### PAD-08 — Pause
 
@@ -334,6 +466,28 @@ Expected: the HUD alerts the user but does not automatically terminate the bout.
 4. Finish.
 
 Expected: effective walking duration excludes the paused interval.
+
+Runnable since issue #21 added the `Pause`/`Resume` controls
+(`pauseWalkingBoutAction`/`resumeWalkingBoutAction` in
+`frontend/src/pad/actions.ts`, whose derivation is
+`walkingElapsedMs`/`pausedMs` in `frontend/src/pad/session.ts`) — see Part C,
+steps C1–C5 of [`docs/device-smoke-tests.md`](device-smoke-tests.md), which
+also covers this state surviving a force-stop and offline cold-reopen. No
+device run has been performed. See
+[`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for the issue #23
+evidence record.
+
+Real-browser coverage (issue #23): `PAD-08 — pause: effective walking
+duration excludes the paused interval` in `frontend/e2e/pad-walking.spec.ts`
+walks a real ~3s, pauses a real ~3s, walks a further real ~2s, then finishes
+the bout and asserts the recorded duration matches the two measured walk
+spans (not the raw total) within an 800ms tolerance — measured against
+`Date.now()` at each click rather than nominal wait constants, so the only
+slack is the commit round-trip. `PAD-08 — pause: the PAUSED state and its
+excluded-pause elapsed time restore after a cold reopen` covers the pause
+surviving a `coldReopen`: the excluded-pause figure reconstructs to the
+pre-pause walking time immediately after reopening and does not keep
+growing while the pause stays open through more real waiting afterwards.
 
 ### PAD-09 — Manual time correction
 
@@ -363,7 +517,30 @@ correction, generated by the real action builder, through the real
 matches. Invalid corrections (an end before its own start, a bout starting
 before its session, a pause left open past its now-closed bout, overlapping
 pauses, a rest starting before its bout ended) are each refused with their own
-test in `padCorrections.test.ts`. No device run has been performed.
+test in `padCorrections.test.ts`.
+
+This is now a runnable device procedure -- see Part C, steps C27–C32 of
+[`docs/device-smoke-tests.md`](device-smoke-tests.md) -- but no device run has
+been performed. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md)
+for the issue #23 evidence record.
+
+Real-browser coverage (issue #23): `PAD-09 — manual time correction:
+correcting an overrun bout's recorded end time recalculates the displayed
+duration and effective walking time, and reaches the server as one applied
+mutation` in `frontend/e2e/pad-corrections.spec.ts` runs the acceptance
+scenario itself in a real browser -- a real walk, pause and resume, a
+deliberate real-time overrun, `Finish bout`, then a correction entered through
+the actual "Edit times for bout 1" control and `Save` -- and asserts the
+displayed duration recalculates to the corrected, pause-excluded value (not
+the overrun one) and that the correction reaches the mock server as exactly
+one applied mutation, matched on the corrected timestamp itself so it cannot
+be confused with the bout's earlier start/pause/resume/finish mutations. `PAD-09
+— manual time correction: the corrected end time, not the pre-correction
+overrun, is what survives a cold reopen and feeds the next session's total`
+confirms the corrected value, not the overrun one, is what a `coldReopen`
+restores and what the next "Last session" summary card reads back once the
+session is finished -- the two things neither `padCorrections.test.ts` nor
+`PadPage.test.tsx`'s jsdom coverage can reach on their own.
 
 ## Resistance training
 
@@ -555,6 +732,30 @@ different-user protection — are covered by automated tests in
 `AuthProvider account-mismatch (finding #2)` describe blocks) rather than
 restated here.
 
+Case (c)'s device evidence — invalidating a real session server-side while
+the phone holds a pending offline workout, then reconnecting and
+re-authenticating — is Part C, steps C17–C21 of
+[`docs/device-smoke-tests.md`](device-smoke-tests.md); no device run has
+been performed. See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md)
+for the issue #23 evidence record.
+
+Real-browser coverage (issue #23) for case (c): `AUTH-01(c) — session expiry
+during a pending offline workout keeps local data and the outbox untouched,
+and drains once with no duplicates after re-authenticating` in
+`frontend/e2e/auth-sync.spec.ts` queues three mutations offline, invalidates
+the session server-side while still offline (so the device genuinely cannot
+know yet), then reconnects — the resulting 401 on the drain attempt, not the
+offline gap itself, is what flips `authStatus` to `expired`. It confirms the
+PAD screen stays live and usable throughout (never unmounted), the outbox
+and applied-mutation count stay untouched until re-authentication, and the
+whole three-mutation queue then drains once, in order, with no duplicates,
+through the expired-session banner's own inline sign-in form — no
+sign-out/sign-in round trip. This is a real session invalidation against
+the mock server and a real client-side `authStatus` transition, not a
+mocked 401; it is still desktop Chromium against a mock server, not the
+target device against the real backend, which is what Part C's device run
+above still needs to prove.
+
 **(a) No valid session, protected API endpoint**
 
 Call a protected `/api/v1/` endpoint (i.e. anything outside the public
@@ -568,6 +769,19 @@ Expected: `401 {"code": "not_authenticated"}`. Separately, an unsafe request
 CSRF validity are independent checks, and neither substitutes for the
 other. See [Architecture: uniform API error shape](architecture.md#uniform-api-error-shape).
 
+Real-browser suite (issue #23), mock-fidelity guard only: `AUTH-01(a) mock-fidelity guard — the
+harness's guardProtectedEndpoint reproduces the real server's 401-before-403
+ordering` in `frontend/e2e/auth-sync.spec.ts` is **not** acceptance evidence
+for case (a) — every assertion in it targets the harness's own mock
+(`support/server.ts`'s `guardProtectedEndpoint`), never the real Django
+server, so it cannot fail if the real `SessionAuthentication.enforce_csrf`
+ordering in `backend/core/authentication.py` regressed. It stays useful as a
+guard that the mock keeps reproducing the documented 401-before-403 ordering
+faithfully, so `AUTH-01(b)`/`(c)` below are not misled by a mock that has
+drifted from the real contract. The genuine, real-server evidence for case
+(a) remains `backend/core/tests/test_auth.py` and the backend guard test
+below.
+
 **(b) Device that has never signed in**
 
 Open the application on a device that has never completed a successful
@@ -575,6 +789,15 @@ login.
 
 Expected: only the login screen is shown. No local workout data exists yet
 to expose, and none is fetched.
+
+Real-browser coverage (issue #23): `AUTH-01(b) — a device that has never
+signed in shows only the login screen and fetches no workout data` in
+`frontend/e2e/auth-sync.spec.ts` is genuine product coverage: it asserts the
+login form (`Username`/`Password`/`Sign in`) is shown, primary navigation
+and PAD links do not exist, and — read from the mock server's own request
+log, captured from the very first byte the browser sent this origin, not
+from a route installed mid-test — zero `/api/v1/sync/` requests, zero
+pushes, zero applied mutations.
 
 **(c) Previously signed-in device without a currently valid session**
 
