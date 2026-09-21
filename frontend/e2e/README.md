@@ -60,6 +60,16 @@ notices the app.
   closes the rest and starts the next bout atomically) and the RESTING
   counterpart of PAD-02's cold-reopen coverage (WALKING/PAUSED are
   `pad-walking.spec.ts`'s).
+- `e2e/pad-corrections.spec.ts` -- PAD-09 (manual time correction, issue #22's
+  correction controls): overrunning a bout, finishing it, and correcting its
+  recorded end time through the real "Edit times for bout N" controls
+  recalculates the displayed duration and pause-adjusted effective walking
+  time, and reaches the server as exactly one applied mutation (matched on the
+  corrected timestamp itself, not a bare count) -- the two things neither
+  `padCorrections.test.ts` nor `PadPage.test.tsx`'s jsdom coverage can reach. A
+  second test confirms the corrected value, not the pre-correction overrun, is
+  what survives a `coldReopen` and what the next session's "Last session"
+  summary reads back.
 - `e2e/auth-sync.spec.ts` -- PAD-04 (reconnection drains the whole offline
   queue with no manual re-entry, in order, one applied server record per
   logical action), PAD-05 (a mutation delivered twice because its first
@@ -87,11 +97,12 @@ notices the app.
 
 ## Runtime
 
-The whole suite currently runs in about **1.0 minute**. Of that, PAD-07 alone
-accounts for roughly **31 seconds** of deliberate real wall-clock waiting: 30s
-is the smallest "Maximum bout (minutes)" setting the UI accepts (`min="0.5"` on
-that field in `frontend/src/pages/PadPage.tsx`), and PAD-07 needs real time to
-pass up to that maximum -- see the spec's own comment on why a fake/advanced
+The whole suite currently runs in about **1.3 minutes** (18 tests). Of that,
+PAD-07 alone accounts for roughly **31 seconds** of deliberate real
+wall-clock waiting: 30s is the smallest "Maximum bout (minutes)" setting the
+UI accepts (`min="0.5"` on that field in `frontend/src/pages/PadPage.tsx`),
+and PAD-07 needs real time to pass up to that maximum -- see the spec's own
+comment on why a fake/advanced
 clock was considered and rejected for this one. Nothing else in the suite
 waits anywhere near that long.
 

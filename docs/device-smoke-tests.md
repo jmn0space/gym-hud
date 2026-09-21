@@ -44,13 +44,13 @@ This procedure has three parts.
   below, not left as `BLOCKED` rows. Part C also covers the full PAD-03
   offline sequence, PAD-04 reconnection with a concrete server-side check,
   PAD-07's maximum-timer alert, session expiry/re-authentication during a
-  pending offline workout, and a service-worker update while a bout is
-  active. It has not been run. PAD-09 (manual time correction) has no
-  procedure here: it depends on issue #22 (PAD timestamp corrections,
-  confirmed undo, bout deletion), whose PR
-  [#43](https://github.com/jmn0space/gym-hud/pull/43) is open and unmerged.
-  See [`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for the full
-  blocking-issue record and the issue #23 coverage matrix.
+  pending offline workout, a service-worker update while a bout is active,
+  and PAD-09's manual time correction (steps C27–C32, added once issue #22
+  — PAD timestamp corrections, confirmed undo, bout deletion — merged and
+  the correction controls it added actually existed to write a procedure
+  against). None of Part C has been run. See
+  [`docs/pad-pilot-validation.md`](pad-pilot-validation.md) for the issue #23
+  coverage matrix.
 
 One thing remains genuinely blocked and must not be recorded as passing:
 confirming that cached reference data survives an offline reopen. The client
@@ -451,6 +451,55 @@ C26. Repeat C22–C24 with a bout running and one pending outbox mutation,
      and the pending mutation are exactly as left — a staged update that is
      never applied never touches anything, closing the app included.
 
+**PAD-09 manual time correction** (issue #22's correction controls;
+`frontend/src/pages/PadPage.tsx`'s `CompletedBout`/`RecordedTimeField`):
+
+C27. Finish or discard the session above. Start a new one, press `Start
+     walking` to begin Bout 1, and note the wall-clock time. Let it run for
+     at least two minutes past when you intend to stop it — the accidental
+     overrun PAD-09's own scenario describes — then press `Finish bout`.
+     Confirm the state reads `Resting after bout 1` and note the displayed
+     duration under "Completed bouts": it should read the full overrun span,
+     not the shorter time you actually meant to walk.
+C28. Under "Completed bouts," press `Edit times for bout 1`. Confirm it
+     expands to show `Bout 1 started` and `Bout 1 ended`, each showing the
+     recorded clock time. Press `Bout 1 ended`. Confirm it reveals a
+     date/time field pre-filled with that same recorded end time, and
+     `Save`/`Cancel` buttons.
+C29. Change the field to the time the bout should actually have ended (a few
+     minutes earlier than what C27 recorded) and press `Save`. Confirm the
+     field collapses back to the tapped-row view showing the new time, and
+     the duration shown in the bout's own summary line updates to the
+     shorter, corrected span — not the original overrun figure. **This is
+     PAD-09.**
+C30. If Bout 1 included a pause (repeat C1–C2's pause/resume before C27's
+     `Finish bout` if it did not), confirm the corrected duration shown in
+     C29 already excludes the paused interval — i.e., the correction and
+     PAD-08's own pause exclusion apply together, not one at the expense of
+     the other.
+C31. Press `Finish session`. Confirm the screen returns to the PAD start
+     screen's "Last session" card, and that its walking total matches the
+     CORRECTED duration from C29, not the original overrun span from C27.
+C32. On the host, confirm the correction reached the server as its own
+     record, using the same account/shell approach as C14:
+
+     ```bash
+     docker compose -f docker-compose.preview.yml exec web python backend/manage.py shell -c "
+     from django.contrib.auth import get_user_model
+     from apps.pad.models import WalkingBout
+     user = get_user_model().objects.get(username='<DJANGO_APP_USERNAME value>')
+     bout = WalkingBout.objects.filter(user=user, bout_number=1).order_by('-id').first()
+     print('ended_at:', bout.ended_at if bout else None)
+     "
+     ```
+
+     Confirm the printed `ended_at` matches the corrected time entered in
+     C29 (not C27's original overrun time), and that Django Admin's
+     `/admin/sync/processedmutation/`, filtered to this account, shows
+     exactly one additional applied row for this correction — never zero
+     (the correction only ever reached IndexedDB) and never more than one
+     (a retried or duplicated push).
+
 ## Results
 
 Run metadata:
@@ -516,7 +565,12 @@ Per-step results (Run 1):
 | C24 | C | "Update now" deferred while the bout is live | NOT YET RUN | |
 | C25 | C | Update applies once idle; new cache name active | NOT YET RUN | |
 | C26 | C | Bout and pending outbox survive a force-stop with the update staged | NOT YET RUN | |
-| — | C | PAD-09 manual time correction | BLOCKED | depends on issue #22 / PR #43 (unmerged) — see `docs/pad-pilot-validation.md` |
+| C27 | C | Start Bout 1; let it run a real overrun past its intended end; Finish bout | NOT YET RUN | |
+| C28 | C | Open "Edit times for bout 1"; "Bout 1 ended" reveals the recorded end time | NOT YET RUN | |
+| C29 | C | Correct the end time; displayed duration recalculates to the corrected span (PAD-09) | NOT YET RUN | |
+| C30 | C | Corrected duration also excludes a pause, when the bout had one (PAD-08 + PAD-09) | NOT YET RUN | |
+| C31 | C | Finish session; "Last session" total reflects the corrected duration, not the overrun | NOT YET RUN | |
+| C32 | C | Server-side check: corrected `ended_at` stored; exactly one additional applied mutation | NOT YET RUN | |
 
 An unrun step must never be recorded as `PASS`. If a step is executed and
 fails, record `FAIL` with a note, not `NOT YET RUN` and not a silent skip.

@@ -14,27 +14,28 @@ and what is still missing.
 
 **The gate is not passed.**
 
-- No device evidence exists yet. Every PAD-01…PAD-08 and AUTH-01 row below
+- No device evidence exists yet. Every PAD-01…PAD-09 and AUTH-01 row below
   needs a real run on the target device (Xiaomi Redmi Note 13 Pro+ /
   Android) against Parts A, B and C of
   [`docs/device-smoke-tests.md`](device-smoke-tests.md), and none has
   happened. This document will not be edited to show a passing device
   result until that run actually occurs; see the honesty rule this document
-  inherits from `docs/device-smoke-tests.md`'s own "Honesty statement."
-- PAD-09 (manual time correction) cannot be exercised at all yet: it depends
-  on issue #22 (PAD timestamp corrections, confirmed undo, bout deletion),
-  whose pull request, [#43](https://github.com/jmn0space/gym-hud/pull/43),
-  is open and unmerged. See [Blocking issues](#blocking-issues).
+  inherits from `docs/device-smoke-tests.md`'s own "Honesty statement." This
+  is now the **only** remaining reason the gate stays open: PAD-09 was
+  blocked on issue #22 (see [Blocking issues](#blocking-issues) for that
+  history), but #22 merged into this branch and PAD-09 now has the same
+  automated coverage and the same device procedure (Part C, steps C27–C32)
+  every other row has — it is simply, like them, `NOT YET RUN`.
 - A desktop-Chromium Playwright suite now exists and runs as its own `e2e`
-  CI job (`.github/workflows/ci.yml`, `frontend/playwright.config.ts`): 16
+  CI job (`.github/workflows/ci.yml`, `frontend/playwright.config.ts`): 18
   tests across `frontend/e2e/smoke.spec.ts`, `pad-walking.spec.ts`,
-  `pad-offline.spec.ts`, `auth-sync.spec.ts` and `service-worker.spec.ts`,
-  taking roughly 1.0 minute. The coverage matrix below cites the specific
-  test names against each acceptance ID. **This is real evidence, and it is
-  explicitly not device evidence** — desktop Chromium is not the target
-  Android PWA, and nothing in this bullet, or in the matrix below, changes
-  the two device-evidence reasons the gate stays open (see the next two
-  bullets and [What automated evidence can and cannot
+  `pad-offline.spec.ts`, `pad-corrections.spec.ts`, `auth-sync.spec.ts` and
+  `service-worker.spec.ts`, taking roughly 1.3 minutes. The coverage matrix
+  below cites the specific test names against each acceptance ID. **This is
+  real evidence, and it is explicitly not device evidence** — desktop
+  Chromium is not the target Android PWA, and nothing in this bullet, or in
+  the matrix below, changes the device-evidence reason the gate stays open
+  (see the previous bullet and [What automated evidence can and cannot
   establish](#what-automated-evidence-can-and-cannot-establish)).
 
 Issue #23's acceptance criterion 5 is explicit that this gate cannot be
@@ -81,7 +82,7 @@ visible on-device through DevTools → Application → Cache Storage or
 | PAD-06 | Rest integrity: a new bout cannot start while a rest is open; `START NEXT BOUT` closes the rest and starts the next bout atomically. | Playwright (`pad-offline.spec.ts`): `PAD-06 — rest integrity: Start walking is not offered while RESTING, and Start next bout closes the rest and starts the next bout atomically` — run offline, proving this is a local UI/state-machine rule (`requireState(view, "RESTING")` in `frontend/src/pad/actions.ts`), not something only a reachable server enforces. Vitest/pytest: `test_pad06_a_bout_cannot_start_while_a_rest_is_open` and related tests in `backend/apps/sync/tests/test_mutations_api.py` (the server-side rejection path). | Part C, step C6 | NOT YET RUN |
 | PAD-07 | Maximum timer: the HUD alerts at the configured maximum but does not auto-terminate the bout. | Playwright (`pad-walking.spec.ts`): `PAD-07 — maximum timer: the HUD alerts once the maximum bout is reached but does not auto-terminate the bout` — a real 30-second wall-clock wait (the smallest legal "Maximum bout (minutes)" value), confirming the `· Maximum reached` alert appears, the bout stays WALKING with `Pause`/`Finish bout` still offered, and no `walking_rests` mutation was ever pushed. | Part C, steps C15–C16 | NOT YET RUN |
 | PAD-08 | Pause: effective walking duration excludes the paused interval. | Playwright (`pad-walking.spec.ts`): `PAD-08 — pause: effective walking duration excludes the paused interval` (measured real walk/pause/walk intervals, asserting the recorded duration matches the two walk spans and excludes the pause) and `PAD-08 — pause: the PAUSED state and its excluded-pause elapsed time restore after a cold reopen` (the excluded-pause figure reconstructs correctly and does not keep growing while the pause stays open across a cold reopen). Vitest: the pause/resume action-builder unit tests. | Part C, steps C1–C5 | NOT YET RUN |
-| PAD-09 | Manual time correction: editing a bout's end time recalculates duration and derived values correctly. | None (cannot be written until issue #22 merges). | No device procedure written; genuinely blocked | BLOCKED (issue #22 / PR #43) |
+| PAD-09 | Manual time correction: editing a bout's end time recalculates duration and derived values correctly. | Playwright (`frontend/e2e/pad-corrections.spec.ts`): `PAD-09 — manual time correction: correcting an overrun bout's recorded end time recalculates the displayed duration and effective walking time, and reaches the server as one applied mutation` (a real walk/pause/resume/overrun/finish, then a correction through the actual "Edit times for bout 1" control, asserting the recalculated duration and that the correction reaches the mock server as exactly one applied mutation) and `PAD-09 — manual time correction: the corrected end time, not the pre-correction overrun, is what survives a cold reopen and feeds the next session's total`. Vitest: `"recalculates bout duration, effective walking time, rest duration and session totals after correcting a late finish"` (`frontend/src/pad/padCorrections.test.ts`) and `"corrects a completed bout's recorded end time and recalculates the displayed duration (PAD-09)"` (`frontend/src/pages/PadPage.test.tsx`). Server round-trip: `frontend/src/padCorrectionsReplay.test.ts` / `backend/apps/sync/tests/test_pad_corrections_replay.py`. | Part C, steps C27–C32 | NOT YET RUN |
 | AUTH-01 | Unauthenticated access and offline continuation, including (c) session expiry/re-authentication with pending offline data preserved and re-drained without duplication. | (a) Playwright `AUTH-01(a) mock-fidelity guard — the harness's guardProtectedEndpoint reproduces the real server's 401-before-403 ordering` (`auth-sync.spec.ts`) is **not** product coverage — every assertion targets this harness's own mock, not the real server, so it cannot catch a regression in the real `enforce_csrf` ordering; the genuine (a) coverage is `backend/core/tests/test_auth.py` and `backend/core/tests/test_url_auth_coverage.py`. (b) Playwright `AUTH-01(b) — a device that has never signed in shows only the login screen and fetches no workout data` (`auth-sync.spec.ts`) is genuine product coverage: it asserts zero `/api/v1/sync/` requests from the very first byte the browser sent. (c) Playwright `AUTH-01(c) — session expiry during a pending offline workout keeps local data and the outbox untouched, and drains once with no duplicates after re-authenticating` (`auth-sync.spec.ts`). Logout/account-mismatch: `frontend/src/auth/AuthProvider.test.tsx`. | Part C, steps C17–C21 (case (c) specifically; case (a)'s real product coverage and case (b) are covered above) | NOT YET RUN |
 
 PAD-05's device evidence is intentionally left without a Part C reference: a
@@ -283,7 +284,19 @@ covers which acceptance ID, and cite individual test names with
   state and its excluded-pause elapsed time restore after a cold reopen`
   (both `frontend/e2e/pad-walking.spec.ts`); the pause/resume action-builder
   unit tests. Device: Part C, steps C1–C5.
-- **PAD-09.** Neither exists; see [Blocking issues](#blocking-issues).
+- **PAD-09.** Automated: Playwright's `PAD-09 — manual time correction:
+  correcting an overrun bout's recorded end time recalculates the displayed
+  duration and effective walking time, and reaches the server as one applied
+  mutation` and `PAD-09 — manual time correction: the corrected end time,
+  not the pre-correction overrun, is what survives a cold reopen and feeds
+  the next session's total` (both `frontend/e2e/pad-corrections.spec.ts`);
+  the tests named in
+  `docs/acceptance-tests.md#pad-09--manual-time-correction`
+  (`frontend/src/pad/padCorrections.test.ts`,
+  `frontend/src/pages/PadPage.test.tsx`,
+  `frontend/src/padCorrectionsReplay.test.ts`,
+  `backend/apps/sync/tests/test_pad_corrections_replay.py`). Device: Part C,
+  steps C27–C32.
 - **AUTH-01.** Automated: Playwright's `AUTH-01(a) mock-fidelity guard —
   the harness's guardProtectedEndpoint reproduces the real server's
   401-before-403 ordering`, `AUTH-01(b) — a device that has never signed in
@@ -299,17 +312,19 @@ covers which acceptance ID, and cite individual test names with
 
 ## Blocking issues
 
-**PAD-09 is blocked on issue #22.** Manual time correction — editing a
-bout's recorded end time and recalculating duration and derived values — has
-no implementation on this branch. Issue #22 ("PAD timestamp corrections,
-confirmed undo, bout deletion") is where that lands; its pull request,
-[#43](https://github.com/jmn0space/gym-hud/pull/43), is open and unmerged as
-of this writing. This PR deliberately branches from `main` rather than from
-PR #43's branch, per the owner's decision, so PAD-09 cannot be exercised —
-neither automated nor on-device — until #43 merges. Once it does, PAD-09
-needs both a Playwright spec and a device procedure added to Part C of
-`docs/device-smoke-tests.md`, and this document's coverage matrix updated
-out of `BLOCKED`.
+**None currently.** PAD-09 was blocked on issue #22 ("PAD timestamp
+corrections, confirmed undo, bout deletion"): manual time correction —
+editing a bout's recorded end time and recalculating duration and derived
+values — had no implementation on this branch, and issue #22's pull request,
+[#43](https://github.com/jmn0space/gym-hud/pull/43), was open and unmerged.
+That PR has since merged into `main` and into this branch, so the correction
+controls it added now exist here. PAD-09 accordingly now has the same two
+things every other row in the [coverage matrix](#coverage-matrix) has: a
+Playwright spec (`frontend/e2e/pad-corrections.spec.ts`) and a device
+procedure (Part C, steps C27–C32 of `docs/device-smoke-tests.md`). It is not
+a separate blocker any more — it is folded into the single reason the gate
+stays open, stated in [Status](#status): no device evidence exists yet for
+any row, PAD-09 included.
 
 ### Bugs found during validation
 
@@ -329,7 +344,7 @@ Issue #23 can be closed once all of the following are true:
    every step recorded as `PASS` or `FAIL` (never left as `NOT YET RUN`),
    and the run-metadata table filled in with the actual device, OS/browser
    versions, build identifier, date and tester.
-2. Every PAD-01…PAD-08 and AUTH-01 row in the [coverage
+2. Every PAD-01…PAD-09 and AUTH-01 row in the [coverage
    matrix](#coverage-matrix) above shows a device result other than `NOT YET
    RUN`.
 3. Any `FAIL` recorded in step 1 is either resolved (with a follow-up run
@@ -337,9 +352,12 @@ Issue #23 can be closed once all of the following are true:
    found during validation](#bugs-found-during-validation) — issue #23's
    acceptance criterion 5 requires one or the other, not a silently
    ignored failure.
-4. PAD-09 is either exercised (issue #22 / PR #43 has merged, and both a
-   device procedure and its result exist) or remains explicitly `BLOCKED`
-   here with its link — issue #23 does not require PAD-09 to pass, only
-   that it not be silently skipped.
+4. (Historical, already satisfied.) PAD-09 was exercised rather than left
+   silently skipped: issue #22 / PR #43 merged, and both a device procedure
+   (Part C, steps C27–C32) and automated coverage
+   (`frontend/e2e/pad-corrections.spec.ts` and the tests cited in the
+   coverage matrix above) now exist for it. What remains for PAD-09 is the
+   same as every other row — an actual device result — which criterion 2
+   above already covers.
 5. This document's [Status](#status) section is updated to reflect the
    above, in place of its current "not passed" statement.
