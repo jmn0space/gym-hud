@@ -22,14 +22,16 @@ interface GymHudFixtures {
 /**
  * `server` is started fresh **per test**, not per file: every test gets an empty
  * mutation ledger, a logged-out session and a pristine CSRF token. `playwright.
- * config.ts` already forces `workers: 1` and `fullyParallel: false` for the
- * unrelated reason that a shared worker/cache-storage registration is not safe to
- * race -- per-test isolation here does not cost extra parallelism on top of that,
- * and it means a spec never has to reason about another test's leftover state (an
- * outbox mutation, an expired session) when reading `server.appliedMutations()` or
- * asserting on auth state. The tradeoff is one extra `http.Server` start/stop per
- * test (sub-millisecond; it serves files already built to disk) -- cheap enough
- * that isolation wins outright.
+ * config.ts` already forces `workers: 1` and `fullyParallel: false`, but for a
+ * different reason (see that file's own comment: several specs' timing
+ * tolerances, not a shared worker/cache-storage registration -- Playwright gives
+ * every test its own `BrowserContext`, so that state was never actually shared
+ * between tests to begin with) -- per-test isolation here does not cost extra
+ * parallelism on top of that, and it means a spec never has to reason about
+ * another test's leftover state (an outbox mutation, an expired session) when
+ * reading `server.appliedMutations()` or asserting on auth state. The tradeoff is
+ * one extra `http.Server` start/stop per test (sub-millisecond; it serves files
+ * already built to disk) -- cheap enough that isolation wins outright.
  */
 export const test = base.extend<GymHudFixtures>({
   // Playwright inspects this function's source text to work out which fixtures
@@ -63,13 +65,44 @@ export const test = base.extend<GymHudFixtures>({
 
 export { expect };
 
+/**
+ * Parses a `TimerDisplay`'s `datetime="PT<seconds>S"` attribute back into
+ * milliseconds (see `frontend/src/components/TimerDisplay.tsx`). Reading this
+ * instead of the rendered "MM:SS" text avoids re-deriving hour/minute/second parsing
+ * in the test and gets whole-second precision directly from the same value the
+ * component computed.
+ */
+export function parseTimerDatetimeMs(datetime: string | null): number {
+  const match = datetime === null ? null : /^PT(\d+)S$/.exec(datetime);
+  if (match === null) {
+    throw new Error(`Expected a "PT<seconds>S" timer datetime, got: ${String(datetime)}`);
+  }
+  return Number(match[1]) * 1000;
+}
+
+/** Parses a rendered "MM:SS" or "H:MM:SS" duration (`formatDuration`'s own format). */
+export function parseFormattedDurationMs(text: string): number {
+  const parts = text.trim().split(":").map(Number);
+  if (parts.length < 2 || parts.length > 3 || parts.some((part) => !Number.isFinite(part))) {
+    throw new Error(`Expected a formatted MM:SS or H:MM:SS duration, got: ${text}`);
+  }
+  const padded = parts.length === 3 ? parts : [0, ...parts];
+  const [hours, minutes, seconds] = padded as [number, number, number];
+  return ((hours * 60 + minutes) * 60 + seconds) * 1000;
+}
+
 /** Polls the page for an activated, controlling service worker. `navigator.
  * serviceWorker.ready` alone is not enough: it resolves once a worker is active
  * for the scope, but a *first* install only starts controlling the page once
  * `clients.claim()` runs in `activate` (see `src/sw/runtime.ts`) -- checking
  * `controller` too is what keeps a spec from acting on a page the worker cannot
- * actually answer fetches for yet. */
-async function waitForServiceWorkerActive(page: Page): Promise<void> {
+ * actually answer fetches for yet.
+ *
+ * Exported (not just used internally by the `app` fixture) for a spec that
+ * needs to control navigation itself -- e.g. installing `page.clock` before
+ * `page.goto`, which the `app` fixture's own `page.goto` would otherwise beat
+ * it to. */
+export async function waitForServiceWorkerActive(page: Page): Promise<void> {
   await page.waitForFunction(async () => {
     if (!("serviceWorker" in navigator)) {
       return false;

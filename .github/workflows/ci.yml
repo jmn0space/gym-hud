@@ -130,6 +130,13 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
 
+      # Issue #23's acceptance criterion 1 asks for evidence tied to one
+      # identified build; this ties the run's own log to the commit it built
+      # and tested (the shell cache name attached by smoke.spec.ts ties the
+      # browser-side evidence to the same build).
+      - name: Record the commit under test
+        run: echo "Validating commit $GITHUB_SHA"
+
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
@@ -139,6 +146,18 @@ jobs:
 
       - name: Install locked dependencies
         run: npm ci
+
+      # Keyed on the lockfile's hash rather than a written-out version number, so
+      # bumping @playwright/test invalidates this without anyone remembering to
+      # edit the key -- a stale browser binary against a newer Playwright is a
+      # confusing failure to debug. A cache hit still needs `--with-deps` below
+      # to run: that step installs the OS-level system dependencies the cached
+      # binary needs, and those are never part of this cache.
+      - name: Cache Playwright browser binaries
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}
 
       - name: Install Playwright browser
         run: npx playwright install --with-deps chromium
@@ -151,7 +170,7 @@ jobs:
 
       - name: Upload Playwright report
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-report
           path: frontend/playwright-report/

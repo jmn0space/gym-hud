@@ -216,9 +216,16 @@ test(
 
     // The resend really happened...
     const pushed = server.pushRequests();
-    expect(pushed).toHaveLength(2);
+    // >= 2, not exactly 2: `INITIAL_BACKOFF_MS` is 5000ms +/-10% jitter
+    // (`frontend/src/sync/engine.ts`), and the `toBeVisible()` above has a 10s
+    // budget -- if the real backoff timer also fires before the manual "Sync
+    // now" click lands, a third delivery arrives on its own. That would still
+    // be a genuine resend of the same mutation, so it must not fail this
+    // test; PAD-05's actual claim (exactly-once *application*) is checked
+    // below via `appliedMutations()`, which is unaffected either way.
+    expect(pushed.length).toBeGreaterThanOrEqual(2);
     const deliveredMutationIds = new Set(pushed.flatMap((request) => request.body.mutations.map((m) => m.mutation_id)));
-    expect(deliveredMutationIds.size).toBe(1); // ...it was genuinely the same mutation both times...
+    expect(deliveredMutationIds.size).toBe(1); // ...it was genuinely the same mutation every time...
 
     // ...but only one logical server-side event exists: the ledger applied
     // it once (on the delivery the client never saw), and the resend came
@@ -228,10 +235,26 @@ test(
 );
 
 test(
-  "AUTH-01(a) — unauthenticated access and CSRF failure are independent checks, neither substituting for the other",
+  "AUTH-01(a) mock-fidelity guard — the harness's guardProtectedEndpoint reproduces the real server's 401-before-403 ordering",
   async ({ request, server }) => {
+    // NOT AUTH-01(a) acceptance evidence: every assertion below targets this
+    // harness's own mock (`support/server.ts`'s `guardProtectedEndpoint`) --
+    // `request.post` goes straight to it, no product code participates, so this
+    // cannot fail if the real `SessionAuthentication.enforce_csrf` ordering in
+    // `backend/core/authentication.py` regressed. It stays valuable as a guard
+    // that the mock keeps reproducing the documented ordering faithfully (so a
+    // future spec that relies on it, e.g. `AUTH-01(b)`/`(c)` below, is not being
+    // misled by a mock that drifted from the real contract). The genuine
+    // AUTH-01(a) acceptance coverage -- against the real server -- lives in
+    // `backend/core/tests/test_auth.py` and `backend/core/tests/
+    // test_url_auth_coverage.py`.
     const mutationsUrl = `${server.origin}/api/v1/sync/mutations/`;
-    const validEnvelope = { client_id: "11111111-1111-1111-1111-111111111111", mutations: [] };
+    // Not a *valid* envelope by the real protocol (`backend/apps/sync/
+    // envelope.py` rejects an empty `mutations` array, `:115`) -- it only works
+    // here because both requests below are answered by `guardProtectedEndpoint`
+    // before the body is ever parsed. Named for what it actually is: just enough
+    // shape for `JSON.parse` and the guard's own field checks to accept it.
+    const unparsedRequestBody = { client_id: "11111111-1111-1111-1111-111111111111", mutations: [] };
 
     // No session at all, and no CSRF token either: the mock's
     // `guardProtectedEndpoint` (mirroring `SessionAuthentication`/
@@ -240,7 +263,7 @@ test(
     // CSRF, so the answer is `not_authenticated`, not `csrf_failed` -- the
     // absence of a valid session is decided on its own, not because CSRF
     // also happened to be missing.
-    const unauthenticated = await request.post(mutationsUrl, { data: validEnvelope });
+    const unauthenticated = await request.post(mutationsUrl, { data: unparsedRequestBody });
     expect(unauthenticated.status()).toBe(401);
     expect(await unauthenticated.json()).toMatchObject({ code: "not_authenticated" });
 
@@ -261,7 +284,7 @@ test(
 
     const csrfFailureWhileAuthenticated = await request.post(mutationsUrl, {
       headers: { "X-CSRFToken": "not-the-real-token" },
-      data: validEnvelope,
+      data: unparsedRequestBody,
     });
     expect(csrfFailureWhileAuthenticated.status()).toBe(403);
     expect(await csrfFailureWhileAuthenticated.json()).toMatchObject({ code: "csrf_failed" });
@@ -275,24 +298,25 @@ test(
     // checked *before* any network call is made, not merely to fail one
     // (`runCycle`'s very first line in `frontend/src/sync/engine.ts`) -- so
     // while `authStatus` never leaves "login-required" on this fresh device,
-    // bootstrap/changes/mutations should never be attempted at all. Recorded
-    // directly, not inferred from silence.
-    const syncCalls: string[] = [];
-    await app.route("**/api/v1/sync/**", async (route) => {
-      syncCalls.push(route.request().url());
-      await route.continue();
-    });
-
-    // AuthGate withholds every app route while status is "login-required":
-    // only the sign-in form renders, with no bottom navigation and no PAD
-    // link to reach local data through even if there were any.
+    // bootstrap/changes/mutations should never be attempted at all.
+    //
+    // Read server-side via `server.apiRequests()`, not an `app.route()`
+    // installed here: the `app` fixture (`support/fixtures.ts`) has already
+    // done `page.goto` and awaited worker activation before this test body
+    // runs, so a route installed only now could only ever observe calls made
+    // *after* that -- exactly the regression this test is supposed to catch
+    // (a sync call fired during load) would have already happened and gone
+    // unseen. `server.apiRequests()` is populated as the very first thing the
+    // mock's request handler does, before routing or any guard, so this
+    // closes that window completely, back to the very first byte the browser
+    // sent this origin.
     await expect(app.getByLabel("Username")).toBeVisible();
     await expect(app.getByLabel("Password")).toBeVisible();
     await expect(app.getByRole("button", { name: "Sign in" })).toBeVisible();
     await expect(app.getByRole("navigation", { name: "Primary" })).toHaveCount(0);
     await expect(app.getByRole("link", { name: "PAD walking" })).toHaveCount(0);
 
-    expect(syncCalls).toHaveLength(0);
+    expect(server.apiRequests().filter((request) => request.pathname.startsWith("/api/v1/sync/"))).toHaveLength(0);
     expect(server.pushRequests()).toHaveLength(0);
     expect(server.appliedMutations()).toHaveLength(0);
   },
@@ -356,8 +380,12 @@ test(
     await expect(app.getByRole("status").filter({ hasText: "Sync paused — signed out" })).toBeVisible();
 
     // Re-authenticate through the banner's own inline form -- the "expired"
-    // recovery path, not a sign-out/sign-in round trip.
-    server.restoreSession();
+    // recovery path, not a sign-out/sign-in round trip. No `server.
+    // restoreSession()` call here: it would be a no-op anyway (`handleLogin`
+    // sets `sessionValid = true` itself, `support/server.ts:385`), and calling
+    // it before the login form submits would make the server-side session
+    // valid again ahead of the real re-authentication, leaving only the
+    // client-side gate to force the login this test is actually about.
     await expiredBanner.getByRole("button", { name: "Sign in" }).click();
     await expiredBanner.getByLabel("Username").fill(DEFAULT_USERNAME);
     await expiredBanner.getByLabel("Password").fill(DEFAULT_PASSWORD);

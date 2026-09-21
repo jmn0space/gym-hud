@@ -24,6 +24,22 @@
  *  - No multi-account support: one configured username/password, one session at a
  *    time. Good enough for a device-validation gate; not a stand-in for the real
  *    backend's test suite.
+ *  - `client_id` is accepted as any non-empty string (`handleMutations` below);
+ *    the real server requires a canonical lowercase UUID
+ *    (`backend/apps/sync/envelope.py`'s `is_canonical_uuid`). A spec asserting on
+ *    envelope validation errors for a malformed `client_id` would get a false
+ *    pass here.
+ *  - Strictly-ascending `sequence` across one push's `mutations` array is not
+ *    enforced (the real server 400s on it, `envelope.py`'s batch-sequence check).
+ *    This mock applies whatever order it is given.
+ *  - `MAX_CHANGES_PER_MUTATION` is advertised in `/bootstrap/`'s `limits` (matching
+ *    the real server's default) but never actually enforced against a pushed
+ *    mutation's `changes` array -- unlike `MAX_MUTATIONS_PER_REQUEST`, which is.
+ *  - No `413 request_too_large` equivalent for an oversized request body (the real
+ *    server's `views.py` checks `DATA_UPLOAD_MAX_MEMORY_SIZE` before parsing).
+ *  - `pad.defaults` intentionally match the documented application defaults
+ *    (`docs/data-sync.md`: 5.0 km/h, 2.0%, 480s) rather than diverging from them --
+ *    if you change these, update that doc reference too.
  */
 
 import { randomBytes, randomUUID } from "node:crypto";
@@ -83,6 +99,15 @@ export interface PushRequestRecord {
   readonly body: MockPushRequestBody;
 }
 
+/** What a spec reads back through `apiRequests()` -- one entry per `/api/**`
+ * request this server received, logged before any auth/CSRF guard runs (see
+ * `apiRequests()`'s own doc comment on why that ordering is the point). */
+export interface ApiRequestRecord {
+  readonly receivedAt: number;
+  readonly method: string;
+  readonly pathname: string;
+}
+
 export interface MockServer {
   /** `http://127.0.0.1:<port>`, assigned by the OS (port 0). */
   readonly origin: string;
@@ -100,6 +125,18 @@ export interface MockServer {
   appliedMutations(): readonly AppliedMutationRecord[];
   /** Every push request this server received, including retries and duplicates. */
   pushRequests(): readonly PushRequestRecord[];
+  /**
+   * Every `/api/**` request this server received (method + decoded pathname),
+   * in arrival order -- logged as the very first thing the request handler
+   * does, before routing, before `guardProtectedEndpoint`, before a body is
+   * ever read. A spec asserting "no sync call was ever attempted" needs this,
+   * not `pushRequests()`/`appliedMutations()`: those only ever record a `POST
+   * /sync/mutations/`, so a device that (wrongly) fired a bootstrap/changes GET
+   * -- or a mutations POST that got 401'd before `pushLog` was written to --
+   * would leave both of those empty while still having reached the server.
+   * `apiRequests()` closes that blind spot completely.
+   */
+  apiRequests(): readonly ApiRequestRecord[];
   /**
    * Serves a byte-different `/sw.js` from now on, without touching anything on
    * disk: it rewrites the `self.__GYM_HUD_BUILD__` version string the real Vite
@@ -258,6 +295,7 @@ export async function startMockServer(options: StartMockServerOptions = {}): Pro
   const ledger = new Map<string, AppliedMutationRecord>();
   const appliedOrder: string[] = [];
   const pushLog: PushRequestRecord[] = [];
+  const apiLog: ApiRequestRecord[] = [];
 
   // --- Change feed --------------------------------------------------------
   // Accumulates one entry per change of every *applied* (first-delivery) mutation,
@@ -486,7 +524,9 @@ export async function startMockServer(options: StartMockServerOptions = {}): Pro
     if (!guardProtectedEndpoint(req, res)) {
       return;
     }
-    const defaults = { speed_kmh: 2.5, incline_pct: 0, max_bout_seconds: 480 };
+    // Matches the documented application defaults (docs/data-sync.md: "the
+    // application defaults (5.0 km/h, 2.0 %, 480 s) until someone saves them").
+    const defaults = { speed_kmh: 5.0, incline_pct: 2.0, max_bout_seconds: 480 };
     sendJson(res, 200, {
       cursor: changeFeed.length,
       limits: {
@@ -553,6 +593,11 @@ export async function startMockServer(options: StartMockServerOptions = {}): Pro
     const url = new URL(req.url ?? "/", "http://internal.invalid");
     const pathname = decodeURIComponent(url.pathname);
     if (pathname.startsWith("/api/")) {
+      // Logged before routing, before `guardProtectedEndpoint`, before any body
+      // is read -- this is what makes `apiRequests()` a complete record of
+      // "was this endpoint ever hit," independent of whether the request went
+      // on to be authenticated, rejected, or parsed at all.
+      apiLog.push({ receivedAt: Date.now(), method: req.method ?? "GET", pathname });
       handleApi(req, res, pathname, url).catch((error: unknown) => {
         sendJson(res, 500, { code: "server_error", detail: String(error) });
       });
@@ -580,6 +625,7 @@ export async function startMockServer(options: StartMockServerOptions = {}): Pro
     },
     appliedMutations: () => appliedOrder.map((id) => ledger.get(id)).filter((entry): entry is AppliedMutationRecord => entry !== undefined),
     pushRequests: () => pushLog,
+    apiRequests: () => apiLog,
     stageNewBuild() {
       stagedBuildCount += 1;
       const newVersion = `e2e-staged-${stagedBuildCount.toString()}-${randomBytes(4).toString("hex")}`;

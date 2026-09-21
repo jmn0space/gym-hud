@@ -18,11 +18,14 @@ import { coldReopen, readShellCacheName, signIn, startWalkingBout } from "./supp
 test("build served, sign-in, a bout syncs, offline works, and a cold reopen resumes", async ({
   app,
   server,
-}) => {
+}, testInfo) => {
   // The worker actually precached a shell under this build's own cache name --
-  // the "one identified build" issue #23 asks evidence to be tied to.
+  // the "one identified build" issue #23 asks evidence to be tied to. Attached
+  // to the report (not just asserted on) so a CI run's evidence record names
+  // the exact build it exercised, alongside the commit SHA the `e2e` job logs.
   const cacheName = await readShellCacheName(app);
   expect(cacheName).toMatch(/^gym-hud-shell-/);
+  await testInfo.attach("shell-cache-name", { body: cacheName ?? "" });
 
   await signIn(app);
   await startWalkingBout(app);
@@ -33,9 +36,12 @@ test("build served, sign-in, a bout syncs, offline works, and a cold reopen resu
   await expect
     .poll(() => server.appliedMutations().length, { timeout: 10_000 })
     .toBeGreaterThan(0);
-  const [firstMutation] = server.appliedMutations();
-  expect(firstMutation).toBeDefined();
-  // Sent exactly once and applied exactly once -- no duplicate delivery yet.
+  // Not a precise count on purpose: `startWalkingBout` queues two mutations
+  // (start session, start bout), and this poll can catch either one or both
+  // already applied depending on drain timing -- exact-count and
+  // exactly-once-delivery assertions are PAD-04's and PAD-05's job, not this
+  // harness self-test's. All this needs to prove is that at least one push
+  // genuinely reached the server and got applied.
   expect(server.pushRequests().length).toBeGreaterThan(0);
 
   // Genuinely offline: Playwright cuts the network at the browser-context level,

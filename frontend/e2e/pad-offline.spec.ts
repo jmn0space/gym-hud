@@ -24,8 +24,7 @@ test(
     await signIn(app);
     await app.context().setOffline(true);
 
-    const startedAt = await startWalkingBout(app);
-    expect(startedAt).toBeGreaterThan(0);
+    await startWalkingBout(app);
 
     await app.getByRole("button", { name: "Finish bout" }).click();
     const status = app.getByRole("status");

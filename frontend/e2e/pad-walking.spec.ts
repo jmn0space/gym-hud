@@ -13,101 +13,109 @@
  */
 
 import { expect, test } from "./support/fixtures";
-import { coldReopen, signIn, startWalkingBout } from "./support/fixtures";
-
-/**
- * Local helpers, not shared via `support/`: this PR's scope is limited to its own
- * two spec files, and a concurrent agent is reading `support/` for its own specs, so
- * duplicating these few lines is cheaper than risking a conflicting edit there.
- */
-
-/**
- * Parses a `TimerDisplay`'s `datetime="PT<seconds>S"` attribute back into
- * milliseconds (see `frontend/src/components/TimerDisplay.tsx`). Reading this
- * instead of the rendered "MM:SS" text avoids re-deriving hour/minute/second parsing
- * in the test and gets whole-second precision directly from the same value the
- * component computed.
- */
-function parseTimerDatetimeMs(datetime: string | null): number {
-  const match = datetime === null ? null : /^PT(\d+)S$/.exec(datetime);
-  if (match === null) {
-    throw new Error(`Expected a "PT<seconds>S" timer datetime, got: ${String(datetime)}`);
-  }
-  return Number(match[1]) * 1000;
-}
-
-/** Parses a rendered "MM:SS" or "H:MM:SS" duration (`formatDuration`'s own format). */
-function parseFormattedDurationMs(text: string): number {
-  const parts = text.trim().split(":").map(Number);
-  if (parts.length < 2 || parts.length > 3 || parts.some((part) => !Number.isFinite(part))) {
-    throw new Error(`Expected a formatted MM:SS or H:MM:SS duration, got: ${text}`);
-  }
-  const padded = parts.length === 3 ? parts : [0, ...parts];
-  const [hours, minutes, seconds] = padded as [number, number, number];
-  return ((hours * 60 + minutes) * 60 + seconds) * 1000;
-}
+import {
+  coldReopen,
+  parseFormattedDurationMs,
+  parseTimerDatetimeMs,
+  signIn,
+  startWalkingBout,
+  waitForServiceWorkerActive,
+} from "./support/fixtures";
 
 test(
-  "PAD-01 — lock-screen recovery: displayed duration resyncs to wall-clock elapsed time after a real visibility change",
-  async ({ app }) => {
-    await signIn(app);
-    const startedAt = await startWalkingBout(app);
-    const timer = app.locator("time.timer--large");
+  "PAD-01 — lock-screen recovery: displayed duration resyncs after a visibility/focus recovery signal, and ONLY via that resync path",
+  async ({ page, server }) => {
+    // Fake clock installed BEFORE navigation (per Playwright's own guidance:
+    // https://playwright.dev/docs/clock), so `useNow`'s `setInterval` (frontend/
+    // src/pad/useNow.ts) is fake from the moment React creates it -- never a real
+    // OS timer. This is what makes the test able to fail for the defect PAD-01
+    // exists to catch: with a real clock, Chromium's own background-tab timer
+    // throttling still delivers at least one 1s tick during a few-second hide, and
+    // that lone tick alone -- via `now = Date.now()` -- is already enough to land
+    // inside a 2s tolerance, regardless of whether the `visibilitychange`/`focus`
+    // listeners exist. This is deliberately a different technique from PAD-07's
+    // real wall-clock wait (below): PAD-07 starts from an interval React already
+    // created against the page's *real* timers before this test could install a
+    // fake clock over it (`page.clock` cannot retrofit an already-running
+    // interval) -- here, `page` (not the shared `app` fixture, which has already
+    // navigated) is still blank when the clock is installed, so there is no such
+    // race.
+    await page.clock.install({ time: Date.now() });
+    await page.goto(server.origin);
+    await waitForServiceWorkerActive(page);
+
+    await signIn(page);
+    await startWalkingBout(page);
+    const timer = page.locator("time.timer--large");
     await expect(timer).toBeVisible();
 
-    // Real lock-screen stand-in, not a faked one: a second page in the SAME browser
-    // context is brought to the front, which genuinely backgrounds `app` -- Chromium
-    // fires a real `visibilitychange` on it, exactly the event `useNow` (frontend/
-    // src/pad/useNow.ts) listens for. The existing fake-timer coverage (`PAD-01 --
-    // lock-screen recovery` in `frontend/src/pages/PadPage.test.tsx`) advances a
-    // mocked clock so that literally *no* tick fires while time passes; this spec
-    // cannot force that on headless Chromium over a few real seconds (Chrome's
-    // background-tab timer throttling generally only bites after minutes hidden, and
-    // headless mode's exact scheduling is not something this suite controls), so it
-    // does not claim to reproduce "zero ticks delivered." What it CAN prove on a real
-    // browser: after a genuine visibility change, the displayed duration matches
-    // wall-clock elapsed -- which is only true if the display is recomputed from the
-    // stored `started_at`, because a tick-accumulating implementation that missed
-    // ticks while hidden would show a smaller value than wall-clock elapsed and stay
-    // wrong until its next natural tick.
-    const blank = await app.context().newPage();
-    await blank.bringToFront();
+    // `install()` alone leaves the clock "live": `Date.now()` keeps advancing
+    // with real wall-clock time (just offset by whatever `install`/`setSystemTime`
+    // last set), so `useNow`'s interval would still tick on its own, on its
+    // normal real-time cadence, exactly the confound this rewrite exists to
+    // remove. `pauseAt()` is what actually freezes it: after this call, per
+    // Playwright's own docs, "no timers are fired unless runFor()/
+    // fastForward()/pauseAt()/resume() is called" -- so the interval genuinely
+    // cannot tick again until this test explicitly says so, no matter how much
+    // real time elapses around it.
+    //
+    // The `+ 50` margin (well under the 1s interval period, so it cannot itself
+    // cross a tick boundary) exists because the clock is still live at the
+    // instant this line's own `Date.now()` read happens: by the time the
+    // `pauseAt` command actually reaches the page over CDP, live real time has
+    // moved on a little, and `pauseAt` refuses to "fast-forward to the past".
+    const pausedAtMs = (await page.evaluate(() => Date.now())) + 50;
+    await page.clock.pauseAt(pausedAtMs);
+    expect(parseTimerDatetimeMs(await timer.getAttribute("datetime"))).toBe(0);
 
-    // Deliberate wall-clock wait, not a synchronization mechanism -- PAD-01's whole
-    // premise is that real time passes while the tab is hidden. 4s is long enough to
-    // be clearly more than one 1s tick interval (so "the display just ticked once
-    // more" cannot explain a pass) and short enough to keep CI fast.
-    const HIDE_MS = 4_000;
-    await blank.waitForTimeout(HIDE_MS);
+    // Moves the (paused, non-live) fake `Date.now()` forward by 10s, before any
+    // recovery signal fires. `setSystemTime` is the one clock method that is
+    // explicitly documented to move time WITHOUT firing any due timer -- unlike
+    // `fastForward`/`runFor`/`pauseAt` itself, which all fire due timers (at
+    // least once) as part of advancing. Combined with the clock already being
+    // paused above, this is what makes the 1s interval fire zero times across
+    // the jump: the ONLY way `now` can end up correct afterwards is the
+    // `visibilitychange`/`focus` resync path calling `Date.now()` itself.
+    const ADVANCE_MS = 10_000;
+    await page.clock.setSystemTime(pausedAtMs + ADVANCE_MS);
 
-    await app.bringToFront();
+    // A genuine `document.visibilityState`/`window` focus transition (bringing a
+    // second same-context page to the front, then this one back) was tried
+    // first and does NOT work in this harness: verified directly (a page-level
+    // event counter recorded zero `visibilitychange`/`focus`/`blur` deliveries
+    // across a `blank.bringToFront()` / `page.bringToFront()` round trip) --
+    // this headless multi-page setup never actually backgrounds the other
+    // `Page`, so `document.visibilityState` stays `"visible"` throughout. That
+    // also means the *previous* version of this test, which relied on exactly
+    // that round trip to "genuinely background" the page, never exercised a
+    // real visibility transition at all; it passed solely because the real
+    // interval kept ticking during the real 4s wait, which is a second,
+    // independent reason (beyond the one CRITICAL 2 identified) that it could
+    // not have failed for the tick-accumulation defect. Dispatching the events
+    // directly is the honest fix: it still runs the app's own real listener
+    // functions (`document.addEventListener("visibilitychange", ...)` /
+    // `window.addEventListener("focus", ...)` in `useNow.ts`), just triggered
+    // synthetically instead of through a browser-level backgrounding this
+    // environment cannot produce.
+    await page.evaluate(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("focus"));
+    });
 
-    // Tolerance: two `bringToFront` round trips plus one React re-render are not
-    // instantaneous under CI load (see `playwright.config.ts`'s own comment about
-    // needing more slack than a typical DOM assertion for an IndexedDB round trip).
-    // 2s is half of `HIDE_MS`, so a pass still clearly demonstrates recomputation --
-    // a implementation that simply never resyncs would be off by ~`HIDE_MS`, not by
-    // something inside this tolerance.
-    const TOLERANCE_MS = 2_000;
-
-    // Recomputed on every poll attempt (not a single fixed target) because the
-    // acceptable "wall-clock elapsed" value keeps moving while `expect.poll` retries
-    // waiting for React to flush the resync.
+    // Deterministic, not a wall-clock race: the fake clock only ever holds exactly
+    // `pausedAtMs + ADVANCE_MS` at this point, so the only slack needed is for
+    // React to actually flush the resync -- a whole-second floor (up to 999ms) plus
+    // a little margin for the event round trip.
+    const TOLERANCE_MS = 1_100;
     await expect
       .poll(
-        async () => {
-          const displayedMs = parseTimerDatetimeMs(await timer.getAttribute("datetime"));
-          const wallClockMs = Date.now() - startedAt;
-          return Math.abs(displayedMs - wallClockMs);
-        },
+        async () => Math.abs(parseTimerDatetimeMs(await timer.getAttribute("datetime")) - ADVANCE_MS),
         {
           timeout: 3_000,
-          message: "displayed duration should resync to wall-clock elapsed time after becoming visible again",
+          message: "displayed duration should resync to the fake clock's advanced time after the recovery signal",
         },
       )
       .toBeLessThanOrEqual(TOLERANCE_MS);
-
-    await blank.close();
   },
 );
 
@@ -207,29 +215,39 @@ test(
 
 test("PAD-08 — pause: effective walking duration excludes the paused interval", async ({ app }) => {
   await signIn(app);
-  await startWalkingBout(app);
+  const boutStartedAt = await startWalkingBout(app);
   const status = app.getByRole("status");
 
   // Three real intervals: walk, pause, walk again. Kept a few seconds each so the
   // "excludes the pause" signal (the gap between the raw total and the effective
-  // total is roughly PAUSE_MS) is well clear of round-trip noise from the commit
-  // queue (each Pause/Resume/Finish tap is its own local-first action, committed
-  // through real IndexedDB -- see playwright.config.ts's own comment on why that
-  // needs more slack than a typical DOM assertion).
+  // total is roughly the pause's own length) is well clear of round-trip noise
+  // from the commit queue (each Pause/Resume/Finish tap is its own local-first
+  // action, committed through real IndexedDB -- see playwright.config.ts's own
+  // comment on why that needs more slack than a typical DOM assertion).
   const WALK1_MS = 3_000;
   const PAUSE_MS = 3_000;
   const WALK2_MS = 2_000;
-  const TOLERANCE_MS = 2_000;
+  // Tight on purpose: every interval below is *measured* (bracketed with
+  // `Date.now()` around the click that ends it), not the nominal constants
+  // above, so the only slack this needs to cover is the commit round-trip
+  // between a click and the app's own recorded timestamp for it -- not
+  // `waitForTimeout`'s own scheduling slop (a `waitForTimeout(3_000)` can
+  // legitimately resolve at 3_050ms under load; measuring removes that
+  // entirely rather than padding around it).
+  const TOLERANCE_MS = 800;
 
   await app.waitForTimeout(WALK1_MS); // Deliberate wall-clock wait: real walking time.
+  const pauseClickedAt = Date.now();
   await app.getByRole("button", { name: "Pause" }).click();
   await expect(status.filter({ hasText: "Paused" })).toBeVisible();
 
   await app.waitForTimeout(PAUSE_MS); // Deliberate wall-clock wait: real paused time.
+  const resumeClickedAt = Date.now();
   await app.getByRole("button", { name: "Resume" }).click();
   await expect(status.filter({ hasText: "Walking" })).toBeVisible();
 
   await app.waitForTimeout(WALK2_MS); // Deliberate wall-clock wait: more real walking time.
+  const finishClickedAt = Date.now();
   await app.getByRole("button", { name: "Finish bout" }).click();
   await expect(status.filter({ hasText: "Resting" })).toBeVisible();
 
@@ -240,12 +258,18 @@ test("PAD-08 — pause: effective walking duration excludes the paused interval"
   const effectiveMs = parseFormattedDurationMs(
     (await app.locator(".pad-bout-record .timer--inline").textContent()) ?? "",
   );
-  const expectedMs = WALK1_MS + WALK2_MS;
+  const measuredWalk1Ms = pauseClickedAt - boutStartedAt;
+  const measuredWalk2Ms = finishClickedAt - resumeClickedAt;
+  const expectedMs = measuredWalk1Ms + measuredWalk2Ms;
   expect(Math.abs(effectiveMs - expectedMs)).toBeLessThanOrEqual(TOLERANCE_MS);
   // Distinguishes "excluded correctly" from "not excluded at all": had the pause
-  // leaked into the total, it would read close to WALK1+PAUSE+WALK2 (~8s), well
-  // outside the tolerance band around the expected ~5s.
-  expect(effectiveMs).toBeLessThan(WALK1_MS + PAUSE_MS + WALK2_MS - TOLERANCE_MS);
+  // leaked into the total, it would read close to the measured raw span from bout
+  // start to finish (~8s), well outside the tolerance band around the ~5s
+  // expected once the pause is excluded. A non-excluded pause still fails this
+  // (verified: reintroducing the pause into the total lands well past
+  // `rawTotalMs - TOLERANCE_MS`).
+  const rawTotalMs = finishClickedAt - boutStartedAt;
+  expect(effectiveMs).toBeLessThan(rawTotalMs - TOLERANCE_MS);
 });
 
 test(

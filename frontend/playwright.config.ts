@@ -16,11 +16,17 @@ import { defineConfig, devices } from "@playwright/test";
 export default defineConfig({
   testDir: "e2e",
 
-  // These tests drive one browser's service-worker registration and one mock
-  // server's in-memory state; nothing about either is safe to race. A worker
-  // registration is scoped to an origin/context, and two tests sharing a context
-  // would fight over which build is "active" -- so both parallelism knobs are off
-  // rather than just relying on `server` being test-scoped.
+  // NOT because of shared service-worker/Cache-Storage/IndexedDB state: Playwright
+  // gives every test its own `BrowserContext`, so that state is already isolated
+  // per test and two tests never actually share a registration to fight over (the
+  // reviewer confirmed order-independence by running each spec file alone). The
+  // real reason is timing: PAD-01 (1.1s tolerance), PAD-02 (1.5s) and PAD-08
+  // (0.8-1.5s, see its own spec) compare a displayed duration against the wall
+  // clock (or a fake clock advanced against it), and parallel workers competing
+  // for CPU would erode those margins directly -- a slower scheduler means more
+  // real time between a click and the assertion that reads its effect, which is
+  // exactly what these tolerances are trying to bound. Serial execution keeps
+  // that variable out of the picture.
   fullyParallel: false,
   workers: 1,
 

@@ -24,7 +24,6 @@ node_modules/
 # Playwright (frontend/e2e, issue #23): local run artifacts, never source.
 frontend/test-results/
 frontend/playwright-report/
-frontend/blob-report/
 
 # Docker preview stack (docker-compose.preview.yml): the locally-trusted CA
 # certificate a developer extracts from Caddy's persisted volume to install
