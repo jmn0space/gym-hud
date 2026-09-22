@@ -1301,3 +1301,109 @@ describe("PAD corrections, undo and delete (issue #22)", () => {
     expect(within(dialog).getByText("Undo starting bout 1?")).toBeInTheDocument();
   });
 });
+
+describe("PAD pain onset", () => {
+  it("records the moment pain started with one tap on the running bout", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    const repository = freshRepository();
+    renderPad(repository);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start walking" }));
+    await screen.findByText("Walking");
+
+    // Five minutes in, the pain starts.
+    vi.setSystemTime(Date.parse("2026-09-18T10:05:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Pain started now" }));
+
+    await waitFor(async () => {
+      expect((await repository.listRecords("walking_bouts"))[0]).toEqual(
+        expect.objectContaining({ pain_onset_at: "2026-09-18T10:05:00.000Z", ended_at: null }),
+      );
+    });
+    // The bout keeps running; what changed is what the HUD now says about it.
+    expect(await screen.findByText("Pain started 05:00 into bout 1")).toBeInTheDocument();
+    expect(screen.getByText("Walking")).toBeInTheDocument();
+  });
+
+  it("counts only walking time before the onset, not a pause in between", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    const repository = freshRepository();
+    renderPad(repository);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start walking" }));
+    await screen.findByText("Walking");
+    vi.setSystemTime(Date.parse("2026-09-18T10:01:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    await screen.findByText("Paused");
+    vi.setSystemTime(Date.parse("2026-09-18T10:03:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+    await screen.findByText("Walking");
+
+    vi.setSystemTime(Date.parse("2026-09-18T10:05:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Pain started now" }));
+
+    // Five minutes elapsed, two of them paused.
+    expect(await screen.findByText("Pain started 03:00 into bout 1")).toBeInTheDocument();
+  });
+
+  it("records, corrects and clears the onset of a bout that already finished", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    const repository = freshRepository();
+    renderPad(repository);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start walking" }));
+    await screen.findByText("Walking");
+    vi.setSystemTime(Date.parse("2026-09-18T10:08:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Finish bout" }));
+    await screen.findByText("Resting");
+
+    // Nobody tapped it in time, so it is entered afterwards instead.
+    fireEvent.click(screen.getByRole("button", { name: /Pain onset in bout 1.*Not recorded/ }));
+    fireEvent.change(screen.getByLabelText("Pain onset in bout 1"), {
+      target: { value: toDatetimeLocalValue(new Date(Date.parse("2026-09-18T10:06:00.000Z"))) },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(async () => {
+      expect((await repository.listRecords("walking_bouts"))[0]).toEqual(
+        expect.objectContaining({ pain_onset_at: "2026-09-18T10:06:00.000Z" }),
+      );
+    });
+    expect(await screen.findByText("Pain started 06:00 into bout 1")).toBeInTheDocument();
+
+    // And a mis-tapped one can be taken back.
+    fireEvent.click(screen.getByRole("button", { name: /Pain onset in bout 1/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+
+    await waitFor(async () => {
+      expect((await repository.listRecords("walking_bouts"))[0]).toEqual(
+        expect.objectContaining({ pain_onset_at: null }),
+      );
+    });
+    expect(screen.queryByText(/Pain started .* into bout 1/)).not.toBeInTheDocument();
+  });
+
+  it("refuses an onset outside the bout and leaves the record unchanged", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    const repository = freshRepository();
+    renderPad(repository);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Start walking" }));
+    await screen.findByText("Walking");
+    vi.setSystemTime(Date.parse("2026-09-18T10:08:00.000Z"));
+    fireEvent.click(screen.getByRole("button", { name: "Finish bout" }));
+    await screen.findByText("Resting");
+
+    fireEvent.click(screen.getByRole("button", { name: /Pain onset in bout 1/ }));
+    fireEvent.change(screen.getByLabelText("Pain onset in bout 1"), {
+      // After the bout ended: the containment rule refuses it.
+      target: { value: toDatetimeLocalValue(new Date(Date.parse("2026-09-18T10:09:00.000Z"))) },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await screen.findByRole("alert");
+    expect((await repository.listRecords("walking_bouts"))[0]).toEqual(
+      expect.objectContaining({ pain_onset_at: null }),
+    );
+  });
+});

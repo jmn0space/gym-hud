@@ -194,6 +194,7 @@ class Device:
             "ended_at": None,
             "pain_min": None,
             "pain_max": None,
+            "pain_onset_at": None,
             "stop_reason": None,
             "notes": None,
         }

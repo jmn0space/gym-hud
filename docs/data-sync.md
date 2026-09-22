@@ -643,6 +643,12 @@ Per record (`invalid_record`):
 - `bout_number` a positive integer; `stop_reason` null or one of the five reasons;
 - pain is null/null, or one value or two adjacent values from 1 to 5
   (`pain_min <= pain_max <= pain_min + 1`);
+- `pain_onset_at` is null, or a timestamp inside its own bout: at or after
+  `started_at`, and at or before `ended_at` once the bout has ended (the end is
+  read as it will be stored, after the clamp below). A device stamps it
+  monotonically like every other PAD moment, so an onset outside its bout is
+  not something a clock step produces -- it is refused, not clamped, and the
+  database holds the same rule (`pad_bout_pain_onset_within_bout`);
 - free text (`session_notes`, `notes`) is a string or null. It is made storable
   rather than refused: NUL characters are removed (PostgreSQL text cannot hold them)
   and a lone UTF-16 surrogate becomes U+FFFD. Identity fields stay strict.
@@ -663,7 +669,15 @@ boundary instead, deterministically, and notes each move in the ledger (`applied
   bout ended and, once the session is closed, has ended by `completed_at`. A start
   outside the range moves to the nearer bound, an end past it moves back to it, an
   open child of a closed parent is closed at the parent's end, and an end left
-  before a raised start moves up to it.
+  before a raised start moves up to it;
+- a bout's `pain_onset_at` follows the bout it belongs to: once the bout's own
+  timestamps are final, an onset left outside them moves to the bound it
+  crossed, in the same write. This is the only way an onset moves, since one
+  arriving outside its bout is refused rather than stored. A pain onset also
+  counts as a sign of life when the server closes a stuck session on its own
+  (below): such a session closes at the latest moment it records, an onset
+  included, so an open bout carrying one is never closed before the pain it
+  recorded.
 
 Every clamp lands inside the database's constraints, and the same input always
 gives the same stored result. Rows the mutation did not itself write can move too (a
@@ -733,8 +747,8 @@ queues a mutation the server has to repair or refuse: close every open pause whe
 bout ends and every open bout, pause and rest when the session ends; stamp times
 monotonically within a session (done: `monotonicNow`); refuse a new bout while a
 rest is open; tombstone a rest when undoing the bout finish that created it; delete
-children with their parent; never reopen a finished session; keep pain, stop reason
-and text within the rules above.
+children with their parent; never reopen a finished session; keep pain, the pain
+onset, stop reason and text within the rules above.
 
 **Settled 2026-09-20 (issue #22).** The local repository (`commitAction` in
 `frontend/src/storage/repository.ts`) enforces the one-at-a-time rules, the
@@ -1320,6 +1334,7 @@ The following must work offline:
 - start a bout;
 - pause/resume;
 - select pain;
+- record when pain started;
 - finish a bout;
 - begin rest;
 - start the next bout;

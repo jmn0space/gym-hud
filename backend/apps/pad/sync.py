@@ -189,6 +189,11 @@ class _SessionTree:
             moments.append(row.started_at)
             if row.ended_at is not None:
                 moments.append(row.ended_at)
+        # A pain onset counts as a sign of life of its own: an open bout
+        # records no end, so without this a session closed here could be
+        # closed *before* a pain onset it already holds -- which is both
+        # untrue and outside the bout's own constraint.
+        moments.extend(bout.pain_onset_at for bout in self.bouts if bout.pain_onset_at is not None)
         return max(moments)
 
 
@@ -232,6 +237,26 @@ class _Clamps:
             # Only after the start itself moved up to ``low``.
             self.set(store, row, "ended_at", row.started_at, f"before its {parent} started")
 
+    def pain_onset(self, bout: WalkingBout) -> None:
+        """Keep a bout's recorded pain onset inside the bout, after the bout itself moved.
+
+        Only reachable through a clamp of the bout's own timestamps (a bout
+        that started before its session, or was still open when the session
+        closed): a device stamps the onset monotonically inside the bout, and
+        :func:`~apps.pad.records.parse_walking_bout` refuses one that is not.
+        Saved together with whatever moved the bout, so the row never lands
+        outside ``pad_bout_pain_onset_within_bout``.
+        """
+        onset = bout.pain_onset_at
+        if onset is None:
+            return
+        if onset < bout.started_at:
+            self.set(
+                "walking_bouts", bout, "pain_onset_at", bout.started_at, "before its bout started"
+            )
+        elif bout.ended_at is not None and onset > bout.ended_at:
+            self.set("walking_bouts", bout, "pain_onset_at", bout.ended_at, "after its bout ended")
+
     def save(self) -> None:
         for row, fields in self.changed.values():
             self.ctx.save_derived(row, sorted(fields))
@@ -247,6 +272,8 @@ def settle_session_tree(ctx: ApplyContext, session: WalkingSession) -> None:
       started, and once the session is closed (``COMPLETED``/``DISCARDED``) it
       has ended, at or before ``completed_at``;
     - a pause lies within its bout (and has ended once the bout has);
+    - a bout's recorded pain onset lies within that bout, once the bout's own
+      timestamps are final;
     - a rest starts at or after its bout ended and, once the session is
       closed, has ended by ``completed_at``.
 
@@ -263,6 +290,7 @@ def settle_session_tree(ctx: ApplyContext, session: WalkingSession) -> None:
 
     for bout in tree.bouts:
         clamps.interval("walking_bouts", bout, session.started_at, closed_at, "session")
+        clamps.pain_onset(bout)
     for pause in tree.pauses:
         bout = tree.bout_by_id[pause.walking_bout_id]
         clamps.interval("walking_pauses", pause, bout.started_at, bout.ended_at, "bout")
@@ -439,5 +467,6 @@ PAD_DOMAIN = SyncDomain(
         "pad_one_open_bout_per_session": "This walking session already has an open bout.",
         "pad_one_open_pause_per_bout": "This bout already has an open pause.",
         "pad_one_rest_per_bout": "This bout already has a rest.",
+        "pad_bout_pain_onset_within_bout": "The pain onset is outside its walking bout.",
     },
 )

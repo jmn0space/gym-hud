@@ -742,6 +742,60 @@ def test_children_are_clamped_to_a_session_that_closed_earlier(
     assert WalkingRest.objects.get(pk=rest_id).ended_at == at(10)
 
 
+def test_a_pain_onset_follows_the_bout_it_belongs_to_when_the_bout_is_clamped(
+    api: APIClient, device: Device
+) -> None:
+    """A clamp of the bout drags its recorded pain onset with it, into the bout's new bounds."""
+    session_id, bout_id = _active_session(api, device)
+    onset = device.edit(at(3), "walking_bouts", bout_id, pain_onset_at=iso(at(3)))
+    finish_bout, _ = device.finish_bout(bout_id, at(9))
+    assert statuses(push(api, device, onset, finish_bout)) == ["applied", "applied"]
+    assert WalkingBout.objects.get(pk=bout_id).pain_onset_at == at(3)
+
+    # The session closes before the bout's recorded end: the bout's end clamps
+    # back to the closure, and the onset -- now after it -- clamps with it.
+    finish = device.finish_session(session_id, at(9))
+    session_change = next(c for c in finish["changes"] if c["store"] == "walking_sessions")
+    session_change["record"]["completed_at"] = iso(at(2))
+
+    assert statuses(push(api, device, finish)) == ["applied"]
+    bout = WalkingBout.objects.get(pk=bout_id)
+    assert (bout.ended_at, bout.pain_onset_at) == (at(2), at(2))
+    detail = ProcessedMutation.objects.get(mutation_id=finish["mutation_id"]).detail
+    assert f"walking_bouts/{bout_id} pain_onset_at" in detail
+    assert "after its bout ended" in detail
+
+
+def test_a_pain_onset_is_raised_with_a_bout_clamped_into_a_later_session_start(
+    api: APIClient, device: Device
+) -> None:
+    session_id, bout_id = _active_session(api, device)
+    onset = device.edit(at(3), "walking_bouts", bout_id, pain_onset_at=iso(at(3)))
+    assert statuses(push(api, device, onset)) == ["applied"]
+
+    moved = device.edit(at(4), "walking_sessions", session_id, started_at=iso(at(5)))
+    assert statuses(push(api, device, moved)) == ["applied"]
+    bout = WalkingBout.objects.get(pk=bout_id)
+    assert (bout.started_at, bout.pain_onset_at) == (at(5), at(5))
+
+
+def test_a_stuck_session_closes_no_earlier_than_a_pain_onset_it_recorded(
+    api: APIClient, device: Device
+) -> None:
+    """The onset is a sign of life of its own: an open bout has no end to close at."""
+    session_id, bout_id = _active_session(api, device)
+    onset = device.edit(at(3), "walking_bouts", bout_id, pain_onset_at=iso(at(3)))
+    assert statuses(push(api, device, onset)) == ["applied"]
+    tablet = Device()
+    second, _ = tablet.start_session(at(30))
+
+    assert statuses(push(api, tablet, second)) == ["applied"]
+    stuck = WalkingSession.objects.get(pk=session_id)
+    bout = WalkingBout.objects.get(pk=bout_id)
+    assert (stuck.status, stuck.completed_at) == ("COMPLETED", at(3))
+    assert (bout.ended_at, bout.pain_onset_at) == (at(3), at(3))
+
+
 def test_a_time_correction_is_judged_on_the_finished_state(api: APIClient, device: Device) -> None:
     """PAD-09's correction: moving a bout's end must move what depends on it, in one mutation."""
     session_id, bout_id = _active_session(api, device)

@@ -42,6 +42,13 @@ export interface WalkingBout {
   ended_at: string | null;
   pain_min: number | null;
   pain_max: number | null;
+  /**
+   * When pain started during this bout (docs/pad-walking.md, "Pain onset"), or
+   * null while none has been recorded. A moment inside the bout, not a duration:
+   * the pain-free walking time every screen shows is derived from it and the
+   * bout's own timestamps, never stored.
+   */
+  pain_onset_at: string | null;
   stop_reason: WalkingStopReason | null;
   notes: string | null;
 }
