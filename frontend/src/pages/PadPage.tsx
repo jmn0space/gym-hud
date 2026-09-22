@@ -20,11 +20,14 @@ import {
   hasUnreadableOpenRecords,
   inheritedWalkingSettings,
   finishWalkingBoutAction,
+  markWalkingPainOnsetAction,
+  painOnsetElapsedMs,
   parseWalkingSessionSummary,
   pauseWalkingBoutAction,
   PREVIOUS_WALKING_SESSION_KEY,
   readPadSession,
   resumeWalkingBoutAction,
+  setWalkingPainOnsetAction,
   startWalkingBoutAction,
   startNextWalkingBoutAction,
   startWalkingSessionAction,
@@ -301,6 +304,33 @@ export function PadPage() {
     [readLiveSnapshot, run, view],
   );
 
+  // Stamping, not editing: the recorded moment is when the user felt pain, so
+  // this goes through the same displayed-interval guard as PAUSE/FINISH BOUT
+  // rather than the looser "same session" check an edit gets -- a tap that
+  // lands after another tab finished the bout must not stamp the next one.
+  const markPainOnset = useCallback(() => {
+    const boutId = view?.currentBout?.id;
+    if (view === null || boutId === undefined) return;
+    run(`pain-onset-${boutId}`, async (attempt) => {
+      const liveView = requireDisplayedInterval(view, readPadSession(await readLiveSnapshot()));
+      return markWalkingPainOnsetAction({ actionId: attempt.actionId, view: liveView, boutId, now: attempt.now });
+    });
+  }, [readLiveSnapshot, run, view]);
+
+  const setPainOnset = useCallback(
+    (boutId: string, painOnsetAt: string | null) => {
+      if (view === null) return;
+      run(`set-pain-onset-${boutId}`, async (attempt) => {
+        const liveView = readPadSession(await readLiveSnapshot());
+        if (liveView?.session.id !== view.session.id) {
+          throw new InvalidActionError("This walking session is no longer active.");
+        }
+        return setWalkingPainOnsetAction({ actionId: attempt.actionId, view: liveView, boutId, painOnsetAt });
+      });
+    },
+    [readLiveSnapshot, run, view],
+  );
+
   const changeSessionNotes = useCallback(
     (notes: string) => {
       if (view === null) return;
@@ -501,6 +531,8 @@ export function PadPage() {
           onCorrectRestTimes={correctRestTimes}
           onDeleteBout={deleteBout}
           onFinishSession={finishSession}
+          onMarkPainOnset={markPainOnset}
+          onSetPainOnset={setPainOnset}
           onStartBout={startBout}
           onTransitionBout={transitionBout}
           onUndo={undoTransition}
@@ -912,6 +944,9 @@ interface WalkingHudProps {
   onCorrectRestTimes: (restId: string, values: { startedAt?: string; endedAt?: string }) => void;
   onDeleteBout: (boutId: string) => void;
   onFinishSession: () => void;
+  /** Records "pain started now" on the bout that is running. */
+  onMarkPainOnset: () => void;
+  onSetPainOnset: (boutId: string, painOnsetAt: string | null) => void;
   onStartBout: () => void;
   onTransitionBout: (kind: "pause" | "resume" | "finish" | "next") => void;
   onUndo: () => void;
@@ -930,6 +965,8 @@ function WalkingHud({
   onCorrectRestTimes,
   onDeleteBout,
   onFinishSession,
+  onMarkPainOnset,
+  onSetPainOnset,
   onStartBout,
   onTransitionBout,
   onUndo,
@@ -992,6 +1029,13 @@ function WalkingHud({
               busy={busy}
               bout={currentBout}
               onChange={(painMin, painMax) => { onChangeBout(currentBout.id, { painMin, painMax }); }}
+            />
+            <PainOnsetControl
+              bout={currentBout}
+              busy={busy}
+              onMark={onMarkPainOnset}
+              onSet={(painOnsetAt) => { onSetPainOnset(currentBout.id, painOnsetAt); }}
+              pauses={view.pauses}
             />
             <NoteEditor
               key={currentBout.id}
@@ -1063,6 +1107,7 @@ function WalkingHud({
                   onCorrectPauseTimes={onCorrectPauseTimes}
                   onCorrectRestTimes={onCorrectRestTimes}
                   onDelete={() => { onDeleteBout(bout.id); }}
+                  onSetPainOnset={(painOnsetAt) => { onSetPainOnset(bout.id, painOnsetAt); }}
                   pauses={view.pauses.filter((pause) => pause.walking_bout_id === bout.id)}
                   rest={view.rests.find((rest) => rest.walking_bout_id === bout.id) ?? null}
                   now={now}
@@ -1203,6 +1248,7 @@ function CompletedBout({
   onCorrectPauseTimes,
   onCorrectRestTimes,
   onDelete,
+  onSetPainOnset,
   pauses,
   rest,
 }: {
@@ -1215,6 +1261,7 @@ function CompletedBout({
   onCorrectPauseTimes: (pauseId: string, values: { startedAt?: string; endedAt?: string }) => void;
   onCorrectRestTimes: (restId: string, values: { startedAt?: string; endedAt?: string }) => void;
   onDelete: () => void;
+  onSetPainOnset: (painOnsetAt: string | null) => void;
   pauses: readonly WalkingBoutPause[];
   rest: PadSessionView["currentRest"];
 }) {
@@ -1238,6 +1285,7 @@ function CompletedBout({
         onChange={(painMin, painMax) => { onChange({ painMin, painMax }); }}
       />
       <p className="muted">{selected.length === 0 ? "No pain selected" : `Pain ${selected.join("–")}`}</p>
+      <PainOnsetControl bout={bout} busy={busy} onSet={onSetPainOnset} pauses={pauses} />
       <div className="field">
         <label htmlFor={reasonId}>Stop reason for bout {bout.bout_number.toString()}</label>
         <select
@@ -1311,25 +1359,87 @@ function CompletedBout({
 }
 
 /**
+ * Every bout's pain-onset control (docs/pad-walking.md, "Pain onset").
+ *
+ * On the bout that is running, `onMark` makes it one tap -- "pain started
+ * now", stamped as it happens, which is the whole point of recording the
+ * moment rather than reconstructing it. On a bout that has finished there is
+ * no "now" left to stamp, so the same control opens the time editor instead,
+ * seeded with the bout's own start; once a moment is recorded, both read and
+ * edit it the same way, and either can clear one tapped by mistake.
+ */
+function PainOnsetControl({
+  bout,
+  busy,
+  onMark,
+  onSet,
+  pauses,
+}: {
+  bout: WalkingBout;
+  busy: boolean;
+  /** Present only while the bout is running: stamps the current moment. */
+  onMark?: () => void;
+  onSet: (painOnsetAt: string | null) => void;
+  pauses: readonly WalkingBoutPause[];
+}) {
+  const elapsedMs = painOnsetElapsedMs(bout, pauses);
+  return (
+    <div className="stack">
+      {bout.pain_onset_at === null && onMark !== undefined ? (
+        <button className="button" disabled={busy} onClick={onMark} type="button">
+          Pain started now
+        </button>
+      ) : (
+        <RecordedTimeField
+          busy={busy}
+          emptyText="Not recorded"
+          label={`Pain onset in bout ${bout.bout_number.toString()}`}
+          onClear={() => { onSet(null); }}
+          onSave={(painOnsetAt) => { onSet(painOnsetAt); }}
+          seed={bout.started_at}
+          value={bout.pain_onset_at}
+        />
+      )}
+      {elapsedMs !== null && (
+        <p className="muted">
+          Pain started {formatDuration(elapsedMs)} into bout {bout.bout_number.toString()}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
  * One recorded timestamp, tapped to reveal a `datetime-local` editor
  * (docs/pad-walking.md: "Recorded times can be tapped and corrected").
  * Keyboard input is normally avoided in this HUD, but a correction is the
  * documented exception -- typing an exact time is the point.
+ *
+ * A `null` value is a moment that may be recorded but is not yet (only a pain
+ * onset, today): the collapsed control reads `emptyText`, the editor opens on
+ * `seed`, and `onClear` -- offered only where a recorded moment may be taken
+ * back again -- removes one.
  */
 function RecordedTimeField({
   busy,
+  emptyText,
   label,
+  onClear,
   onSave,
+  seed,
   value,
 }: {
   busy: boolean;
+  emptyText?: string;
   label: string;
+  onClear?: () => void;
   onSave: (iso: string) => void;
-  value: string;
+  seed?: string;
+  value: string | null;
 }) {
   const id = useId();
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(() => isoToLocalInputValue(value));
+  const [draft, setDraft] = useState(() => isoToLocalInputValue(value ?? seed ?? ""));
   const parsed = localInputValueToIso(draft);
   // Compared -- and Save gated -- at whole-second resolution: the field
   // cannot edit milliseconds, so a draft that reads back the same second as
@@ -1337,7 +1447,7 @@ function RecordedTimeField({
   // may carry a sub-second remainder the field never showed (issue #22
   // finding 3; a save-without-editing must never silently move the stored
   // instant by up to 999 ms).
-  const unchanged = parsed !== null && toWholeSeconds(parsed) === toWholeSeconds(value);
+  const unchanged = parsed !== null && value !== null && toWholeSeconds(parsed) === toWholeSeconds(value);
 
   if (!editing) {
     return (
@@ -1345,13 +1455,15 @@ function RecordedTimeField({
         className="pad-time-field"
         disabled={busy}
         onClick={() => {
-          setDraft(isoToLocalInputValue(value));
+          setDraft(isoToLocalInputValue(value ?? seed ?? ""));
           setEditing(true);
         }}
         type="button"
       >
         <span className="pad-time-field__label">{label}</span>
-        <span className="pad-time-field__value">{formatClockTime(value)}</span>
+        <span className="pad-time-field__value">
+          {value === null ? (emptyText ?? "Not recorded") : formatClockTime(value)}
+        </span>
       </button>
     );
   }
@@ -1377,7 +1489,7 @@ function RecordedTimeField({
               // reads (the draft was opened and saved without a real edit),
               // send the original value back verbatim so its milliseconds
               // are never silently dropped.
-              onSave(toWholeSeconds(parsed) === toWholeSeconds(value) ? value : parsed);
+              onSave(value !== null && toWholeSeconds(parsed) === toWholeSeconds(value) ? value : parsed);
               setEditing(false);
             }
           }}
@@ -1385,6 +1497,19 @@ function RecordedTimeField({
         >
           Save
         </button>
+        {onClear !== undefined && value !== null && (
+          <button
+            className="button button--quiet"
+            disabled={busy}
+            onClick={() => {
+              setEditing(false);
+              onClear();
+            }}
+            type="button"
+          >
+            Clear
+          </button>
+        )}
         <button className="button" disabled={busy} onClick={() => { setEditing(false); }} type="button">
           Cancel
         </button>

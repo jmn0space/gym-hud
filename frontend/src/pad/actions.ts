@@ -51,7 +51,12 @@ export function monotonicNow(now: Date, recorded: Iterable<unknown>): Date {
   return new Date(latest);
 }
 
-const RECORDED_TIME_FIELDS = ["started_at", "ended_at", "completed_at"] as const;
+// `pain_onset_at` counts as a recorded moment like any interval endpoint: a
+// later stamp (the bout's own end, the session's completion) must never land
+// before a pain onset the session already recorded, or the containment rules
+// below -- and the server's matching ones -- would refuse what a clock step,
+// not the user, caused.
+const RECORDED_TIME_FIELDS = ["started_at", "ended_at", "completed_at", "pain_onset_at"] as const;
 
 /** Every start and end a set of session records holds, for `monotonicNow`. */
 function recordedTimes(records: readonly object[]): unknown[] {
@@ -316,6 +321,7 @@ export function startWalkingBoutAction({
           ended_at: null,
           pain_min: null,
           pain_max: null,
+          pain_onset_at: null,
           stop_reason: null,
           notes: null,
         }),
@@ -453,7 +459,7 @@ export function startNextWalkingBoutAction({ actionId, boutId, view, now }: Star
       { store: "walking_bouts", operation: "put", record: walkingBoutRecord({
         id: boutId, walking_session_id: view.session.id, bout_number: view.currentBoutNumber,
         started_at: startedAt, ended_at: null, pain_min: null, pain_max: null,
-        stop_reason: null, notes: null,
+        pain_onset_at: null, stop_reason: null, notes: null,
       }) },
       stampedWorkflowChange(view, { kind: "next_bout_started", boutId, restId: rest.id, pauseId: null }),
     ],
@@ -708,6 +714,7 @@ function isValidTimestamp(value: string): boolean {
  *
  * - a bout starts at or after its session started;
  * - an interval's end is not before its own start;
+ * - a bout's recorded pain onset lies inside that bout;
  * - a pause lies within its bout, and cannot stay open once the bout has
  *   ended;
  * - pauses of the same bout do not overlap;
@@ -740,6 +747,15 @@ function assertContainedWalkingSession(
     }
     if (bout.ended_at !== null && Date.parse(bout.ended_at) < Date.parse(bout.started_at)) {
       throw new InvalidActionError(`Bout ${bout.bout_number.toString()} cannot end before it started`);
+    }
+    if (bout.pain_onset_at !== null) {
+      const onset = Date.parse(bout.pain_onset_at);
+      if (onset < Date.parse(bout.started_at)) {
+        throw new InvalidActionError(`Pain onset cannot be before bout ${bout.bout_number.toString()} started`);
+      }
+      if (bout.ended_at !== null && onset > Date.parse(bout.ended_at)) {
+        throw new InvalidActionError(`Pain onset cannot be after bout ${bout.bout_number.toString()} ended`);
+      }
     }
   }
 
@@ -992,6 +1008,105 @@ export function correctWalkingRestTimesAction(input: CorrectWalkingRestTimesInpu
     ],
     preconditions: [workflowPrecondition(view), unchangedRecordPrecondition("walking_rests", rawRest)],
   };
+}
+
+/**
+ * Both pain-onset writes, which differ only in where the moment comes from.
+ *
+ * Validated against the whole resulting session exactly like a correction
+ * (`assertContainedWalkingSession`): an onset lies inside its own bout. The
+ * transition stamp is deliberately *not* invalidated -- an onset moves no
+ * interval endpoint, so whatever transition is underneath it still reverses
+ * exactly (docs/pad-walking.md, "Undo": an unrelated edit on top does not
+ * block undoing the transition underneath it). This is how
+ * `updateWalkingBoutAction` already treats pain and notes, and a pain onset
+ * is a pain datum with a timestamp, not a workflow endpoint.
+ */
+function walkingPainOnsetAction(
+  actionId: string,
+  view: PadSessionView,
+  bout: WalkingBout,
+  painOnsetAt: string | null,
+): LocalAction {
+  const bouts = view.bouts.map((item) =>
+    item.id === bout.id ? { ...item, pain_onset_at: painOnsetAt } : item);
+  assertContainedWalkingSession(view.session, bouts, view.pauses, view.rests);
+
+  const rawBout = rawById(view.boutRecords, bout.id);
+  return {
+    actionId,
+    changes: [
+      { store: "walking_bouts", operation: "put", record: {
+        ...carriedFields(rawBout), pain_onset_at: painOnsetAt,
+      } },
+      workflowChange(view),
+    ],
+    preconditions: [workflowPrecondition(view), unchangedRecordPrecondition("walking_bouts", rawBout)],
+  };
+}
+
+export interface MarkWalkingPainOnsetInput {
+  actionId: string;
+  view: PadSessionView;
+  boutId: string;
+  now: Date;
+}
+
+/**
+ * Record the moment pain started in the bout that is running now
+ * (docs/pad-walking.md, "Pain onset"): the one-tap control the HUD offers
+ * while a bout is WALKING or PAUSED, so the moment is captured as it happens
+ * rather than reconstructed afterwards.
+ *
+ * The stamp goes through `monotonicNow` like every other recorded PAD moment,
+ * so a device clock that stepped back can never place the onset before the
+ * bout it belongs to. Pressing it again replaces the recorded moment: "pain
+ * started now" is the only thing a second press can mean, and the moment
+ * stays correctable and clearable afterwards through
+ * `setWalkingPainOnsetAction`.
+ */
+export function markWalkingPainOnsetAction({ actionId, view, boutId, now }: MarkWalkingPainOnsetInput): LocalAction {
+  requireState(view, "WALKING", "PAUSED");
+  const bout = guardedCurrentBout(view);
+  if (bout.id !== boutId) {
+    throw new InvalidActionError("Pain onset can only be stamped on the running bout");
+  }
+  return walkingPainOnsetAction(actionId, view, bout, monotonicNow(now, sessionTimes(view)).toISOString());
+}
+
+export interface SetWalkingPainOnsetInput {
+  actionId: string;
+  view: PadSessionView;
+  boutId: string;
+  /** The corrected moment, or `null` to clear one recorded by mistake. */
+  painOnsetAt: string | null;
+}
+
+/**
+ * Set, correct or clear any bout's recorded pain onset -- the counterpart of
+ * `correctWalkingBoutTimesAction` for a moment that is not an interval
+ * endpoint. It applies to every bout of the active session, finished or
+ * running: a bout whose onset nobody tapped in time can still be given one
+ * afterwards, and a recorded one is as correctable as every other recorded
+ * time (docs/pad-walking.md, "Editing, undo, and delete").
+ *
+ * Clearing is allowed where clearing `ended_at` is not. A correction may not
+ * reopen an interval, because opening and closing intervals is what the
+ * workflow controls do; an onset opens nothing, so "there was no pain onset
+ * after all" has to stay expressible -- the same way pain itself can go back
+ * to none.
+ */
+export function setWalkingPainOnsetAction({ actionId, view, boutId, painOnsetAt }: SetWalkingPainOnsetInput): LocalAction {
+  if (view.session.status !== "ACTIVE") throw new InvalidActionError("Session is no longer active");
+  const bout = view.bouts.find((item) => item.id === boutId);
+  if (bout === undefined) throw new InvalidActionError("Bout does not belong to session");
+  if (painOnsetAt !== null && !isValidTimestamp(painOnsetAt)) {
+    throw new InvalidActionError("Pain onset is not a valid timestamp");
+  }
+  if (painOnsetAt === bout.pain_onset_at) {
+    throw new InvalidActionError("Pain onset is unchanged");
+  }
+  return walkingPainOnsetAction(actionId, view, bout, painOnsetAt);
 }
 
 /**

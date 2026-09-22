@@ -9,15 +9,24 @@ import {
   deleteWalkingBoutAction,
   detectUndoableWalkingTransition,
   finishWalkingBoutAction,
+  finishWalkingSessionAction,
+  markWalkingPainOnsetAction,
   pauseWalkingBoutAction,
   resumeWalkingBoutAction,
+  setWalkingPainOnsetAction,
   startNextWalkingBoutAction,
   startWalkingBoutAction,
   startWalkingSessionAction,
   undoLastWalkingTransitionAction,
   updateWalkingBoutAction,
 } from "./actions";
-import { readPadSession, totalWalkingMs, walkingElapsedMs, type PadSessionView } from "./session";
+import {
+  painOnsetElapsedMs,
+  readPadSession,
+  totalWalkingMs,
+  walkingElapsedMs,
+  type PadSessionView,
+} from "./session";
 import { DEFAULT_WALKING_SETTINGS } from "./types";
 
 const factory = new IDBFactory();
@@ -736,5 +745,164 @@ describe("PAD bout deletion", () => {
     // refused up front rather than silently no-opping or double-tombstoning.
     const second = await live(repo);
     expect(() => deleteWalkingBoutAction({ actionId: nextActionId(), view: second, boutId: "bout-1" })).toThrow(InvalidActionError);
+  });
+});
+
+describe("PAD pain onset", () => {
+  it("stamps the moment pain started in the running bout and derives the pain-free walking time net of pauses", async () => {
+    const repo = open();
+    await start(repo);
+    await repo.commitAction(startWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-1", view: await live(repo), now: at(0) }));
+    await repo.commitAction(pauseWalkingBoutAction({ actionId: nextActionId(), pauseId: "pause-1", view: await live(repo), now: at(1) }));
+    await repo.commitAction(resumeWalkingBoutAction({ actionId: nextActionId(), view: await live(repo), now: at(3) }));
+
+    await repo.commitAction(markWalkingPainOnsetAction({
+      actionId: nextActionId(), view: await live(repo), boutId: "bout-1", now: at(5),
+    }));
+
+    const view = await live(repo);
+    const bout = view.bouts[0];
+    if (bout === undefined) throw new Error("Expected bout 1");
+    expect(bout.pain_onset_at).toBe(at(5).toISOString());
+    // Five minutes into the bout, two of them standing still.
+    expect(painOnsetElapsedMs(bout, view.pauses)).toBe(3 * 60_000);
+    // The bout itself is untouched: an onset opens and closes nothing.
+    expect(bout.ended_at).toBeNull();
+    expect(view.state).toBe("WALKING");
+  });
+
+  it("stays available while paused, which is when pain often stops the walk", async () => {
+    const repo = open();
+    await start(repo);
+    await repo.commitAction(startWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-1", view: await live(repo), now: at(0) }));
+    await repo.commitAction(pauseWalkingBoutAction({ actionId: nextActionId(), pauseId: "pause-1", view: await live(repo), now: at(4) }));
+
+    await repo.commitAction(markWalkingPainOnsetAction({
+      actionId: nextActionId(), view: await live(repo), boutId: "bout-1", now: at(5),
+    }));
+
+    expect((await live(repo)).bouts[0]?.pain_onset_at).toBe(at(5).toISOString());
+  });
+
+  it("stamps monotonically, so a clock that stepped back cannot place the onset before its bout", async () => {
+    const repo = open();
+    await start(repo);
+    await repo.commitAction(startWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-1", view: await live(repo), now: at(10) }));
+
+    await repo.commitAction(markWalkingPainOnsetAction({
+      actionId: nextActionId(), view: await live(repo), boutId: "bout-1", now: at(2),
+    }));
+
+    const view = await live(repo);
+    const bout = view.bouts[0];
+    if (bout === undefined) throw new Error("Expected bout 1");
+    expect(bout.pain_onset_at).toBe(at(10).toISOString());
+    expect(painOnsetElapsedMs(bout, view.pauses)).toBe(0);
+  });
+
+  it("closes the session no earlier than a recorded pain onset", async () => {
+    const repo = open();
+    await start(repo);
+    await repo.commitAction(startWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-1", view: await live(repo), now: at(0) }));
+    await repo.commitAction(markWalkingPainOnsetAction({
+      actionId: nextActionId(), view: await live(repo), boutId: "bout-1", now: at(6),
+    }));
+    await repo.commitAction(pauseWalkingBoutAction({ actionId: nextActionId(), pauseId: "pause-1", view: await live(repo), now: at(7) }));
+
+    // A clock step back: the finish must still not end the bout before its onset.
+    await repo.commitAction(finishWalkingSessionAction({
+      actionId: nextActionId(), snapshot: await repo.readSnapshot(), sessionId: "session", now: at(1),
+    }));
+
+    const bout = await repo.getRecord("walking_bouts", "bout-1");
+    expect(bout?.ended_at).toBe(at(7).toISOString());
+  });
+
+  it("refuses a stamp on any bout but the one that is running", async () => {
+    const repo = open();
+    await start(repo);
+    await repo.commitAction(startWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-1", view: await live(repo), now: at(0) }));
+    await repo.commitAction(finishWalkingBoutAction({ actionId: nextActionId(), restId: "rest-1", view: await live(repo), now: at(8) }));
+
+    // RESTING: there is no bout running to stamp "now" on.
+    const resting = await live(repo);
+    expect(() => markWalkingPainOnsetAction({
+      actionId: nextActionId(), view: resting, boutId: "bout-1", now: at(9),
+    })).toThrow(InvalidActionError);
+  });
+
+  it("records, corrects and clears the onset of a bout that already finished", async () => {
+    const repo = open();
+    await start(repo);
+    await repo.commitAction(startWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-1", view: await live(repo), now: at(0) }));
+    await repo.commitAction(finishWalkingBoutAction({ actionId: nextActionId(), restId: "rest-1", view: await live(repo), now: at(8) }));
+
+    // Nobody tapped it in time; it is entered afterwards, then corrected, then removed.
+    await repo.commitAction(setWalkingPainOnsetAction({
+      actionId: nextActionId(), view: await live(repo), boutId: "bout-1", painOnsetAt: at(5).toISOString(),
+    }));
+    expect((await live(repo)).bouts[0]?.pain_onset_at).toBe(at(5).toISOString());
+
+    await repo.commitAction(setWalkingPainOnsetAction({
+      actionId: nextActionId(), view: await live(repo), boutId: "bout-1", painOnsetAt: at(6).toISOString(),
+    }));
+    expect((await live(repo)).bouts[0]?.pain_onset_at).toBe(at(6).toISOString());
+
+    await repo.commitAction(setWalkingPainOnsetAction({
+      actionId: nextActionId(), view: await live(repo), boutId: "bout-1", painOnsetAt: null,
+    }));
+    const cleared = await live(repo);
+    const clearedBout = cleared.bouts[0];
+    if (clearedBout === undefined) throw new Error("Expected bout 1");
+    expect(clearedBout.pain_onset_at).toBeNull();
+    expect(painOnsetElapsedMs(clearedBout, cleared.pauses)).toBeNull();
+  });
+
+  it("refuses an onset outside the bout it belongs to", async () => {
+    const repo = open();
+    await start(repo);
+    await repo.commitAction(startWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-1", view: await live(repo), now: at(1) }));
+    await repo.commitAction(finishWalkingBoutAction({ actionId: nextActionId(), restId: "rest-1", view: await live(repo), now: at(8) }));
+    const view = await live(repo);
+
+    expect(() => setWalkingPainOnsetAction({
+      actionId: nextActionId(), view, boutId: "bout-1", painOnsetAt: at(0.5).toISOString(),
+    })).toThrow(InvalidActionError);
+    expect(() => setWalkingPainOnsetAction({
+      actionId: nextActionId(), view, boutId: "bout-1", painOnsetAt: at(9).toISOString(),
+    })).toThrow(InvalidActionError);
+    expect(() => setWalkingPainOnsetAction({
+      actionId: nextActionId(), view, boutId: "bout-1", painOnsetAt: "not a time",
+    })).toThrow(InvalidActionError);
+  });
+
+  it("refuses a correction that would leave a bout's own start after its recorded onset", async () => {
+    const repo = open();
+    await start(repo);
+    await repo.commitAction(startWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-1", view: await live(repo), now: at(1) }));
+    await repo.commitAction(markWalkingPainOnsetAction({
+      actionId: nextActionId(), view: await live(repo), boutId: "bout-1", now: at(3),
+    }));
+
+    const view = await live(repo);
+    expect(() => correctWalkingBoutTimesAction({
+      actionId: nextActionId(), view, boutId: "bout-1", startedAt: at(4).toISOString(),
+    })).toThrow(InvalidActionError);
+  });
+
+  it("leaves the transition underneath it undoable: an onset moves no interval endpoint", async () => {
+    const repo = open();
+    await start(repo);
+    await repo.commitAction(startWalkingBoutAction({ actionId: nextActionId(), boutId: "bout-1", view: await live(repo), now: at(0) }));
+    await repo.commitAction(markWalkingPainOnsetAction({
+      actionId: nextActionId(), view: await live(repo), boutId: "bout-1", now: at(3),
+    }));
+
+    const view = await live(repo);
+    expect(detectUndoableWalkingTransition(view)).toEqual({ type: "bout_started", boutId: "bout-1" });
+
+    // And undoing the start still removes the bout, onset and all.
+    await repo.commitAction(undoLastWalkingTransitionAction({ actionId: nextActionId(), view }));
+    expect(await repo.getRecord("walking_bouts", "bout-1")).toBeUndefined();
   });
 });

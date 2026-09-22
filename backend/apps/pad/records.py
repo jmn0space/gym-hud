@@ -84,7 +84,11 @@ def parse_walking_bout(record: Mapping[str, object]) -> dict[str, object]:
 
     Pain is one value (``pain_min == pain_max``) or two adjacent ones
     (``pain_max == pain_min + 1``), both from 1 to 5, or both null
-    (docs/pad-walking.md, "Pain input").
+    (docs/pad-walking.md, "Pain input"). ``pain_onset_at`` is null or a moment
+    inside the bout (docs/pad-walking.md, "Pain onset"): the device stamps it
+    monotonically like every other PAD moment, so an onset outside its own
+    bout is not something a clock step produces, and it is refused here rather
+    than clamped -- mirroring the database constraint that also holds it.
     """
     started_at, ended_at = _interval(record)
     pain_min = read_optional_integer(record, "pain_min", minimum=1, maximum=5)
@@ -95,6 +99,19 @@ def parse_walking_bout(record: Mapping[str, object]) -> dict[str, object]:
         raise Rejected(
             INVALID_RECORD, "pain must be one value or two adjacent values (for example 2 or 2-3)."
         )
+    pain_onset_at = read_optional_timestamp(record, "pain_onset_at")
+    if pain_onset_at is not None:
+        # The end is read as the engine will store it: an end before its own
+        # start is clamped up to that start (``clamp_end``), never refused, so
+        # judging the onset against the raw value would refuse a bout a clock
+        # step alone made look inverted.
+        end = None if ended_at is None else max(ended_at, started_at)
+        if pain_onset_at < started_at or (end is not None and pain_onset_at > end):
+            raise Rejected(
+                INVALID_RECORD,
+                "pain_onset_at must be within the bout (at or after started_at, "
+                "and at or before ended_at once the bout has ended).",
+            )
     return {
         "walking_session_id": read_uuid(record, "walking_session_id"),
         "bout_number": read_integer(record, "bout_number", minimum=1, maximum=MAX_BOUT_NUMBER),
@@ -102,6 +119,7 @@ def parse_walking_bout(record: Mapping[str, object]) -> dict[str, object]:
         "ended_at": ended_at,
         "pain_min": pain_min,
         "pain_max": pain_max,
+        "pain_onset_at": pain_onset_at,
         "stop_reason": read_optional_choice(record, "stop_reason", STOP_REASONS),
         "notes": read_optional_text(record, "notes"),
     }
@@ -156,6 +174,7 @@ def serialize_walking_bout(row: SyncedRecord) -> dict[str, object]:
         "ended_at": _timestamp(bout.ended_at),
         "pain_min": bout.pain_min,
         "pain_max": bout.pain_max,
+        "pain_onset_at": _timestamp(bout.pain_onset_at),
         "stop_reason": bout.stop_reason,
         "notes": bout.notes,
         **_metadata(bout),

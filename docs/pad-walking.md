@@ -55,6 +55,7 @@ started_at          datetime
 ended_at            datetime nullable
 pain_min            integer nullable
 pain_max            integer nullable
+pain_onset_at       datetime nullable
 stop_reason         enum nullable
 notes               text nullable
 created_at
@@ -116,6 +117,56 @@ pain_max = 3
 ```
 
 The UI rejects non-adjacent combinations such as `1 + 4`. Pain values remain editable after the bout.
+
+## Pain onset
+
+Every bout has a button that records *when* pain started, alongside the
+selector that records how bad it was:
+
+```text
+Pain
+
+[ 1 ] [ 2 ] [ 3 ] [ 4 ] [ 5 ]
+
+[ PAIN STARTED NOW ]
+```
+
+While the bout is running (`WALKING` or `PAUSED`), one tap stores the current
+moment:
+
+```text
+pain_onset_at = current device timestamp
+```
+
+It is stamped the same way every other PAD moment is (see [Starting and timing
+a bout](#starting-and-timing-a-bout)): from the device clock, never before
+anything the session already recorded, so it always lands inside its own bout.
+
+Only the moment is stored. The pain-free walking time the HUD shows is derived
+from it, the bout's start, and any pause in between -- pausing is not walking,
+on either side of the onset -- exactly as effective walking time is:
+
+```text
+Bout 3
+
+       05:43
+
+Pain started 03:12 into bout 3
+```
+
+A bout that nobody tapped in time keeps the same control, without the "now":
+tapping it opens the time editor at the bout's start, so the moment can be
+entered afterwards. A recorded onset can be corrected or cleared the same way
+(see [Editing, undo, and delete](#editing-undo-and-delete)); clearing it is
+allowed, because an onset is a pain datum like `pain_min`, not an interval the
+workflow opens and closes.
+
+An onset lies inside its own bout: at or after the bout started, and at or
+before it ended once it has. A correction that would break that is refused,
+like every other correction, rather than clamped.
+
+Recording an onset does not by itself select a pain value or a stop reason:
+those stay the user's, and the inference below is unchanged by it.
 
 ## Stop-reason behaviour
 
@@ -326,10 +377,11 @@ editable in v1.
 ### Corrections
 
 Recorded times can be tapped and corrected: a bout's `started_at`/`ended_at`,
-a pause's `started_at`/`ended_at`, and a rest's `started_at`/`ended_at`. Pain,
-stop reason and notes were already editable (see [Pain input](#pain-input)
-and [Stop-reason behaviour](#stop-reason-behaviour) above); a time correction
-is the same kind of edit, applied to a timestamp field instead. A bout's own
+a pause's `started_at`/`ended_at`, a rest's `started_at`/`ended_at`, and a
+bout's `pain_onset_at`. Pain, stop reason and notes were already editable (see
+[Pain input](#pain-input) and [Stop-reason behaviour](#stop-reason-behaviour)
+above); a time correction is the same kind of edit, applied to a timestamp
+field instead. A bout's own
 "Edit times" disclosure lists every pause it has, individually labelled
 ("Pause 1 of bout 2", "Pause 2 of bout 2", ...) when it has more than one.
 
@@ -348,9 +400,16 @@ that obviously came from the user (`FOOT_NUMBNESS`, `SUDDEN_SWELLING`,
 `OTHER`, or a `MAX_DURATION`/`CLAUDICATION` chosen when a *different* value was
 what inference actually said at the time).
 
-A correction changes the *value* of an endpoint that is already recorded; it
-does not open or close an interval. Concretely: `ended_at` may only be
-corrected once the record has actually finished (a still-open bout, pause or
+`pain_onset_at` is the one recorded time that may also be set from nothing and
+cleared back to nothing (see [Pain onset](#pain-onset)): it is not an interval
+endpoint, so neither setting nor clearing it opens or closes anything. A
+correction to it is validated like any other -- it must leave the onset inside
+its bout -- and it never invalidates the undo stamp below, because it moves no
+endpoint the last transition wrote.
+
+For the endpoints themselves, a correction changes the *value* of one that is
+already recorded; it does not open or close an interval. Concretely: `ended_at`
+may only be corrected once the record has actually finished (a still-open bout, pause or
 rest is closed by `FINISH BOUT`/`RESUME`/`START NEXT BOUT`, never by editing a
 time field to a non-null value), and a correction never sets an endpoint back
 to null. `started_at` may be corrected at any time, open or closed -- the
@@ -499,6 +558,8 @@ Bout 4
 
 Pain
 [ 1 ] [ 2 ] [ 3 ] [ 4 ] [ 5 ]
+
+[ PAIN STARTED NOW ]
 
 [ PAUSE ]
 [ FINISH BOUT ]

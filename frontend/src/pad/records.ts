@@ -73,6 +73,18 @@ function endTimestamp(record: LocalRecord): string | null | undefined {
   return typeof value === "string" && isTimestamp(value) ? value : undefined;
 }
 
+/**
+ * An optional recorded moment: a parseable timestamp, else `null`. Unlike
+ * `started_at`/`ended_at`, a field read this way decides neither identity nor
+ * state -- a bout whose pain onset is unreadable is still a bout that can be
+ * resumed, finished and corrected -- so an unusable value degrades to "none
+ * recorded" instead of dropping the row.
+ */
+function optionalTimestamp(record: LocalRecord, field: string): string | null {
+  const value = recordText(record, field);
+  return value !== undefined && isTimestamp(value) ? value : null;
+}
+
 function finiteNumber(record: LocalRecord, field: string): number | undefined {
   const value = record[field];
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
@@ -161,6 +173,7 @@ export function parseWalkingBouts(
           ended_at: endedAt,
           pain_min: painValue(record, "pain_min"),
           pain_max: painValue(record, "pain_max"),
+          pain_onset_at: optionalTimestamp(record, "pain_onset_at"),
           stop_reason: stopReason(record),
           notes: optionalText(record, "notes"),
         } satisfies WalkingBout,
@@ -244,6 +257,7 @@ export function walkingBoutRecord(bout: WalkingBout): LocalRecord {
     ended_at: bout.ended_at,
     pain_min: bout.pain_min,
     pain_max: bout.pain_max,
+    pain_onset_at: bout.pain_onset_at,
     stop_reason: bout.stop_reason,
     notes: bout.notes,
   };

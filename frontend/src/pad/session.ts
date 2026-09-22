@@ -240,6 +240,50 @@ export function walkingElapsedMs(
   return Math.max(0, intervalElapsedMs(bout, now) - pausedMs(bout, pauses, now));
 }
 
+/** Milliseconds an interval spends inside `[from, to]`; an open one runs to `to`. */
+function overlapMs(
+  interval: { started_at: string; ended_at: string | null },
+  from: number,
+  to: number,
+): number {
+  const start = Date.parse(interval.started_at);
+  if (!Number.isFinite(start)) {
+    return 0;
+  }
+  const end = interval.ended_at === null ? to : Date.parse(interval.ended_at);
+  return Math.max(0, Math.min(Number.isFinite(end) ? end : to, to) - Math.max(start, from));
+}
+
+/**
+ * Effective walking time from a bout's start to its recorded pain onset -- the
+ * pain-free walking time (docs/pad-walking.md, "Pain onset") -- or `null` when
+ * no onset is recorded. Net of whatever pausing happened before it, exactly as
+ * `walkingElapsedMs` is net of the bout's pauses: standing still is not walking,
+ * whichever side of the onset it falls on.
+ *
+ * Derived here rather than stored, like every other PAD duration: correcting
+ * the bout's start, a pause, or the onset itself recalculates it with nothing
+ * else to update.
+ */
+export function painOnsetElapsedMs(
+  bout: WalkingBout,
+  pauses: readonly WalkingBoutPause[],
+): number | null {
+  if (bout.pain_onset_at === null) {
+    return null;
+  }
+  const start = Date.parse(bout.started_at);
+  const onset = Date.parse(bout.pain_onset_at);
+  if (!Number.isFinite(start) || !Number.isFinite(onset)) {
+    return null;
+  }
+  const paused = pausesOf(pauses, bout).reduce(
+    (total, pause) => total + overlapMs(pause, start, onset),
+    0,
+  );
+  return Math.max(0, onset - start - paused);
+}
+
 /**
  * The duration the HUD's primary timer shows for the current state, or `null` in a
  * state that has no running interval (READY, or a finished session).

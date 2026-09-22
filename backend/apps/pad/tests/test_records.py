@@ -45,6 +45,7 @@ def _bout(**overrides: Any) -> dict[str, Any]:
         "ended_at": None,
         "pain_min": None,
         "pain_max": None,
+        "pain_onset_at": None,
         "stop_reason": None,
         "notes": None,
     }
@@ -232,6 +233,57 @@ def test_an_end_before_its_start_is_left_for_the_engine_to_clamp() -> None:
     ended_at, started_at = values["ended_at"], values["started_at"]
     assert isinstance(ended_at, datetime) and isinstance(started_at, datetime)
     assert ended_at < started_at
+
+
+@pytest.mark.parametrize(
+    "pain_onset_at",
+    [
+        "2026-09-14T10:01:00.000Z",  # the instant the bout started
+        "2026-09-14T10:03:00.000Z",  # inside it
+        "2026-09-14T10:09:00.000Z",  # the instant it ended
+    ],
+)
+def test_a_pain_onset_inside_its_bout_parses(pain_onset_at: str) -> None:
+    values = parse_walking_bout(
+        _bout(ended_at="2026-09-14T10:09:00.000Z", pain_onset_at=pain_onset_at)
+    )
+
+    assert values["pain_onset_at"] == datetime.fromisoformat(pain_onset_at.replace("Z", "+00:00"))
+
+
+def test_an_absent_or_null_pain_onset_means_none_was_recorded() -> None:
+    record = _bout()
+    del record["pain_onset_at"]
+
+    assert parse_walking_bout(record)["pain_onset_at"] is None
+    assert parse_walking_bout(_bout(pain_onset_at=None))["pain_onset_at"] is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"pain_onset_at": "2026-09-14T10:00:59.999Z"},  # before the bout started
+        {"ended_at": "2026-09-14T10:09:00.000Z", "pain_onset_at": "2026-09-14T10:09:00.001Z"},
+    ],
+)
+def test_a_pain_onset_outside_its_bout_is_rejected(overrides: dict[str, Any]) -> None:
+    """No clock step produces one: the device stamps it monotonically inside the bout."""
+    rejected = _rejected(parse_walking_bout, _bout(**overrides))
+
+    assert rejected.code == "invalid_record"
+    assert "pain_onset_at" in rejected.detail
+
+
+def test_a_pain_onset_is_judged_against_the_end_the_engine_will_store() -> None:
+    """An end before its own start is clamped up to the start, so the onset holds."""
+    values = parse_walking_bout(
+        _bout(
+            ended_at="2026-09-14T10:00:30.000Z",  # a clock step back
+            pain_onset_at="2026-09-14T10:01:00.000Z",
+        )
+    )
+
+    assert values["pain_onset_at"] == values["started_at"]
 
 
 def test_an_instant_bout_is_valid() -> None:

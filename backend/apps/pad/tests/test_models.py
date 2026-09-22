@@ -121,6 +121,11 @@ def test_one_active_session_per_user_ignoring_tombstones(user: User) -> None:
         {"pain_min": 0, "pain_max": 1},
         {"pain_min": 5, "pain_max": 6},
         {"stop_reason": "TIRED"},
+        {"pain_onset_at": T0 - timedelta(seconds=1)},  # before the bout started
+        {
+            "ended_at": T0 + timedelta(minutes=8),
+            "pain_onset_at": T0 + timedelta(minutes=8, seconds=1),  # after it ended
+        },
     ],
 )
 def test_bout_check_constraints(user: User, overrides: dict[str, Any]) -> None:
@@ -131,6 +136,21 @@ def test_bout_check_constraints(user: User, overrides: dict[str, Any]) -> None:
 @pytest.mark.parametrize(("pain_min", "pain_max"), [(None, None), (2, 2), (2, 3)])
 def test_valid_pain_is_stored(user: User, pain_min: int | None, pain_max: int | None) -> None:
     _bout(_session(user), pain_min=pain_min, pain_max=pain_max)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"pain_onset_at": None},
+        {"pain_onset_at": T0},  # the instant the bout started
+        {"pain_onset_at": T0 + timedelta(minutes=3)},
+        {"ended_at": T0 + timedelta(minutes=8), "pain_onset_at": T0 + timedelta(minutes=8)},
+    ],
+)
+def test_a_pain_onset_inside_its_bout_is_stored(user: User, overrides: dict[str, Any]) -> None:
+    bout = _bout(_session(user), **overrides)
+
+    assert bout.pain_onset_at == overrides["pain_onset_at"]
 
 
 def test_one_open_bout_per_session(user: User) -> None:

@@ -169,6 +169,11 @@ class WalkingBout(SyncedRecord):
     ``bout_number`` is the number the bout had when it was recorded. It is not
     unique: display numbering is recomputed after a delete, and a new bout can
     reuse the number of a deleted one.
+
+    ``pain_onset_at`` is the moment pain started during the bout
+    (docs/pad-walking.md, "Pain onset"), null while none was recorded. Only the
+    moment is stored: the pain-free walking time is derived from it and the
+    bout's own timestamps, like every other PAD duration.
     """
 
     walking_session = models.ForeignKey(
@@ -179,6 +184,7 @@ class WalkingBout(SyncedRecord):
     ended_at = models.DateTimeField(null=True, blank=True)
     pain_min = models.PositiveSmallIntegerField(null=True, blank=True)
     pain_max = models.PositiveSmallIntegerField(null=True, blank=True)
+    pain_onset_at = models.DateTimeField(null=True, blank=True)
     stop_reason = models.CharField(max_length=32, choices=WalkingStopReason, null=True, blank=True)
     notes = models.TextField(null=True, blank=True)
 
@@ -208,6 +214,18 @@ class WalkingBout(SyncedRecord):
             models.CheckConstraint(
                 condition=Q(stop_reason__isnull=True) | Q(stop_reason__in=WalkingStopReason.values),
                 name="pad_bout_stop_reason_valid",
+            ),
+            # A recorded pain onset lies inside its own bout. As above, the
+            # isnull terms carry the meaning: a comparison with NULL is
+            # unknown, which a CHECK treats as passing, so an open bout has
+            # only the lower bound and no onset has neither.
+            models.CheckConstraint(
+                condition=Q(pain_onset_at__isnull=True)
+                | (
+                    Q(pain_onset_at__gte=F("started_at"))
+                    & (Q(ended_at__isnull=True) | Q(pain_onset_at__lte=F("ended_at")))
+                ),
+                name="pad_bout_pain_onset_within_bout",
             ),
             models.UniqueConstraint(
                 fields=["walking_session"],
