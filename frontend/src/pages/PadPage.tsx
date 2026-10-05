@@ -33,9 +33,11 @@ import {
   startWalkingSessionAction,
   summarizeWalkingSession,
   undoLastWalkingTransitionAction,
+  useLockScreenControls,
   useNow,
   updateWalkingBoutAction,
   updateWalkingSessionNotesAction,
+  totalWalkingMs,
   walkingElapsedMs,
   walkingSessionSummaryValue,
   type PadSessionView,
@@ -443,6 +445,11 @@ export function PadPage() {
     },
     [readLiveSnapshot, run, view],
   );
+
+  useLockScreenControls(view, now, (command) => {
+    if (command === "start") startBout();
+    else transitionBout(command);
+  });
 
   const finishSession = useCallback(() => {
     if (view === null) {
@@ -1012,6 +1019,9 @@ function WalkingHud({
           <p className="muted">
             Walking {formatDuration(walkingElapsedMs(view.currentBout, view.pauses, now))}
           </p>
+        )}
+        {view.bouts.length > 0 && (
+          <p className="muted">Total walking {formatDuration(totalWalkingMs(view, now))}</p>
         )}
         {/* Said here rather than left to a conflict message: the device still
             counts the unreadable interval, so starting another bout can only be

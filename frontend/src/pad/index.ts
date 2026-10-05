@@ -32,6 +32,7 @@ export {
   hasUnreadableOpenRecords,
   painOnsetElapsedMs,
   readPadSession,
+  totalWalkingMs,
   walkingElapsedMs,
 } from "./session";
 export {
@@ -42,6 +43,7 @@ export {
   walkingSessionSummaryValue,
   PREVIOUS_WALKING_SESSION_KEY,
 } from "./settings";
+export { useLockScreenControls, type LockScreenCommand } from "./useLockScreenControls";
 export { useNow } from "./useNow";
 export { DEFAULT_WALKING_SETTINGS } from "./types";
 export type {

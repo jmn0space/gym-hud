@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug builds also trust user-installed CAs, so the WebView accepts the Docker
+     preview stack's Caddy certificate (README, "Docker preview quick start"), as
+     Chrome does. Release builds ignore <debug-overrides> and trust system CAs only. -->
+<network-security-config>
+    <debug-overrides>
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </debug-overrides>
+</network-security-config>

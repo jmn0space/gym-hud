@@ -24,6 +24,28 @@ import {
 } from "../storage";
 import { PadPage } from "./PadPage";
 
+// The Android wrapper's notification plugin, faked; off (plain PWA) unless a test opts in.
+const nativeShell = vi.hoisted(() => {
+  const shell = {
+    native: false,
+    shown: [] as { title: string; text: string; chronometerBase: number | null; actions: { id: string; title: string }[] }[],
+    listener: null as ((event: { id: string }) => void) | null,
+    tap: (id: string) => { shell.listener?.({ id }); },
+  };
+  return shell;
+});
+vi.mock("@capacitor/core", () => ({
+  Capacitor: { isNativePlatform: () => nativeShell.native },
+  registerPlugin: () => ({
+    show: (content: (typeof nativeShell.shown)[number]) => { nativeShell.shown.push(content); return Promise.resolve(); },
+    hide: () => Promise.resolve(),
+    addListener: (_event: string, listener: (event: { id: string }) => void) => {
+      nativeShell.listener = listener;
+      return Promise.resolve({ remove: () => Promise.resolve() });
+    },
+  }),
+}));
+
 const openRepositories: LocalRepository[] = [];
 
 function repositoryOver(databaseName: string): LocalRepository {
@@ -1405,5 +1427,53 @@ describe("PAD pain onset", () => {
     expect((await repository.listRecords("walking_bouts"))[0]).toEqual(
       expect.objectContaining({ pain_onset_at: null }),
     );
+  });
+});
+
+describe("PAD lock-screen controls", () => {
+  it("mirrors the session onto the Android notification and obeys its buttons", async () => {
+    useFrozenClock("2026-09-18T10:00:00.000Z");
+    nativeShell.native = true;
+    try {
+      renderPad(freshRepository());
+      fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+      await waitFor(() => {
+        expect(nativeShell.shown.at(-1)).toEqual({
+          title: "Bout 1 · Ready",
+          text: "Total walking 0 min",
+          chronometerBase: null,
+          actions: [{ id: "start", title: "Start walking" }],
+        });
+      });
+
+      act(() => { nativeShell.tap("start"); });
+      await waitFor(() => { expect(nativeShell.shown.at(-1)?.title).toBe("Bout 1 · Walking"); });
+      expect(nativeShell.shown.at(-1)?.chronometerBase).toBe(Date.parse("2026-09-18T10:00:00.000Z"));
+
+      vi.setSystemTime(Date.parse("2026-09-18T10:03:00.000Z"));
+      act(() => { nativeShell.tap("pause"); });
+      expect(await screen.findByText("Paused")).toBeInTheDocument();
+      await waitFor(() => {
+        expect(nativeShell.shown.at(-1)).toEqual(expect.objectContaining({
+          title: "Bout 1 · Paused",
+          text: "Walked 03:00 · Total walking 3 min",
+          chronometerBase: Date.parse("2026-09-18T10:03:00.000Z"),
+        }));
+      });
+
+      vi.setSystemTime(Date.parse("2026-09-18T10:04:00.000Z"));
+      act(() => { nativeShell.tap("finish"); });
+      await waitFor(() => {
+        expect(nativeShell.shown.at(-1)).toEqual({
+          title: "Rest after bout 1",
+          text: "Total walking 3 min",
+          chronometerBase: Date.parse("2026-09-18T10:04:00.000Z"),
+          actions: [{ id: "next", title: "Start next bout" }],
+        });
+      });
+      expect(screen.getByText("Total walking 03:00")).toBeInTheDocument();
+    } finally {
+      nativeShell.native = false;
+    }
   });
 });
